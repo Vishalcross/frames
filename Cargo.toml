@@ -1,4 +1,6 @@
 [workspace]
+members = [
+    "crates/frames-core",
+    "frames-shell/src-tauri",
+]
 resolver = "2"
-members = ["crates/frames-core"]
-# "src-tauri" joins this list when the Tauri shell is generated.

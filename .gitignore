@@ -1,0 +1,15 @@
+# Rust
+target/
+# Node / Svelte (added when the UI lands)
+node_modules/
+dist/
+.svelte-kit/
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+# Local databases and caches must never be committed
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

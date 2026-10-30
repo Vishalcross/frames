@@ -1,0 +1,270 @@
+/* =============================================================================
+   MODE 3: WINDOWS VISTA / 7 LIQUID GLASS AERO THEME OVERRIDES
+   Activates under [data-theme="aero"]
+   ============================================================================= */
+
+[data-theme="aero"] {
+  --aero-blue-top: #e8f5fd;
+  --aero-blue-mid: #b8e2fa;
+  --aero-blue-bottom: #8ad2f8;
+  --aero-cyan-glow: rgba(0, 195, 255, 0.75);
+}
+
+/* Background: Windows 7 / Vista Aurora wallpaper radial gradient */
+[data-theme="aero"] .app-shell {
+  background:
+    radial-gradient(ellipse at 50% -10%, #205c8f 0%, #0c2b48 55%, #051424 100%) !important;
+}
+
+/* Translucent Glass Sidebar */
+[data-theme="aero"] .sidebar {
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.45) 0%,
+    rgba(215, 235, 255, 0.25) 50%,
+    rgba(175, 210, 245, 0.35) 100%
+  ) !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.6) !important;
+  box-shadow: inset -1px 0 0 rgba(0, 0, 0, 0.15), inset 1px 0 0 rgba(255, 255, 255, 0.8) !important;
+  backdrop-filter: blur(20px) saturate(180%) !important;
+  -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
+}
+
+[data-theme="aero"] .brand-title {
+  color: #ffffff !important;
+  text-shadow: 0 0 10px rgba(0, 195, 255, 0.8), 0 1px 3px rgba(0, 0, 0, 0.8) !important;
+}
+
+[data-theme="aero"] .device-pill {
+  background: rgba(255, 255, 255, 0.25) !important;
+  border: 1px solid rgba(255, 255, 255, 0.5) !important;
+  color: #ffffff !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+[data-theme="aero"] .nav-heading {
+  color: #d8edfc !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+[data-theme="aero"] .nav-item,
+[data-theme="aero"] .album-nav-row {
+  color: #f0f7ff !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  border-radius: 4px !important;
+}
+
+[data-theme="aero"] .nav-item:hover,
+[data-theme="aero"] .album-nav-row:hover {
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.4) 0%,
+    rgba(255, 255, 255, 0.15) 50%,
+    rgba(140, 205, 255, 0.3) 100%
+  ) !important;
+  border: 1px solid rgba(255, 255, 255, 0.6) !important;
+  box-shadow: 0 0 8px rgba(0, 195, 255, 0.5) !important;
+}
+
+[data-theme="aero"] .nav-item.active,
+[data-theme="aero"] .album-nav-row.active {
+  background: linear-gradient(180deg,
+    #7cd9ff 0%,
+    #29b6f6 49%,
+    #0288d1 50%,
+    #039be5 100%
+  ) !important;
+  border: 1px solid rgba(255, 255, 255, 0.8) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9),
+              inset 0 -1px 0 rgba(0, 0, 0, 0.3),
+              0 2px 10px rgba(2, 136, 209, 0.6) !important;
+  color: #ffffff !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+/* Glass Top Toolbar */
+[data-theme="aero"] .top-toolbar {
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.65) 0%,
+    rgba(255, 255, 255, 0.25) 49%,
+    rgba(190, 225, 250, 0.18) 50%,
+    rgba(215, 240, 255, 0.35) 100%
+  ) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.7) !important;
+  box-shadow: 0 2px 12px rgba(0, 20, 50, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.95) !important;
+  backdrop-filter: blur(24px) saturate(190%) !important;
+  -webkit-backdrop-filter: blur(24px) saturate(190%) !important;
+}
+
+[data-theme="aero"] .toolbar-view-title {
+  color: #0d2844 !important;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+[data-theme="aero"] .toolbar-view-subtitle {
+  color: #386082 !important;
+}
+
+/* Glass Search Field */
+[data-theme="aero"] .search-wrapper {
+  background: rgba(255, 255, 255, 0.85) !important;
+  border: 1px solid rgba(130, 180, 220, 0.8) !important;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.15), 0 1px 0 rgba(255, 255, 255, 0.8) !important;
+}
+
+[data-theme="aero"] .search-input {
+  color: #0d2844 !important;
+}
+
+/* Aero Buttons */
+[data-theme="aero"] .btn-primary {
+  background: linear-gradient(180deg,
+    #7cd9ff 0%,
+    #29b6f6 49%,
+    #0288d1 50%,
+    #039be5 100%
+  ) !important;
+  border: 1px solid rgba(255, 255, 255, 0.75) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9),
+              inset 0 -1px 0 rgba(0, 0, 0, 0.3),
+              0 2px 6px rgba(2, 136, 209, 0.5) !important;
+  color: #ffffff !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6) !important;
+  border-radius: 4px !important;
+}
+
+[data-theme="aero"] .btn-primary:hover:not(:disabled) {
+  filter: brightness(1.12);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 1),
+              0 0 14px rgba(41, 182, 246, 0.8) !important;
+}
+
+[data-theme="aero"] .btn-secondary {
+  background: linear-gradient(180deg,
+    #ffffff 0%,
+    #f2f6fa 49%,
+    #e1ecf5 50%,
+    #e8f2fa 100%
+  ) !important;
+  border: 1px solid rgba(130, 175, 215, 0.8) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95),
+              0 1px 3px rgba(0, 20, 50, 0.15) !important;
+  color: #0f3050 !important;
+  border-radius: 4px !important;
+}
+
+[data-theme="aero"] .btn-secondary:hover:not(:disabled) {
+  background: linear-gradient(180deg,
+    #fbfdff 0%,
+    #e4f1fc 49%,
+    #cfe4f7 50%,
+    #ddedf9 100%
+  ) !important;
+  border-color: #29b6f6 !important;
+  box-shadow: 0 0 8px rgba(41, 182, 246, 0.5) !important;
+}
+
+[data-theme="aero"] .btn-danger {
+  background: linear-gradient(180deg,
+    #ff9a9e 0%,
+    #f7444e 49%,
+    #d91b26 50%,
+    #e82e38 100%
+  ) !important;
+  border: 1px solid rgba(255, 255, 255, 0.75) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9),
+              0 2px 6px rgba(217, 27, 38, 0.5) !important;
+  border-radius: 4px !important;
+}
+
+/* Sticky Month Header with Specular Gloss */
+[data-theme="aero"] .sticky-month-header {
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.85) 0%,
+    rgba(235, 245, 255, 0.75) 49%,
+    rgba(205, 230, 250, 0.8) 50%,
+    rgba(220, 240, 255, 0.85) 100%
+  ) !important;
+  border: 1px solid rgba(255, 255, 255, 0.9) !important;
+  box-shadow: 0 3px 10px rgba(0, 30, 70, 0.12),
+              inset 0 1px 0 rgba(255, 255, 255, 1) !important;
+  backdrop-filter: blur(14px) !important;
+  border-radius: 6px !important;
+  padding: 8px 14px !important;
+}
+
+[data-theme="aero"] .month-title {
+  color: #0c2c4d !important;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+}
+
+[data-theme="aero"] .month-count {
+  color: #3b6284 !important;
+}
+
+/* Vista Explorer Thumbnails */
+[data-theme="aero"] .thumb-cell {
+  border: 2px solid rgba(255, 255, 255, 0.7) !important;
+  border-radius: 3px !important;
+  box-shadow: 0 2px 6px rgba(0, 20, 50, 0.25) !important;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease !important;
+}
+
+[data-theme="aero"] .thumb-cell:hover {
+  transform: translateY(-2px) scale(1.02) !important;
+  border-color: #29b6f6 !important;
+  box-shadow: 0 6px 18px rgba(41, 182, 246, 0.6), 0 0 10px rgba(255, 255, 255, 0.8) !important;
+}
+
+[data-theme="aero"] .thumb-cell.selected {
+  outline: 3px solid #29b6f6 !important;
+  border-color: #ffffff !important;
+  box-shadow: 0 0 16px rgba(41, 182, 246, 0.9) !important;
+}
+
+/* Floating Glass HUD in Aero */
+[data-theme="aero"] .apple-floating-hud {
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.75) 0%,
+    rgba(235, 247, 255, 0.5) 49%,
+    rgba(180, 220, 250, 0.45) 50%,
+    rgba(215, 240, 255, 0.65) 100%
+  ) !important;
+  border: 1px solid rgba(255, 255, 255, 0.85) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 1),
+              0 8px 28px rgba(0, 25, 60, 0.45) !important;
+  backdrop-filter: blur(24px) saturate(200%) !important;
+  -webkit-backdrop-filter: blur(24px) saturate(200%) !important;
+  border-radius: 8px !important;
+}
+
+[data-theme="aero"] .hud-count {
+  color: #0c2c4d !important;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+/* Aero Scrollbars */
+[data-theme="aero"] ::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+[data-theme="aero"] ::-webkit-scrollbar-track {
+  background: rgba(200, 225, 245, 0.25);
+  border-left: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+[data-theme="aero"] ::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.8) 0%,
+    rgba(180, 220, 250, 0.7) 100%
+  );
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  border-radius: 6px;
+  box-shadow: inset 0 1px 0 #ffffff;
+}
+
+[data-theme="aero"] ::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg,
+    #b8e2fa 0%,
+    #41b0f0 100%
+  );
+}

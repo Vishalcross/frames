@@ -702,12 +702,12 @@ where
     Ok(report)
 }
 
-/// Split a folder's scanned candidates into stem-aligned batches of ~16 files so
+/// Split a folder's scanned candidates into stem-aligned batches of ~32 files so
 /// large folders (e.g. 850+ files / 10 GB) begin uploading within ~1 second instead
 /// of waiting for all 850 files to be hashed upfront, while keeping same-stem
 /// Live Photo pairs (`IMG_1234.HEIC` + `IMG_1234.MOV`) in the same batch.
 fn split_folder_into_stem_batches(mut candidates: Vec<ScannedCandidate>) -> Vec<Vec<ScannedCandidate>> {
-    if candidates.len() <= 24 {
+    if candidates.len() <= 36 {
         return vec![candidates];
     }
     candidates.sort_by(|a, b| {
@@ -727,7 +727,7 @@ fn split_folder_into_stem_batches(mut candidates: Vec<ScannedCandidate>) -> Vec<
     });
 
     let mut batches: Vec<Vec<ScannedCandidate>> = Vec::new();
-    let mut current: Vec<ScannedCandidate> = Vec::with_capacity(18);
+    let mut current: Vec<ScannedCandidate> = Vec::with_capacity(36);
     let mut last_stem = String::new();
 
     for cand in candidates {
@@ -737,7 +737,7 @@ fn split_folder_into_stem_batches(mut candidates: Vec<ScannedCandidate>) -> Vec<
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if current.len() >= 16 && stem != last_stem {
+        if current.len() >= 32 && stem != last_stem {
             batches.push(std::mem::take(&mut current));
         }
         last_stem = stem;
@@ -1046,9 +1046,9 @@ where
                 continue;
             }
 
-            // Work-stealing pool of up to 4 concurrent upload workers so fast photo
+            // Work-stealing pool of up to 10 concurrent upload workers so fast photo
             // uploads never stall waiting for a slow video upload in the same batch.
-            let worker_count = assets.len().min(4);
+            let worker_count = assets.len().clamp(1, 10);
             let work_queue = Mutex::new(VecDeque::from(assets));
             let shared_report = Mutex::new(report);
             let stop_folder_loop = AtomicBool::new(false);

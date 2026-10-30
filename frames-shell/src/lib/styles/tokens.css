@@ -1,0 +1,257 @@
+/* =============================================================================
+   FRAMES THEME TOKENS
+   Three visual modes, selected with <html data-theme="…" data-scheme="…">:
+
+     standard  – Apple Photos look. data-scheme = light | dark (follows OS by default)
+     adaptive  – Standard layout whose colours are derived live from the photo
+                 being viewed (see $lib/theme.ts → --ad-* variables)
+     aero      – Windows Vista / 7 "Aero Glass": translucent blue glass chrome,
+                 gloss highlights, Explorer-style light content pane
+
+   Every component in app.css reads only the semantic tokens defined here.
+   ============================================================================= */
+
+/* Registered so the adaptive palette can cross-fade smoothly between photos. */
+@property --ad-accent   { syntax: "<color>"; inherits: true; initial-value: #0a84ff; }
+@property --ad-accent-fg{ syntax: "<color>"; inherits: true; initial-value: #ffffff; }
+@property --ad-tint-1   { syntax: "<color>"; inherits: true; initial-value: #2a4a7a; }
+@property --ad-tint-2   { syntax: "<color>"; inherits: true; initial-value: #3a2f6b; }
+@property --ad-bg       { syntax: "<color>"; inherits: true; initial-value: #101216; }
+
+:root {
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI Variable Text",
+    "Segoe UI", system-ui, Roboto, "Helvetica Neue", sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter",
+    "Segoe UI Variable Display", "Segoe UI", system-ui, Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, "Cascadia Mono", Consolas, monospace;
+
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --r-xl: 26px;
+
+  --toolbar-h: 58px;
+  --sidebar-w: 252px;
+
+  --danger: #ff453a;
+  --warn: #ff9f0a;
+  --ok: #30d158;
+
+  transition:
+    --ad-accent 0.9s var(--ease-soft),
+    --ad-accent-fg 0.9s var(--ease-soft),
+    --ad-tint-1 0.9s var(--ease-soft),
+    --ad-tint-2 0.9s var(--ease-soft),
+    --ad-bg 0.9s var(--ease-soft);
+}
+
+/* -----------------------------------------------------------------------------
+   1 · STANDARD — LIGHT
+   ----------------------------------------------------------------------------- */
+[data-theme="standard"][data-scheme="light"] {
+  color-scheme: light;
+  --window: #ececf0;
+  --content: #ffffff;
+  --sidebar: rgba(240, 240, 245, 0.74);
+  --toolbar: rgba(255, 255, 255, 0.74);
+  --card: #ffffff;
+  --card-2: rgba(0, 0, 0, 0.04);
+  --field: rgba(0, 0, 0, 0.055);
+  --text: #1d1d1f;
+  --text-2: rgba(60, 60, 67, 0.7);
+  --text-3: rgba(60, 60, 67, 0.4);
+  --sep: rgba(0, 0, 0, 0.085);
+  --accent: #007aff;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(0, 122, 255, 0.12);
+  --hover: rgba(0, 0, 0, 0.05);
+  --selected: rgba(0, 0, 0, 0.085);
+  --glass: rgba(255, 255, 255, 0.7);
+  --glass-strong: rgba(255, 255, 255, 0.86);
+  --glass-border: rgba(0, 0, 0, 0.07);
+  --glass-hi: rgba(255, 255, 255, 0.9);
+  --glass-blur: blur(30px) saturate(190%);
+  --shadow-1: 0 0.5px 1px rgba(0, 0, 0, 0.08), 0 4px 16px rgba(0, 0, 0, 0.06);
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.08), 0 14px 44px rgba(0, 0, 0, 0.2);
+  --viewer: #ffffff;
+  --viewer-text: #1d1d1f;
+  --skeleton-a: #ececf1;
+  --skeleton-b: #f6f6f9;
+  --thumb-gap: 2px;
+  --thumb-radius: 0px;
+  --scrim: rgba(255, 255, 255, 0.6);
+  --app-bg: var(--window);
+}
+
+/* -----------------------------------------------------------------------------
+   1 · STANDARD — DARK
+   ----------------------------------------------------------------------------- */
+[data-theme="standard"][data-scheme="dark"] {
+  color-scheme: dark;
+  --window: #1c1c1e;
+  --content: #121214;
+  --sidebar: rgba(38, 38, 42, 0.72);
+  --toolbar: rgba(24, 24, 27, 0.72);
+  --card: #1f1f23;
+  --card-2: rgba(255, 255, 255, 0.06);
+  --field: rgba(255, 255, 255, 0.09);
+  --text: #f5f5f7;
+  --text-2: rgba(235, 235, 245, 0.64);
+  --text-3: rgba(235, 235, 245, 0.34);
+  --sep: rgba(255, 255, 255, 0.1);
+  --accent: #0a84ff;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(10, 132, 255, 0.2);
+  --hover: rgba(255, 255, 255, 0.07);
+  --selected: rgba(255, 255, 255, 0.13);
+  --glass: rgba(40, 40, 46, 0.66);
+  --glass-strong: rgba(34, 34, 40, 0.86);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-hi: rgba(255, 255, 255, 0.16);
+  --glass-blur: blur(30px) saturate(190%);
+  --shadow-1: 0 0.5px 1px rgba(0, 0, 0, 0.5), 0 6px 22px rgba(0, 0, 0, 0.35);
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.5), 0 18px 54px rgba(0, 0, 0, 0.6);
+  --viewer: #000000;
+  --viewer-text: #f5f5f7;
+  --skeleton-a: #1d1d21;
+  --skeleton-b: #28282d;
+  --thumb-gap: 2px;
+  --thumb-radius: 0px;
+  --scrim: rgba(0, 0, 0, 0.55);
+  --app-bg: var(--window);
+}
+
+/* -----------------------------------------------------------------------------
+   2 · ADAPTIVE — same structure, colour pulled from the current photo
+   ----------------------------------------------------------------------------- */
+[data-theme="adaptive"][data-scheme="dark"] {
+  color-scheme: dark;
+  --window: var(--ad-bg);
+  --content: transparent;
+  --sidebar: color-mix(in oklab, var(--ad-bg) 78%, transparent);
+  --toolbar: color-mix(in oklab, var(--ad-bg) 66%, transparent);
+  --card: color-mix(in oklab, var(--ad-tint-1) 16%, rgba(255, 255, 255, 0.04));
+  --card-2: color-mix(in oklab, var(--ad-tint-1) 18%, transparent);
+  --field: color-mix(in oklab, var(--ad-tint-1) 24%, rgba(255, 255, 255, 0.06));
+  --text: #f7f7fa;
+  --text-2: rgba(240, 240, 250, 0.68);
+  --text-3: rgba(240, 240, 250, 0.38);
+  --sep: rgba(255, 255, 255, 0.11);
+  --accent: var(--ad-accent);
+  --accent-fg: var(--ad-accent-fg);
+  --accent-soft: color-mix(in oklab, var(--ad-accent) 26%, transparent);
+  --hover: rgba(255, 255, 255, 0.08);
+  --selected: color-mix(in oklab, var(--ad-accent) 28%, rgba(255, 255, 255, 0.06));
+  --glass: color-mix(in oklab, var(--ad-bg) 62%, transparent);
+  --glass-strong: color-mix(in oklab, var(--ad-bg) 88%, transparent);
+  --glass-border: rgba(255, 255, 255, 0.13);
+  --glass-hi: rgba(255, 255, 255, 0.2);
+  --glass-blur: blur(34px) saturate(210%);
+  --shadow-1: 0 0.5px 1px rgba(0, 0, 0, 0.5), 0 6px 24px rgba(0, 0, 0, 0.35);
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.5), 0 20px 60px rgba(0, 0, 0, 0.55);
+  --viewer: var(--ad-bg);
+  --viewer-text: #f7f7fa;
+  --skeleton-a: color-mix(in oklab, var(--ad-tint-1) 28%, #000);
+  --skeleton-b: color-mix(in oklab, var(--ad-tint-1) 40%, #000);
+  --thumb-gap: 3px;
+  --thumb-radius: 6px;
+  --scrim: rgba(0, 0, 0, 0.5);
+  --app-bg:
+    radial-gradient(1200px 760px at 12% -8%, color-mix(in oklab, var(--ad-tint-1) 46%, transparent), transparent 68%),
+    radial-gradient(1000px 700px at 108% 108%, color-mix(in oklab, var(--ad-tint-2) 40%, transparent), transparent 66%),
+    var(--ad-bg);
+}
+
+[data-theme="adaptive"][data-scheme="light"] {
+  color-scheme: light;
+  --window: var(--ad-bg);
+  --content: transparent;
+  --sidebar: color-mix(in oklab, var(--ad-bg) 70%, rgba(255, 255, 255, 0.5));
+  --toolbar: color-mix(in oklab, var(--ad-bg) 62%, rgba(255, 255, 255, 0.4));
+  --card: rgba(255, 255, 255, 0.72);
+  --card-2: color-mix(in oklab, var(--ad-tint-1) 16%, transparent);
+  --field: color-mix(in oklab, var(--ad-tint-1) 14%, rgba(255, 255, 255, 0.5));
+  --text: #17171c;
+  --text-2: rgba(30, 30, 45, 0.7);
+  --text-3: rgba(30, 30, 45, 0.42);
+  --sep: rgba(0, 0, 0, 0.09);
+  --accent: var(--ad-accent);
+  --accent-fg: var(--ad-accent-fg);
+  --accent-soft: color-mix(in oklab, var(--ad-accent) 18%, transparent);
+  --hover: rgba(0, 0, 0, 0.05);
+  --selected: color-mix(in oklab, var(--ad-accent) 20%, rgba(255, 255, 255, 0.4));
+  --glass: color-mix(in oklab, var(--ad-bg) 58%, rgba(255, 255, 255, 0.55));
+  --glass-strong: color-mix(in oklab, var(--ad-bg) 84%, rgba(255, 255, 255, 0.6));
+  --glass-border: rgba(0, 0, 0, 0.07);
+  --glass-hi: rgba(255, 255, 255, 0.9);
+  --glass-blur: blur(34px) saturate(200%);
+  --shadow-1: 0 0.5px 1px rgba(0, 0, 0, 0.08), 0 6px 20px rgba(0, 0, 0, 0.08);
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.08), 0 16px 48px rgba(0, 0, 0, 0.2);
+  --viewer: var(--ad-bg);
+  --viewer-text: #17171c;
+  --skeleton-a: color-mix(in oklab, var(--ad-tint-1) 22%, #fff);
+  --skeleton-b: color-mix(in oklab, var(--ad-tint-1) 12%, #fff);
+  --thumb-gap: 3px;
+  --thumb-radius: 6px;
+  --scrim: rgba(255, 255, 255, 0.5);
+  --app-bg:
+    radial-gradient(1200px 760px at 12% -8%, color-mix(in oklab, var(--ad-tint-1) 70%, transparent), transparent 68%),
+    radial-gradient(1000px 700px at 108% 108%, color-mix(in oklab, var(--ad-tint-2) 60%, transparent), transparent 66%),
+    var(--ad-bg);
+}
+
+/* -----------------------------------------------------------------------------
+   3 · AERO GLASS (Windows Vista / 7)
+   Chrome is translucent glass over a deep-blue wallpaper; the content pane is
+   an Explorer-style pale gradient with a glossy hover/selection treatment.
+   ----------------------------------------------------------------------------- */
+[data-theme="aero"] {
+  color-scheme: light;
+  --font: "Segoe UI", "Segoe UI Variable Text", Tahoma, "Lucida Grande", system-ui, sans-serif;
+  --font-display: "Segoe UI", "Segoe UI Variable Display", Tahoma, "Lucida Grande", system-ui, sans-serif;
+  --r-xs: 3px;
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-xl: 10px;
+
+  --window: #0c3566;
+  --content: linear-gradient(180deg, #fdfeff 0%, #f1f6fc 55%, #e6eef8 100%);
+  --sidebar: linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(214, 233, 250, 0.32));
+  --toolbar: linear-gradient(180deg, rgba(255, 255, 255, 0.62), rgba(200, 224, 247, 0.34));
+  --card: linear-gradient(180deg, #ffffff, #f3f7fc);
+  --card-2: rgba(40, 90, 150, 0.07);
+  --field: #ffffff;
+  --text: #14253b;
+  --text-2: #476079;
+  --text-3: #7d92a8;
+  --sep: rgba(60, 100, 150, 0.22);
+  --accent: #2b7bd3;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(43, 123, 211, 0.16);
+  --hover: linear-gradient(180deg, rgba(255, 255, 255, 0.85), rgba(217, 238, 253, 0.75));
+  --selected: linear-gradient(180deg, #f4faff, #cfe6fa);
+  --glass: linear-gradient(180deg, rgba(255, 255, 255, 0.52), rgba(176, 210, 242, 0.3));
+  --glass-strong: linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(196, 223, 247, 0.62));
+  --glass-border: rgba(255, 255, 255, 0.75);
+  --glass-hi: rgba(255, 255, 255, 0.95);
+  --glass-blur: blur(16px) saturate(170%);
+  --shadow-1: 0 1px 3px rgba(5, 25, 60, 0.35);
+  --shadow-2: 0 4px 22px rgba(5, 25, 60, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.4);
+  --viewer: #050a12;
+  --viewer-text: #ffffff;
+  --skeleton-a: #dde8f4;
+  --skeleton-b: #eef4fb;
+  --thumb-gap: 8px;
+  --thumb-radius: 2px;
+  --scrim: rgba(240, 247, 255, 0.7);
+  --app-bg: var(--window);
+
+  --danger: #d9382a;
+  --warn: #e8a317;
+  --ok: #2f9e44;
+}

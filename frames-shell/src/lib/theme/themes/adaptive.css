@@ -1,0 +1,50 @@
+/* =============================================================================
+   ADAPTIVE APPEARANCE (themes/adaptive.css)
+   App takes its color dynamically from the focused photo / collection seed.
+   ============================================================================= */
+
+[data-appearance="adaptive"] {
+  /* Ambient canvas background with 2 large blurred radial gradients (§7.5) */
+  --ambient-bg: radial-gradient(
+      60% 50% at 10% 10%,
+      var(--ad-ambient-1, rgba(0, 122, 255, 0.35)) 0%,
+      transparent 80%
+    ),
+    radial-gradient(
+      65% 55% at 90% 90%,
+      var(--ad-ambient-2, rgba(88, 86, 214, 0.28)) 0%,
+      transparent 80%
+    ),
+    var(--bg-canvas);
+
+  /* Fallback glass roles */
+  --glass-backdrop: blur(30px) saturate(1.4);
+  --glass-sheen: 0.15;
+  --glass-rim-top: 0.25;
+}
+
+[data-appearance="adaptive"][data-scheme="light"] {
+  color-scheme: light;
+  --shadow-1: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-2: 0 6px 20px rgba(0, 0, 0, 0.12);
+  --shadow-3: 0 16px 44px rgba(0, 0, 0, 0.16);
+  --glass-tint: #ffffff;
+  --glass-tint-amt: 80%;
+  --glass-fg: #1d1d1f;
+}
+
+[data-appearance="adaptive"][data-scheme="dark"] {
+  color-scheme: dark;
+  --shadow-1: 0 1px 3px rgba(0, 0, 0, 0.25);
+  --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-3: 0 20px 48px rgba(0, 0, 0, 0.55);
+  --glass-tint: #1c1c1e;
+  --glass-tint-amt: 80%;
+  --glass-fg: #f5f5f7;
+}
+
+/* Sidebar in Adaptive mode has light blur and alpha (§7.3) */
+[data-appearance="adaptive"] .sidebar-docked {
+  backdrop-filter: blur(30px);
+  -webkit-backdrop-filter: blur(30px);
+}

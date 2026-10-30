@@ -6,12 +6,16 @@ publish = false
 description = "Frames core logic: bucket keys, dates, change-log types, local schema. No I/O, no UI."
 
 [dependencies]
+byteorder = "1"
 chrono = { version = "0.4", features = ["serde"] }
 fastrand = "2"
 flate2 = "1"
+png = "0.18"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"

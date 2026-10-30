@@ -5,7 +5,9 @@
 //! Spec: `docs/design-spec.md`.
 
 pub mod dates;
+pub mod importer;
 pub mod keys;
+pub mod media;
 pub mod ops;
 pub mod store;
 

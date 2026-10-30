@@ -1055,15 +1055,19 @@ dependencies = [
 name = "frames-core"
 version = "0.1.0"
 dependencies = [
+ "byteorder",
  "chrono",
  "fastrand",
  "flate2",
+ "png",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

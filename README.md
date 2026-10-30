@@ -11,18 +11,23 @@ the code adds to the spec, and what is still open.
 ## Layout
 
 ```
-docs/                    the spec and running notes
-crates/frames-core/      pure logic, tested on its own (no I/O, no UI)
+docs/                    the spec and running handover notes (docs/spec-notes.md)
+frames_design_spec.md    canonical copy of the design spec
+crates/frames-core/      core library, tested on its own (57 unit + integration tests)
   schema.sql               local SQLite schema (spec section 5)
   src/keys.rs              bucket keys, name-clash naming, log/snapshot keys
   src/dates.rs             date-taken fallback chain, filename dates, folder month
   src/ops.rs               change-log batch types (spec sections 5-6)
-  tests/schema.rs          loads schema.sql into real SQLite, FTS5 included
+  src/store.rs             SQLite store, merge engine, outbox, snapshots, FTS5 search
+  src/media.rs             EXIF/QuickTime/ffprobe metadata, RAW preview, WebP thumbnails
+  src/importer.rs          recursive scanner, SHA-256 fingerprint, Live Photo pairing
+  src/s4.rs                S4/S3 client, SigV4 signing, presigned URLs, multipart, keychain
+  src/cache.rs             permanent s.webp store + size-capped LRU preview/original cache
+  src/trash.rs             30-day trash auto-purge, delete now, empty trash
+  src/sync.rs              outbox flush, log pull, snapshots, import runner, check/rebuild
+  tests/                   schema and multi-device sync integration tests
+frames-shell/            Tauri 2 (Rust shell) + Svelte 5 UI
 ```
-
-Coming later, one slice at a time: `src-tauri/` (the Tauri 2 shell) and `ui/`
-(Svelte), then the modules in spec section 3 (`store`, `s4`, `sync`,
-`importer`, `media`, `player`, `cache`, `trash`).
 
 ## Working on it
 
@@ -38,7 +43,8 @@ git-ignored and must stay out of the repo.
 
 ## Status
 
-Slice 1: the core crate. `schema.sql` has been loaded and queried in SQLite and
-the filename-date pattern checked against its test cases. The Rust itself has
-not been compiled yet; run the tests on first checkout and fix whatever the
-compiler finds.
+Slices 1–4 are complete and verified (`57` passing tests in `frames-core`).
+Next up:
+- **Slice 5**: `player` module (play-direct / repackage / convert decision + loopback `127.0.0.1` ffmpeg streaming server).
+- **Slice 6**: Tauri 2 command bridge + Apple Photos-style Svelte 5 UI in `frames-shell`.
+See [docs/spec-notes.md](docs/spec-notes.md) for detailed handover notes.

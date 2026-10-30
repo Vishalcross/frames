@@ -4,12 +4,16 @@
 //!
 //! Spec: `docs/design-spec.md`.
 
+pub mod cache;
 pub mod dates;
 pub mod importer;
 pub mod keys;
 pub mod media;
 pub mod ops;
+pub mod s4;
 pub mod store;
+pub mod sync;
+pub mod trash;
 
 /// The local SQLite schema (spec section 5), applied when a database is created.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");

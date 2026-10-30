@@ -97,7 +97,7 @@ cargo test -p frames-core
    - `crates/frames-core/src/importer.rs`:
      - `scan_paths`, `pair_live_photos` (by Apple `ContentIdentifier` or fallback same folder + base filename stem), and `prepare_import_plan` (with duplicate skipping and S4 name-clash alignment).
 
-4. **Slice 4 — S4 Client, Local Cache, 30-Day Trash Purge & Cloud Sync Engine**
+4. **Slice 4 — S4 Client, Local Cache, 30-Day Trash Purge & Cloud Sync Engine (`138aa69`)**
    - `crates/frames-core/src/s4.rs`:
      - Pure-Rust AWS Signature V4 (`AWS4-HMAC-SHA256`) request signing (`sign_s4_request`) and `Range`-capable presigned `GET` URLs (`presign_get_url`).
      - `ObjectStore` trait + `S4Client` (native OS `curl` HTTPS transport, XML parsers for `ListObjectsV2` and multipart uploads) + `InMemoryObjectStore` (with fault injection and offline simulation for tests).
@@ -111,11 +111,14 @@ cargo test -p frames-core
    - `crates/frames-core/src/sync.rs`:
      - `flush_outbox`, `pull_remote_logs`, `write_snapshot_if_needed`, `sync_once`, `rebuild_from_s4`, `check_library`, `run_import`, and `export_originals`.
 
-### Remaining Slices
+5. **Slice 5 — `player` (Video Playback Decision, Photo Decoder & Loopback Streaming Server)**
+   - `crates/frames-core/src/player.rs`:
+     - `decide_playback`: Evaluates `(container, video_codec, audio_codec, PlayerCapabilities)` and returns `PlaybackDecision::PlayDirect`, `PlaybackDecision::Repackage` (`ffmpeg -c copy` to fragmented MP4), or `PlaybackDecision::Convert { copy_video, copy_audio }`.
+     - `detect_best_h264_encoder` & `build_ffmpeg_stream_args`: Selects hardware encoder (`h264_videotoolbox`, `h264_nvenc`, `h264_qsv`, `h264_amf`, `h264_mf`) or software `libx264` fallback, placing `-ss <seek>` before `-i <presigned_url>` for HTTP Range seeking and outputting fragmented MP4 (`frag_keyframe+empty_moov+default_base_moof`) to `pipe:1`.
+     - `prepare_photo_for_webview`: Extracts embedded JPEG from RAW files (`dng`, `cr2`, `cr3`, `nef`, `arw`) and decodes `heic` to JPEG in memory on platforms where the webview lacks native HEIC support.
+     - `LoopbackStreamServer`: Binds `127.0.0.1:0` with a random 128-bit hex session token, validates `/stream/<session_id>?token=<tok>&t=<seek_secs>`, streams `ffmpeg` stdout directly to the player without touching disk/S4, and returns HTTP 500 `"Can't play here"` if conversion fails.
 
-5. **Slice 5 — `player` (Video Playback Decision & Loopback HTTP Streaming Server)**
-   - Play-direct vs. repackage (`ffmpeg -c copy` to fragmented MP4) vs. convert (`ffmpeg` hardware-accelerated or `libx264` to H.264/AAC fragmented MP4) decision logic (`crates/frames-core/src/player.rs`).
-   - Loopback `127.0.0.1` HTTP streaming server on a random port with per-session token and `-ss` seek restart support, plus HEIC/RAW on-the-fly image decode endpoint for Windows.
+### Remaining Slice
 
 6. **Slice 6 — Tauri 2 Commands & Apple Photos-Style Svelte 5 UI (`frames-shell`)**
    - Wire `Store`, `S4Client` / `InMemoryObjectStore`, `LocalCache`, `sync`, `trash`, and `player` into `frames-shell/src-tauri/src/lib.rs` state and Tauri commands.

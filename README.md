@@ -25,6 +25,7 @@ crates/frames-core/      core library, tested on its own (57 unit + integration 
   src/cache.rs             permanent s.webp store + size-capped LRU preview/original cache
   src/trash.rs             30-day trash auto-purge, delete now, empty trash
   src/sync.rs              outbox flush, log pull, snapshots, import runner, check/rebuild
+  src/player.rs            video play/repackage/convert decision + 127.0.0.1 stream server
   tests/                   schema and multi-device sync integration tests
 frames-shell/            Tauri 2 (Rust shell) + Svelte 5 UI
 ```
@@ -43,8 +44,7 @@ git-ignored and must stay out of the repo.
 
 ## Status
 
-Slices 1–4 are complete and verified (`57` passing tests in `frames-core`).
+Slices 1–5 are complete and verified (`60` passing tests in `frames-core`: all 8 core Rust modules from spec section 3 are implemented and unit-tested).
 Next up:
-- **Slice 5**: `player` module (play-direct / repackage / convert decision + loopback `127.0.0.1` ffmpeg streaming server).
 - **Slice 6**: Tauri 2 command bridge + Apple Photos-style Svelte 5 UI in `frames-shell`.
 See [docs/spec-notes.md](docs/spec-notes.md) for detailed handover notes.

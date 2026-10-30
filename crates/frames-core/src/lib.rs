@@ -10,6 +10,7 @@ pub mod importer;
 pub mod keys;
 pub mod media;
 pub mod ops;
+pub mod player;
 pub mod s4;
 pub mod store;
 pub mod sync;

@@ -3,6 +3,7 @@
   import Badge from '$lib/components/surface/Badge.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import { getThumbnailDataUrl } from '$lib/mock/mockRepo';
+  import { isTauriAvailable } from '$lib/services/tauriRepo';
   import { theme } from '$lib/theme/engine.svelte';
 
   let {
@@ -28,7 +29,15 @@
   } = $props();
 
   let isLoaded = $state(false);
-  const thumbUrl = $derived(getThumbnailDataUrl(asset, 'thumb'));
+  let imgError = $state(false);
+
+  const thumbUrl = $derived.by(() => {
+    if (imgError) return getThumbnailDataUrl(asset, 'thumb');
+    if (isTauriAvailable()) {
+      return `frames://thumb/${asset.id}`;
+    }
+    return getThumbnailDataUrl(asset, 'thumb');
+  });
 
   const formattedDuration = $derived.by(() => {
     if (!asset.durationMs) return '';
@@ -70,6 +79,10 @@
       loading="lazy"
       class="tile-image {isLoaded ? 'loaded' : ''}"
       onload={() => (isLoaded = true)}
+      onerror={() => {
+        imgError = true;
+        isLoaded = true;
+      }}
     />
   </div>
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import Tile from './Tile.svelte';
-  import type { Asset, Query } from '$lib/types';
+  import type { Asset, AssetRepo, Query } from '$lib/types';
   import { mockRepo } from '$lib/mock/mockRepo';
   import { focusAsset } from '$lib/theme/engine.svelte';
 
@@ -9,6 +9,7 @@
 
   let {
     query = {},
+    repo = mockRepo,
     zoomLevelIndex = $bindable(2),
     isFill = $bindable(true),
     selectedIds = $bindable<Set<string>>(new Set()),
@@ -16,6 +17,7 @@
     onselectionchange
   }: {
     query?: Query;
+    repo?: AssetRepo;
     zoomLevelIndex?: number;
     isFill?: boolean;
     selectedIds?: Set<string>;
@@ -65,12 +67,12 @@
   const startIndex = $derived(startRow * cols);
   const endIndex = $derived(Math.min(totalAssets, endRow * cols));
 
-  // Load visible batch of assets from mockRepo
+  // Load visible batch of assets from repo
   $effect(() => {
     const fetchVisible = async () => {
       const needed = endIndex - startIndex;
       if (needed <= 0) return;
-      const assets = await mockRepo.range(query, startIndex, needed);
+      const assets = await repo.range(query, startIndex, needed);
       const newMap = new Map(assetsMap);
       assets.forEach((a, i) => {
         newMap.set(startIndex + i, a);
@@ -82,7 +84,7 @@
 
   // Query count update
   $effect(() => {
-    mockRepo.count(query).then((cnt) => {
+    repo.count(query).then((cnt) => {
       totalAssets = cnt;
     });
   });
@@ -268,6 +270,13 @@
     <span>{datePillText}</span>
   </div>
 
+  {#if totalAssets === 0}
+    <div class="empty-grid-notice">
+      <p class="empty-notice-title">No Photos Found</p>
+      <p class="empty-notice-desc">The library has no items in this view. Use the Import button in the toolbar to load photos or seed demo data.</p>
+    </div>
+  {/if}
+
   <!-- Content canvas with virtualized row spacer -->
   <div
     class="virtual-grid-content"
@@ -445,5 +454,33 @@
     border-radius: 4px;
     pointer-events: none;
     z-index: 40;
+  }
+
+  .empty-grid-notice {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    max-width: 360px;
+    gap: 8px;
+    z-index: 10;
+  }
+
+  .empty-notice-title {
+    font-size: var(--text-size-title);
+    font-weight: 600;
+    color: var(--text-1);
+    margin: 0;
+  }
+
+  .empty-notice-desc {
+    font-size: var(--text-size-body);
+    line-height: var(--text-lh-body);
+    color: var(--text-2);
+    margin: 0;
   }
 </style>

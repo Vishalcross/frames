@@ -7,6 +7,7 @@
 
   let {
     album,
+    repo,
     zoomLevelIndex = $bindable(2),
     isFill = $bindable(true),
     selectedIds = $bindable<Set<string>>(new Set()),
@@ -14,6 +15,7 @@
     onselectionchange
   }: {
     album: AlbumItem;
+    repo?: any;
     zoomLevelIndex?: number;
     isFill?: boolean;
     selectedIds?: Set<string>;
@@ -76,6 +78,7 @@
   <!-- Album Assets Grid -->
   <div class="album-grid-wrap">
     <VirtualGrid
+      {repo}
       {query}
       bind:zoomLevelIndex
       bind:isFill

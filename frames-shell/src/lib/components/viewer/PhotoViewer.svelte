@@ -5,6 +5,7 @@
   import Button from '$lib/components/surface/Button.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import { getThumbnailDataUrl, getAssetByIndex } from '$lib/mock/mockRepo';
+  import { isTauriAvailable } from '$lib/services/tauriRepo';
   import { theme, focusAsset } from '$lib/theme/engine.svelte';
 
   let {
@@ -163,7 +164,15 @@
     })
   );
 
-  const previewUrl = $derived(getThumbnailDataUrl(asset, 'preview'));
+  let previewError = $state(false);
+
+  const previewUrl = $derived.by(() => {
+    if (previewError) return getThumbnailDataUrl(asset, 'preview');
+    if (isTauriAvailable()) {
+      return `frames://preview/${asset.id}`;
+    }
+    return getThumbnailDataUrl(asset, 'preview');
+  });
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -284,6 +293,7 @@
           src={previewUrl}
           alt={asset.title || 'Photo'}
           class="viewer-main-image"
+          onerror={() => (previewError = true)}
         />
       </div>
 

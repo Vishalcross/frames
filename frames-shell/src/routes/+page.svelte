@@ -36,8 +36,16 @@
   import { theme, initThemeEngine, cycleAppearance } from '$lib/theme/engine.svelte';
   import { startPerformanceGovernor } from '$lib/theme/glass';
   import { mockRepo, getAssetByIndex } from '$lib/mock/mockRepo';
+  import { tauriRepo, isTauriAvailable } from '$lib/services/tauriRepo';
+  import { invoke } from '@tauri-apps/api/core';
   import { SAMPLE_ALBUMS } from '$lib/mock/sampleData';
   import type { AlbumItem, Asset, Query } from '$lib/types';
+
+  // Backend state (Milestone M6 bridge)
+  const isTauri = isTauriAvailable();
+  let useRealBackend = $state(isTauri);
+  let gridKey = $state(0);
+  const activeRepo = $derived(useRealBackend ? tauriRepo : mockRepo);
 
   // Navigation & View Routing State
   let currentRoute = $state('library');
@@ -148,6 +156,13 @@
     const cleanupEngine = initThemeEngine();
     const cleanupGovernor = startPerformanceGovernor();
 
+    // Initialise Tauri SQLite bootstrap if running desktop
+    if (isTauri) {
+      tauriRepo.loadBootstrap().then(() => {
+        gridKey++;
+      });
+    }
+
     // Initial navigation entry
     navigationHistory.push({ route: 'library', albumId: '', subView: 'all' });
 
@@ -230,10 +245,10 @@
   function handleFavorite() {
     if (viewerOpen && activeViewerAsset) {
       activeViewerAsset.favorite = !activeViewerAsset.favorite;
-      mockRepo.updateFavorite(activeViewerAsset.id, activeViewerAsset.favorite);
+      activeRepo.updateFavorite(activeViewerAsset.id, activeViewerAsset.favorite);
     } else {
       selectedIds.forEach((id) => {
-        mockRepo.updateFavorite(id, true);
+        activeRepo.updateFavorite(id, true);
       });
       toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Added ${selectedIds.size} items to Favorites` }];
     }
@@ -249,13 +264,76 @@
 
   function handleDeleteConfirmed() {
     selectedIds.forEach((id) => {
-      mockRepo.updateDeleted(id, true);
+      activeRepo.updateDeleted(id, true);
     });
     toasts = [
       ...toasts,
       { id: Date.now().toString(), type: 'info', text: `Moved ${selectedIds.size} items to Recently Deleted` }
     ];
     selectedIds = new Set();
+    gridKey++;
+  }
+
+  // Real Backend Bridge Handlers (M6)
+  async function handlePickFolderAndImport() {
+    if (!isTauri) {
+      toasts = [
+        ...toasts,
+        {
+          id: Date.now().toString(),
+          type: 'info',
+          text: 'Running in browser dev server. To access native folder dialog and SQLite, launch via "npm run tauri dev".'
+        }
+      ];
+      return;
+    }
+    toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Opening system folder dialog…' }];
+    const res = await tauriRepo.pickFolderAndImport();
+    if (res.error) {
+      toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: res.error }];
+    } else {
+      useRealBackend = true;
+      gridKey++;
+      toasts = [
+        ...toasts,
+        { id: Date.now().toString(), type: 'info', text: `Imported ${res.count} photos into SQLite database!` }
+      ];
+    }
+  }
+
+  async function handleSeedDemo() {
+    if (!isTauri) {
+      toasts = [
+        ...toasts,
+        {
+          id: Date.now().toString(),
+          type: 'info',
+          text: 'Seeding SQLite store requires running inside the Tauri 2 desktop window.'
+        }
+      ];
+      return;
+    }
+    toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Writing sample records & WebP thumbnails to SQLite…' }];
+    const count = await tauriRepo.seedDemoLibrary();
+    useRealBackend = true;
+    gridKey++;
+    toasts = [
+      ...toasts,
+      { id: Date.now().toString(), type: 'info', text: `Seeded ${count} items with real EXIF & thumbnails into SQLite!` }
+    ];
+  }
+
+  function handleToggleBackend() {
+    useRealBackend = !useRealBackend;
+    gridKey++;
+    toasts = [
+      ...toasts,
+      {
+        id: Date.now().toString(),
+        type: 'info',
+        text: useRealBackend ? 'Switched data source: Rust SQLite Core' : 'Switched data source: 100,000 Item Benchmark Fixture'
+      }
+    ];
   }
 
   // Global Keyboard Shortcuts (§12)
@@ -334,12 +412,16 @@
         bind:infoPanelOpen
         bind:isSidebarCollapsed
         {isScrolled}
+        {useRealBackend}
+        {isTauri}
         onback={goBack}
         onforward={goForward}
         onshare={handleShare}
         onfavorite={handleFavorite}
         onrotate={handleRotate}
         onopenSettings={() => (settingsOpen = true)}
+        ontogglebackend={handleToggleBackend}
+        onimport={handlePickFolderAndImport}
       />
 
       <!-- Scroll edge blur effect (§8.1 #3) -->
@@ -363,13 +445,16 @@
             <MonthsView year={selectedYear} ondrillmonth={handleDrillMonth} />
           {:else}
             <!-- All Continuous Virtualized Grid (§4.3, §4.4) -->
-            <VirtualGrid
-              query={currentQuery}
-              bind:zoomLevelIndex
-              bind:isFill
-              bind:selectedIds
-              onopenphoto={openPhoto}
-            />
+            {#key gridKey}
+              <VirtualGrid
+                repo={activeRepo}
+                query={currentQuery}
+                bind:zoomLevelIndex
+                bind:isFill
+                bind:selectedIds
+                onopenphoto={openPhoto}
+              />
+            {/key}
           {/if}
         {:else if currentRoute === 'collections'}
           <!-- Collections Landing Rails (§4.9) -->
@@ -380,6 +465,7 @@
         {:else if currentRoute === 'album-detail'}
           <!-- Album Detail with 0.4 Parallax Ambient Hero (§4.9) -->
           <AlbumDetailView
+            repo={activeRepo}
             album={activeAlbum}
             bind:zoomLevelIndex
             bind:isFill
@@ -396,16 +482,25 @@
           <!-- Recently Deleted with days-remaining labels (§4.12) -->
           <TrashView />
         {:else if currentRoute === 'imports'}
-          <EmptyLibraryView onimport={() => (importDragging = true)} />
+          <EmptyLibraryView
+            {isTauri}
+            {useRealBackend}
+            onimport={handlePickFolderAndImport}
+            onseed={handleSeedDemo}
+            ontogglebenchmark={handleToggleBackend}
+          />
         {:else}
           <!-- Generic Filtered Grid for Favorites, Videos, Hidden, Captured by Me -->
-          <VirtualGrid
-            query={currentQuery}
-            bind:zoomLevelIndex
-            bind:isFill
-            bind:selectedIds
-            onopenphoto={openPhoto}
-          />
+          {#key gridKey}
+            <VirtualGrid
+              repo={activeRepo}
+              query={currentQuery}
+              bind:zoomLevelIndex
+              bind:isFill
+              bind:selectedIds
+              onopenphoto={openPhoto}
+            />
+          {/key}
         {/if}
       </div>
 
@@ -478,8 +573,25 @@
   <!-- OS Drag-and-Drop Import Overlay (§4.12) -->
   <ImportOverlay
     bind:isDragging={importDragging}
-    ondropfiles={(files) => {
-      toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Importing ${files.length} items…` }];
+    ondropfiles={async (files) => {
+      const paths: string[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const p = (files[i] as any).path;
+        if (p) paths.push(p);
+      }
+      if (paths.length > 0 && isTauri) {
+        toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Importing ${paths.length} items into SQLite…` }];
+        try {
+          const res = await invoke<any>('import_from_paths', { paths, albumId: null });
+          await tauriRepo.loadBootstrap();
+          gridKey++;
+          toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Successfully imported ${res.imported_count || paths.length} items!` }];
+        } catch (e: any) {
+          toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: `Import failed: ${e?.toString() || e}` }];
+        }
+      } else {
+        toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Received ${files.length} items for import.` }];
+      }
     }}
   />
 

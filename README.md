@@ -44,8 +44,8 @@ git-ignored and must stay out of the repo.
 
 ## Status
 
-All 7 slices (100% of v1 architecture in [docs/design-spec.md](docs/design-spec.md) plus all 26 adversarial review fixes from [frames_review.md](frames_review.md)) are implemented and verified:
-- **Slices 1–5 (`frames-core`)**: `keys`, `dates`, `ops`, `store`, `media`, `importer`, `s4`, `cache`, `trash`, `sync`, and `player` (`65` passing unit and integration tests).
-- **Slice 6 (`frames-shell`)**: Tauri 2 Rust command bridge + custom `frames://` binary media protocol + virtualized Apple Photos-style Svelte 5 desktop UI (`1` isolated state test, `0` `svelte-check` warnings).
-- **Slice 7 (Adversarial Review Hardening)**: All 26 P0–P2 issues resolved (`0` `cargo clippy --workspace --all-targets` warnings).
+All 8 slices (100% of v1 architecture in [docs/design-spec.md](docs/design-spec.md), all 26 first-round adversarial review fixes from [frames_review.md](frames_review.md), and all 7 second-round pre-import blockers) are implemented and verified:
+- **Slices 1–5 (`frames-core`)**: `keys`, `dates`, `ops`, `store`, `media`, `importer`, `s4`, `cache`, `trash`, `sync`, and `player` (`65` unit tests + `6` integration tests passing).
+- **Slice 6 (`frames-shell`)**: Tauri 2 Rust command bridge + async custom `frames://` binary media protocol + virtualized Apple Photos-style Svelte 5 desktop UI (`1` isolated state test, `0` `svelte-check` warnings).
+- **Slices 7–8 (Adversarial Review & Pre-Import Blockers)**: No silent fake-S4 fallback, propagated Keychain errors, 31-second exponential retry backoff, accurate `curl` exit-code classification, lock-free folder hashing, unlocked async `frames://` S4 downloads + background `s.webp` sync, non-blocking startup trash purge, single-import guard + 4-worker work-stealing upload pool + per-part multipart cancel, Windows HTML5 drag-drop compatibility, and local S3/MinIO HTTP + live S4 smoke tests (`0` `cargo clippy --workspace --all-targets` warnings).
 See [docs/spec-notes.md](docs/spec-notes.md) for detailed handover notes.

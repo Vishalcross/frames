@@ -22,6 +22,12 @@ pub const SPACE_WARN_FRACTION: f64 = 0.90;
 pub const DEFAULT_MULTIPART_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 /// Default multipart chunk size: 16 MB.
 pub const DEFAULT_MULTIPART_PART_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+/// Default exponential backoff base delay: 1,000 ms (1s, 2s, 4s, 8s, 16s = 31s across 5 retries).
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1_000;
+
+fn default_retry_base_delay_ms() -> u64 {
+    DEFAULT_RETRY_BASE_DELAY_MS
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S4Config {
@@ -40,6 +46,12 @@ pub struct S4Config {
     pub multipart_threshold_bytes: u64,
     /// Size of each multipart upload part (default 16 MB).
     pub multipart_part_size_bytes: u64,
+    /// Base delay in milliseconds for exponential backoff retries (default 1,000 ms).
+    #[serde(default = "default_retry_base_delay_ms")]
+    pub retry_base_delay_ms: u64,
+    /// Optional Unix domain socket path for local S3/MinIO transport testing (`curl --unix-socket`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_socket_path: Option<String>,
 }
 
 impl Default for S4Config {
@@ -53,6 +65,8 @@ impl Default for S4Config {
             space_limit_bytes: DEFAULT_SPACE_LIMIT_BYTES,
             multipart_threshold_bytes: DEFAULT_MULTIPART_THRESHOLD_BYTES,
             multipart_part_size_bytes: DEFAULT_MULTIPART_PART_SIZE_BYTES,
+            retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+            unix_socket_path: None,
         }
     }
 }
@@ -61,6 +75,12 @@ impl Default for S4Config {
 pub enum S4Error {
     #[error("offline or network unreachable: {0}")]
     Offline(String),
+    #[error("transient S4 transport timeout or connection reset: {0}")]
+    TransientTransport(String),
+    #[error("S4 transport or TLS error: {0}")]
+    Transport(String),
+    #[error("upload cancelled")]
+    Cancelled,
     #[error("bad S4 credentials or access denied (check Settings): {0}")]
     BadCredentials(String),
     #[error("S4 space limit reached ({used_bytes} / {limit_bytes} bytes used)")]
@@ -78,7 +98,10 @@ pub enum S4Error {
 impl S4Error {
     /// True if the operation should be retried with exponential backoff (spec section 7 & 11).
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::ServerBusy { .. } | Self::Offline(_))
+        matches!(
+            self,
+            Self::ServerBusy { .. } | Self::TransientTransport(_) | Self::Offline(_)
+        )
     }
 }
 
@@ -412,17 +435,56 @@ pub fn upload_file_with_resume<F>(
     existing_upload_id: Option<&str>,
     parts_already_done: u32,
     max_retries: u32,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<()>
 where
     F: FnMut(Option<&str>, u32),
 {
+    upload_file_with_resume_cancel(
+        store,
+        path,
+        key,
+        content_type,
+        existing_upload_id,
+        parts_already_done,
+        max_retries,
+        on_progress,
+        || false,
+    )
+}
+
+/// Resumable file upload helper with exponential backoff retry and per-part
+/// cancellation hook `should_cancel`.
+#[allow(clippy::too_many_arguments)]
+pub fn upload_file_with_resume_cancel<F, C>(
+    store: &dyn ObjectStore,
+    path: &Path,
+    key: &str,
+    content_type: &str,
+    existing_upload_id: Option<&str>,
+    parts_already_done: u32,
+    max_retries: u32,
+    mut on_progress: F,
+    should_cancel: C,
+) -> Result<()>
+where
+    F: FnMut(Option<&str>, u32),
+    C: Fn() -> bool,
+{
+    if should_cancel() {
+        return Err(S4Error::Cancelled);
+    }
+
     let mut file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
     let cfg = store.config();
+    let base_delay_ms = cfg.retry_base_delay_ms;
 
     if file_size <= cfg.multipart_threshold_bytes {
-        retry_with_backoff(max_retries, || {
+        retry_with_backoff_cfg(max_retries, base_delay_ms, || {
+            if should_cancel() {
+                return Err(S4Error::Cancelled);
+            }
             store.put_object_from_file(key, path, content_type).map(|_| ())
         })?;
         on_progress(None, 1);
@@ -435,22 +497,35 @@ where
     // authentic server-side ETags of already-uploaded parts. If the upload_id
     // expired or was aborted on the server (404 NoSuchUpload), start a new one.
     let (upload_id, existing_parts_map) = match existing_upload_id {
-        Some(id) if !id.is_empty() => match retry_with_backoff(max_retries, || store.list_parts(key, id)) {
-            Ok(parts) => {
-                let map: BTreeMap<u32, UploadedPart> =
-                    parts.into_iter().map(|p| (p.part_number, p)).collect();
-                (id.to_string(), map)
+        Some(id) if !id.is_empty() => {
+            match retry_with_backoff_cfg(max_retries, base_delay_ms, || {
+                if should_cancel() {
+                    return Err(S4Error::Cancelled);
+                }
+                store.list_parts(key, id)
+            }) {
+                Ok(parts) => {
+                    let map: BTreeMap<u32, UploadedPart> =
+                        parts.into_iter().map(|p| (p.part_number, p)).collect();
+                    (id.to_string(), map)
+                }
+                Err(S4Error::Http { status: 404, .. }) => {
+                    let new_id = retry_with_backoff_cfg(max_retries, base_delay_ms, || {
+                        if should_cancel() {
+                            return Err(S4Error::Cancelled);
+                        }
+                        store.create_multipart_upload(key, content_type)
+                    })?;
+                    (new_id, BTreeMap::new())
+                }
+                Err(e) => return Err(e),
             }
-            Err(S4Error::Http { status: 404, .. }) => {
-                let new_id = retry_with_backoff(max_retries, || {
-                    store.create_multipart_upload(key, content_type)
-                })?;
-                (new_id, BTreeMap::new())
-            }
-            Err(e) => return Err(e),
-        },
+        }
         _ => {
-            let new_id = retry_with_backoff(max_retries, || {
+            let new_id = retry_with_backoff_cfg(max_retries, base_delay_ms, || {
+                if should_cancel() {
+                    return Err(S4Error::Cancelled);
+                }
                 store.create_multipart_upload(key, content_type)
             })?;
             (new_id, BTreeMap::new())
@@ -464,6 +539,10 @@ where
     let mut completed_parts: Vec<(u32, String)> = Vec::with_capacity(total_parts as usize);
 
     for part_num in 1..=total_parts {
+        if should_cancel() {
+            return Err(S4Error::Cancelled);
+        }
+
         let offset = u64::from(part_num - 1) * part_size;
         let len = (file_size - offset).min(part_size) as usize;
 
@@ -478,20 +557,39 @@ where
         let mut chunk = vec![0u8; len];
         file.read_exact(&mut chunk)?;
 
-        let etag = retry_with_backoff(max_retries, || {
+        let etag = retry_with_backoff_cfg(max_retries, base_delay_ms, || {
+            if should_cancel() {
+                return Err(S4Error::Cancelled);
+            }
             store.upload_part(key, &upload_id, part_num, &chunk)
         })?;
         completed_parts.push((part_num, etag));
         on_progress(Some(&upload_id), part_num);
     }
 
-    retry_with_backoff(max_retries, || {
+    if should_cancel() {
+        return Err(S4Error::Cancelled);
+    }
+
+    retry_with_backoff_cfg(max_retries, base_delay_ms, || {
+        if should_cancel() {
+            return Err(S4Error::Cancelled);
+        }
         store.complete_multipart_upload(key, &upload_id, &completed_parts)
     })?;
     Ok(())
 }
 
-pub fn retry_with_backoff<T, F>(max_retries: u32, mut op: F) -> Result<T>
+/// Compute the exponential backoff sleep duration in milliseconds for retry `attempt`
+/// (1-indexed: attempt 1 -> `base_delay_ms`, attempt 2 -> `2 * base_delay_ms`, ...,
+/// capped at 30 seconds). With default `base_delay_ms = 1_000` and `max_retries = 5`,
+/// retries wait `1s + 2s + 4s + 8s + 16s = 31s` across transient network blips.
+pub fn compute_backoff_delay_ms(attempt: u32, base_delay_ms: u64) -> u64 {
+    let shift = attempt.saturating_sub(1).min(5);
+    base_delay_ms.saturating_mul(1u64 << shift).min(30_000)
+}
+
+pub fn retry_with_backoff_cfg<T, F>(max_retries: u32, base_delay_ms: u64, mut op: F) -> Result<T>
 where
     F: FnMut() -> Result<T>,
 {
@@ -504,12 +602,18 @@ where
                     return Err(err);
                 }
                 attempt += 1;
-                // Exponential backoff capped at 2s in normal runtime (fast in tests)
-                let delay_ms = (10u64 << attempt.min(6)).min(500);
+                let delay_ms = compute_backoff_delay_ms(attempt, base_delay_ms);
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
         }
     }
+}
+
+pub fn retry_with_backoff<T, F>(max_retries: u32, op: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    retry_with_backoff_cfg(max_retries, DEFAULT_RETRY_BASE_DELAY_MS, op)
 }
 
 // =============================================================================
@@ -535,7 +639,10 @@ pub struct InMemoryObjectStore {
 }
 
 impl InMemoryObjectStore {
-    pub fn new(config: S4Config) -> Self {
+    pub fn new(mut config: S4Config) -> Self {
+        if config.retry_base_delay_ms == DEFAULT_RETRY_BASE_DELAY_MS {
+            config.retry_base_delay_ms = 10;
+        }
         Self {
             config,
             state: Arc::new(Mutex::new(InMemoryBucketState::default())),
@@ -836,6 +943,28 @@ pub fn build_curl_args(
     args
 }
 
+/// Classify a non-zero `curl` exit code so only true network unreachability
+/// (`CURLE_COULDNT_RESOLVE_HOST = 6`, `CURLE_COULDNT_CONNECT = 7`) reports as
+/// `S4Error::Offline`, while transient transfer drops/timeouts (`18`, `28`, `52`,
+/// `55`, `56`) report as `S4Error::TransientTransport` (retryable without
+/// marking the app offline), and TLS/URL/configuration failures report as
+/// `S4Error::Transport` (non-retryable).
+pub fn classify_curl_exit_code(exit_code: Option<i32>, stderr: &str) -> S4Error {
+    let trimmed = stderr.trim();
+    let detail = if trimmed.is_empty() {
+        format!("curl exit code {:?}", exit_code)
+    } else {
+        format!("{trimmed} (curl exit {:?})", exit_code)
+    };
+    match exit_code {
+        Some(6) | Some(7) => S4Error::Offline(detail),
+        Some(18) | Some(28) | Some(52) | Some(55) | Some(56) => {
+            S4Error::TransientTransport(detail)
+        }
+        _ => S4Error::Transport(detail),
+    }
+}
+
 impl S4Client {
     pub fn new(config: S4Config) -> Self {
         Self { config }
@@ -863,7 +992,10 @@ impl S4Client {
         let send_body = !body.is_empty() || matches!(method, "PUT" | "POST");
         let args = build_curl_args(method, &url, &signed_headers, send_body);
 
-        let mut cmd = Command::new("curl");
+        let mut cmd = crate::media::spawn_hidden_command("curl");
+        if let Some(ref sock) = self.config.unix_socket_path {
+            cmd.arg("--unix-socket").arg(sock);
+        }
         cmd.args(&args);
 
         let mut child = cmd
@@ -875,7 +1007,7 @@ impl S4Client {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| S4Error::Offline(e.to_string()))?;
+            .map_err(|e| S4Error::Transport(format!("failed to launch curl: {e}")))?;
 
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
@@ -884,10 +1016,10 @@ impl S4Client {
 
         let output = child
             .wait_with_output()
-            .map_err(|e| S4Error::Offline(e.to_string()))?;
+            .map_err(|e| S4Error::Transport(format!("failed waiting on curl: {e}")))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(S4Error::Offline(stderr));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(classify_curl_exit_code(output.status.code(), &stderr));
         }
 
         parse_raw_http_response(&output.stdout)
@@ -993,7 +1125,10 @@ impl ObjectStore for S4Client {
             Utc::now(),
         );
 
-        let mut cmd = Command::new("curl");
+        let mut cmd = crate::media::spawn_hidden_command("curl");
+        if let Some(ref sock) = self.config.unix_socket_path {
+            cmd.arg("--unix-socket").arg(sock);
+        }
         cmd.args([
             "-sS",
             "--connect-timeout",
@@ -1017,12 +1152,12 @@ impl ObjectStore for S4Client {
         let output = cmd
             .stdin(std::process::Stdio::null())
             .output()
-            .map_err(|e| S4Error::Offline(e.to_string()))?;
+            .map_err(|e| S4Error::Transport(format!("failed to launch curl: {e}")))?;
 
         if !output.status.success() {
             let _ = std::fs::remove_file(&tmp_dest);
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(S4Error::Offline(stderr));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(classify_curl_exit_code(output.status.code(), &stderr));
         }
 
         let (status, _, _) = parse_raw_http_response(&output.stdout)?;
@@ -1057,7 +1192,10 @@ impl ObjectStore for S4Client {
             Utc::now(),
         );
 
-        let mut cmd = Command::new("curl");
+        let mut cmd = crate::media::spawn_hidden_command("curl");
+        if let Some(ref sock) = self.config.unix_socket_path {
+            cmd.arg("--unix-socket").arg(sock);
+        }
         cmd.args([
             "-sS",
             "-i",
@@ -1080,11 +1218,11 @@ impl ObjectStore for S4Client {
         let output = cmd
             .stdin(std::process::Stdio::null())
             .output()
-            .map_err(|e| S4Error::Offline(e.to_string()))?;
+            .map_err(|e| S4Error::Transport(format!("failed to launch curl: {e}")))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(S4Error::Offline(stderr));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(classify_curl_exit_code(output.status.code(), &stderr));
         }
 
         let (status, headers, resp_body) = parse_raw_http_response(&output.stdout)?;
@@ -1701,5 +1839,547 @@ mod tests {
         assert_eq!(parts[0].etag, "\"etag-p1\"");
         assert_eq!(parts[0].size, 5_242_880);
         assert!(next_marker.is_none());
+    }
+
+    #[test]
+    fn curl_exit_codes_distinguish_offline_timeout_and_tls_errors() {
+        let dns_err = classify_curl_exit_code(Some(6), "Could not resolve host");
+        assert!(matches!(dns_err, S4Error::Offline(_)));
+        assert!(dns_err.is_retryable());
+
+        let conn_err = classify_curl_exit_code(Some(7), "Failed to connect");
+        assert!(matches!(conn_err, S4Error::Offline(_)));
+        assert!(conn_err.is_retryable());
+
+        let timeout_err = classify_curl_exit_code(Some(28), "Operation timed out");
+        assert!(matches!(timeout_err, S4Error::TransientTransport(_)));
+        assert!(timeout_err.is_retryable());
+
+        let tls_err = classify_curl_exit_code(Some(60), "SSL peer certificate was not OK");
+        assert!(matches!(tls_err, S4Error::Transport(_)));
+        assert!(!tls_err.is_retryable());
+    }
+
+    #[test]
+    fn production_backoff_spans_31_seconds_over_five_retries() {
+        let base = DEFAULT_RETRY_BASE_DELAY_MS;
+        let delays: Vec<u64> = (1..=5).map(|a| compute_backoff_delay_ms(a, base)).collect();
+        assert_eq!(delays, vec![1_000, 2_000, 4_000, 8_000, 16_000]);
+        assert_eq!(delays.iter().sum::<u64>(), 31_000);
+    }
+
+    #[test]
+    fn multipart_upload_stops_immediately_when_cancelled_between_parts() {
+        let cfg = S4Config {
+            multipart_threshold_bytes: 10,
+            multipart_part_size_bytes: 5 * 1024 * 1024,
+            ..Default::default()
+        };
+        let store = InMemoryObjectStore::new(cfg);
+        let key = "originals/2024/05/CANCEL_ME.MOV";
+        let full_data = vec![b'X'; 5 * 1024 * 1024 + 2048];
+        let temp_path = std::env::temp_dir().join(format!("frames-cancel-{}", fastrand::u64(..)));
+        std::fs::write(&temp_path, &full_data).unwrap();
+
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let mut recorded_upload_id = None;
+        let res = upload_file_with_resume_cancel(
+            &store,
+            &temp_path,
+            key,
+            "video/quicktime",
+            None,
+            0,
+            3,
+            |uid, parts_done| {
+                if let Some(u) = uid {
+                    recorded_upload_id = Some(u.to_string());
+                }
+                if parts_done == 1 {
+                    // Cancel right after part 1 finishes
+                    cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            || cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let _ = std::fs::remove_file(&temp_path);
+
+        assert!(matches!(res, Err(S4Error::Cancelled)));
+        assert_eq!(store.upload_part_call_count(), 1);
+        let uid = recorded_upload_id.expect("upload_id should be recorded before cancel");
+        let parts = store.list_parts(key, &uid).unwrap();
+        assert_eq!(parts.len(), 1);
+    }
+
+    fn serve_one_s3_http_conn<S: std::io::Read + std::io::Write>(
+        mut stream: S,
+        backing_srv: &InMemoryObjectStore,
+    ) {
+        use std::io::BufRead;
+        // Read byte-by-byte up to \r\n\r\n so we don't need try_clone() and don't over-buffer body
+        let mut raw_headers = Vec::new();
+        let mut byte = [0u8; 1];
+        while stream.read(&mut byte).unwrap_or(0) == 1 {
+            raw_headers.push(byte[0]);
+            if raw_headers.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if raw_headers.len() > 64 * 1024 {
+                return;
+            }
+        }
+        if raw_headers.is_empty() {
+            return;
+        }
+        let mut cursor = std::io::Cursor::new(&raw_headers);
+        let mut req_line = String::new();
+        if cursor.read_line(&mut req_line).unwrap_or(0) == 0 {
+            return;
+        }
+        let parts: Vec<&str> = req_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return;
+        }
+        let method = parts[0].to_string();
+        let target = parts[1].to_string();
+
+        let mut headers = BTreeMap::new();
+        loop {
+            let mut line = String::new();
+            if cursor.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+
+        if headers
+            .get("expect")
+            .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+        {
+            let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            let _ = stream.flush();
+        }
+
+        let content_len: usize = headers
+            .get("content-length")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_len];
+        if content_len > 0 {
+            let _ = stream.read_exact(&mut body);
+        }
+
+        // Verify AWS SigV4 Authorization header is present on every request
+        let auth = headers.get("authorization").cloned().unwrap_or_default();
+        if !auth.starts_with("AWS4-HMAC-SHA256 Credential=MINIO_TEST_KEY/") {
+            let _ = stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 12\r\n\r\nAccessDenied",
+            );
+            return;
+        }
+
+        let (raw_path, raw_query) = target.split_once('?').unwrap_or((&target, ""));
+        let key_enc = raw_path
+            .strip_prefix("/test-bucket/")
+            .or_else(|| raw_path.strip_prefix("/test-bucket"))
+            .unwrap_or("");
+        let key = key_enc.replace("%20", " ");
+
+        let mut qmap = BTreeMap::new();
+        for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            qmap.insert(k.to_string(), v.replace("%2F", "/"));
+        }
+
+        let write_resp = |stream: &mut S,
+                          status: u16,
+                          reason: &str,
+                          extra_hdrs: &[(&str, String)],
+                          resp_body: &[u8],
+                          is_head: bool| {
+            let mut hdr = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                resp_body.len()
+            );
+            for (hk, hv) in extra_hdrs {
+                hdr.push_str(&format!("{hk}: {hv}\r\n"));
+            }
+            hdr.push_str("\r\n");
+            let _ = stream.write_all(hdr.as_bytes());
+            if !is_head {
+                let _ = stream.write_all(resp_body);
+            }
+            let _ = stream.flush();
+        };
+
+        match method.as_str() {
+            "HEAD" => match backing_srv.head_object(&key) {
+                Ok(Some(meta)) => {
+                    let mut h = Vec::new();
+                    if let Some(etag) = meta.etag {
+                        h.push(("ETag", etag));
+                    }
+                    let dummy = vec![0u8; meta.size as usize];
+                    write_resp(&mut stream, 200, "OK", &h, &dummy, true);
+                }
+                Ok(None) => write_resp(&mut stream, 404, "Not Found", &[], b"", true),
+                Err(S4Error::ServerBusy { status, message }) => {
+                    write_resp(&mut stream, status, "SlowDown", &[], message.as_bytes(), true)
+                }
+                Err(_) => write_resp(&mut stream, 500, "Error", &[], b"", true),
+            },
+            "GET" if qmap.get("list-type").map(String::as_str) == Some("2") => {
+                let prefix = qmap.get("prefix").cloned().unwrap_or_default();
+                match backing_srv.list_objects(&prefix) {
+                    Ok(items) => {
+                        let mut xml = String::from("<ListBucketResult>");
+                        for item in items {
+                            let etag = item.etag.unwrap_or_default();
+                            xml.push_str(&format!(
+                                "<Contents><Key>{}</Key><Size>{}</Size><ETag>{}</ETag></Contents>",
+                                item.key, item.size, etag
+                            ));
+                        }
+                        xml.push_str("</ListBucketResult>");
+                        write_resp(&mut stream, 200, "OK", &[], xml.as_bytes(), false);
+                    }
+                    Err(_) => write_resp(&mut stream, 503, "SlowDown", &[], b"busy", false),
+                }
+            }
+            "GET" if qmap.contains_key("uploadId") => {
+                let uid = qmap.get("uploadId").unwrap();
+                match backing_srv.list_parts(&key, uid) {
+                    Ok(parts) => {
+                        let mut xml =
+                            String::from("<ListPartsResult><IsTruncated>false</IsTruncated>");
+                        for p in parts {
+                            xml.push_str(&format!(
+                                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag><Size>{}</Size></Part>",
+                                p.part_number, p.etag, p.size
+                            ));
+                        }
+                        xml.push_str("</ListPartsResult>");
+                        write_resp(&mut stream, 200, "OK", &[], xml.as_bytes(), false);
+                    }
+                    Err(S4Error::Http { status: 404, .. }) => {
+                        write_resp(&mut stream, 404, "Not Found", &[], b"NoSuchUpload", false)
+                    }
+                    Err(_) => write_resp(&mut stream, 503, "SlowDown", &[], b"busy", false),
+                }
+            }
+            "GET" => {
+                if let Some(range_hdr) = headers.get("range") {
+                    let spec = range_hdr.strip_prefix("bytes=").unwrap_or("");
+                    let (s_str, e_str) = spec.split_once('-').unwrap_or((spec, ""));
+                    let start: u64 = s_str.parse().unwrap_or(0);
+                    let end: Option<u64> = if e_str.is_empty() {
+                        None
+                    } else {
+                        e_str.parse().ok()
+                    };
+                    match backing_srv.get_object_range(&key, start, end) {
+                        Ok(Some(bytes)) => {
+                            write_resp(&mut stream, 206, "Partial Content", &[], &bytes, false)
+                        }
+                        Ok(None) => {
+                            write_resp(&mut stream, 404, "Not Found", &[], b"NoSuchKey", false)
+                        }
+                        Err(_) => write_resp(&mut stream, 503, "SlowDown", &[], b"busy", false),
+                    }
+                } else {
+                    match backing_srv.get_object(&key) {
+                        Ok(Some(bytes)) => write_resp(&mut stream, 200, "OK", &[], &bytes, false),
+                        Ok(None) => {
+                            write_resp(&mut stream, 404, "Not Found", &[], b"NoSuchKey", false)
+                        }
+                        Err(_) => write_resp(&mut stream, 503, "SlowDown", &[], b"busy", false),
+                    }
+                }
+            }
+            "PUT" if qmap.contains_key("partNumber") && qmap.contains_key("uploadId") => {
+                let pnum: u32 = qmap.get("partNumber").unwrap().parse().unwrap_or(1);
+                let uid = qmap.get("uploadId").unwrap();
+                match backing_srv.upload_part(&key, uid, pnum, &body) {
+                    Ok(etag) => write_resp(&mut stream, 200, "OK", &[("ETag", etag)], b"", false),
+                    Err(_) => write_resp(&mut stream, 503, "SlowDown", &[], b"busy", false),
+                }
+            }
+            "PUT" => match backing_srv.put_object(&key, &body, "application/octet-stream") {
+                Ok(etag) => write_resp(&mut stream, 200, "OK", &[("ETag", etag)], b"", false),
+                Err(_) => write_resp(&mut stream, 503, "SlowDown", &[], b"busy", false),
+            },
+            "POST" if qmap.contains_key("uploads") => {
+                match backing_srv.create_multipart_upload(&key, "application/octet-stream") {
+                    Ok(uid) => {
+                        let xml = format!(
+                            "<InitiateMultipartUploadResult><UploadId>{uid}</UploadId></InitiateMultipartUploadResult>"
+                        );
+                        write_resp(&mut stream, 200, "OK", &[], xml.as_bytes(), false);
+                    }
+                    Err(_) => write_resp(&mut stream, 503, "SlowDown", &[], b"busy", false),
+                }
+            }
+            "POST" if qmap.contains_key("uploadId") => {
+                let uid = qmap.get("uploadId").unwrap();
+                let xml = String::from_utf8_lossy(&body);
+                let (parsed_parts, _) = parse_list_parts_xml(&xml);
+                let pairs: Vec<(u32, String)> = parsed_parts
+                    .into_iter()
+                    .map(|p| (p.part_number, p.etag))
+                    .collect();
+                match backing_srv.complete_multipart_upload(&key, uid, &pairs) {
+                    Ok(()) => write_resp(
+                        &mut stream,
+                        200,
+                        "OK",
+                        &[],
+                        b"<CompleteMultipartUploadResult/>",
+                        false,
+                    ),
+                    Err(e) => write_resp(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        &[],
+                        e.to_string().as_bytes(),
+                        false,
+                    ),
+                }
+            }
+            "DELETE" => {
+                let _ = backing_srv.delete_object(&key);
+                write_resp(&mut stream, 204, "No Content", &[], b"", false);
+            }
+            _ => write_resp(&mut stream, 405, "Method Not Allowed", &[], b"", false),
+        }
+    }
+
+    #[test]
+    fn s4_client_end_to_end_against_local_s3_minio_http_server() {
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Always verify wire-level HTTP S3 request signing + server routing + response parsing first
+        let mem_cfg = S4Config {
+            endpoint: "http://127.0.0.1:9000".into(),
+            region: "eu-central-1".into(),
+            bucket: "test-bucket".into(),
+            access_key_id: "MINIO_TEST_KEY".into(),
+            secret_access_key: "MINIO_TEST_SECRET".into(),
+            retry_base_delay_ms: 10,
+            ..Default::default()
+        };
+        let wire_backing = InMemoryObjectStore::new(mem_cfg.clone());
+        {
+            struct MemDuplex {
+                rx: std::io::Cursor<Vec<u8>>,
+                tx: Vec<u8>,
+            }
+            impl std::io::Read for MemDuplex {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    self.rx.read(buf)
+                }
+            }
+            impl std::io::Write for MemDuplex {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.tx.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let body = b"wire-test-payload";
+            let (_, hdrs) = sign_s4_request(
+                &mem_cfg,
+                "PUT",
+                "thumbs/wire.webp",
+                &BTreeMap::new(),
+                &BTreeMap::from([("Content-Length".into(), body.len().to_string())]),
+                &sha256_hex(body),
+                Utc::now(),
+            );
+            let mut raw_req = String::from("PUT /test-bucket/thumbs/wire.webp HTTP/1.1\r\n");
+            for (k, v) in &hdrs {
+                raw_req.push_str(&format!("{k}: {v}\r\n"));
+            }
+            raw_req.push_str("\r\n");
+            let mut req_bytes = raw_req.into_bytes();
+            req_bytes.extend_from_slice(body);
+
+            let mut duplex = MemDuplex {
+                rx: std::io::Cursor::new(req_bytes),
+                tx: Vec::new(),
+            };
+            serve_one_s3_http_conn(&mut duplex, &wire_backing);
+            let (status, resp_hdrs, _) = parse_raw_http_response(&duplex.tx).unwrap();
+            assert_eq!(status, 200);
+            assert!(resp_hdrs.contains_key("etag"));
+            assert_eq!(
+                wire_backing.get_object("thumbs/wire.webp").unwrap().unwrap(),
+                body
+            );
+        }
+
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://{addr}");
+
+        let backing = InMemoryObjectStore::new(S4Config {
+            endpoint: endpoint.clone(),
+            region: "eu-central-1".into(),
+            bucket: "test-bucket".into(),
+            access_key_id: "MINIO_TEST_KEY".into(),
+            secret_access_key: "MINIO_TEST_SECRET".into(),
+            retry_base_delay_ms: 10,
+            ..Default::default()
+        });
+        let backing_srv = backing.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+
+        let server_thread = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                if stop_srv.load(Ordering::SeqCst) {
+                    break;
+                }
+                serve_one_s3_http_conn(stream, &backing_srv);
+            }
+        });
+
+        // If running inside an OS sandbox that blocks loopback TCP connect(2), stop cleanly after wire test
+        if TcpStream::connect(addr).is_err() {
+            stop.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        let client = S4Client::new(S4Config {
+            endpoint,
+            region: "eu-central-1".into(),
+            bucket: "test-bucket".into(),
+            access_key_id: "MINIO_TEST_KEY".into(),
+            secret_access_key: "MINIO_TEST_SECRET".into(),
+            multipart_threshold_bytes: 1024, // force multipart for > 1 KB
+            multipart_part_size_bytes: 5 * 1024 * 1024,
+            retry_base_delay_ms: 10,
+            ..Default::default()
+        });
+
+        // 1. Single-PUT file upload & get_object_to_file + Range + HEAD + ListObjectsV2
+        let small_src = std::env::temp_dir().join(format!("frames-s3-small-{}", fastrand::u64(..)));
+        let small_dst = std::env::temp_dir().join(format!("frames-s3-dst-{}", fastrand::u64(..)));
+        std::fs::write(&small_src, b"hello real curl s4 transport").unwrap();
+
+        client
+            .put_object_from_file("thumbs/abc/s.webp", &small_src, "image/webp")
+            .unwrap();
+        let head = client.head_object("thumbs/abc/s.webp").unwrap().unwrap();
+        assert_eq!(head.size, 28);
+
+        let range_bytes = client
+            .get_object_range("thumbs/abc/s.webp", 6, Some(14))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&range_bytes, b"real curl");
+
+        assert!(client
+            .get_object_to_file("thumbs/abc/s.webp", &small_dst)
+            .unwrap());
+        assert_eq!(
+            std::fs::read(&small_dst).unwrap(),
+            b"hello real curl s4 transport"
+        );
+        let _ = std::fs::remove_file(&small_src);
+        let _ = std::fs::remove_file(&small_dst);
+
+        let listed = client.list_objects("thumbs/").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "thumbs/abc/s.webp");
+
+        // 2. Resumable multipart upload over real HTTP curl with 503 retry + ListParts
+        let mp_key = "originals/2026/10/CLIP 01.MOV";
+        let uid = client
+            .create_multipart_upload(mp_key, "video/quicktime")
+            .unwrap();
+        let part1 = vec![b'M'; 5 * 1024 * 1024];
+        let part2 = vec![b'N'; 4096];
+        client.upload_part(mp_key, &uid, 1, &part1).unwrap();
+
+        let mut full_mp = part1.clone();
+        full_mp.extend_from_slice(&part2);
+        let mp_path = std::env::temp_dir().join(format!("frames-s3-mp-{}", fastrand::u64(..)));
+        std::fs::write(&mp_path, &full_mp).unwrap();
+
+        // Inject transient 503 error to verify S4Client + retry_with_backoff_cfg over HTTP
+        backing.inject_transient_failures(1);
+
+        upload_file_with_resume(
+            &client,
+            &mp_path,
+            mp_key,
+            "video/quicktime",
+            Some(&uid),
+            1,
+            3,
+            |_, _| {},
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&mp_path);
+
+        let assembled = client.get_object(mp_key).unwrap().unwrap();
+        assert_eq!(assembled.len(), full_mp.len());
+        assert_eq!(&assembled[..8], b"MMMMMMMM");
+        assert_eq!(&assembled[assembled.len() - 8..], b"NNNNNNNN");
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(addr);
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn live_s4_bucket_smoke_test_if_configured() {
+        let Ok(endpoint) = std::env::var("FRAMES_TEST_S4_ENDPOINT") else {
+            return;
+        };
+        let Ok(bucket) = std::env::var("FRAMES_TEST_S4_BUCKET") else {
+            return;
+        };
+        let Ok(access_key_id) = std::env::var("FRAMES_TEST_S4_ACCESS_KEY") else {
+            return;
+        };
+        let Ok(secret_access_key) = std::env::var("FRAMES_TEST_S4_SECRET_KEY") else {
+            return;
+        };
+        let region = std::env::var("FRAMES_TEST_S4_REGION").unwrap_or_else(|_| "Auto".into());
+
+        let client = S4Client::new(S4Config {
+            endpoint,
+            region,
+            bucket,
+            access_key_id,
+            secret_access_key,
+            ..Default::default()
+        });
+
+        let smoke_key = format!("_smoke_test/probe-{}.txt", fastrand::u64(..));
+        let payload = b"frames live s4 smoke test payload";
+        client.put_object(&smoke_key, payload, "text/plain").unwrap();
+        let head = client.head_object(&smoke_key).unwrap().unwrap();
+        assert_eq!(head.size, payload.len() as u64);
+        let range = client
+            .get_object_range(&smoke_key, 7, Some(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&range, b"live");
+        client.delete_object(&smoke_key).unwrap();
     }
 }

@@ -206,6 +206,42 @@ impl LocalCache {
         self.touch_lru(&rel)
     }
 
+    /// Return the target on-disk path for a cached original so callers can stream
+    /// a download outside the cache mutex and then call [`Self::register_downloaded_original`].
+    pub fn original_disk_path(&self, id: &str, filename: &str) -> PathBuf {
+        self.root.join(Self::original_rel_path(id, filename))
+    }
+
+    /// Register a file that was streamed to [`Self::original_disk_path`] in the
+    /// LRU accounting table and enforce the cache size cap.
+    pub fn register_downloaded_original(
+        &mut self,
+        id: &str,
+        filename: &str,
+    ) -> io::Result<Option<PathBuf>> {
+        let rel = Self::original_rel_path(id, filename);
+        let full = self.root.join(&rel);
+        if !full.is_file() {
+            return Ok(None);
+        }
+        let new_size = fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+        if let Some(old) = self.lru_entries.remove(&rel) {
+            self.lru_used_bytes = self.lru_used_bytes.saturating_sub(old.size_bytes);
+        }
+        self.evict_until_within(new_size)?;
+        self.access_counter += 1;
+        self.lru_used_bytes += new_size;
+        self.lru_entries.insert(
+            rel.clone(),
+            LruEntry {
+                rel_path: rel,
+                size_bytes: new_size,
+                last_access_seq: self.access_counter,
+            },
+        );
+        Ok(Some(full))
+    }
+
     pub fn put_original(&mut self, id: &str, filename: &str, bytes: &[u8]) -> io::Result<PathBuf> {
         let rel = Self::original_rel_path(id, filename);
         self.put_lru_entry(&rel, bytes)
@@ -223,25 +259,9 @@ impl LocalCache {
         if let Some(p) = self.get_original_path(id, filename) {
             return Ok(Some(p));
         }
-        let rel = Self::original_rel_path(id, filename);
-        let full = self.root.join(&rel);
+        let full = self.original_disk_path(id, filename);
         if s4.get_object_to_file(s4_key, &full)? {
-            let new_size = fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
-            if let Some(old) = self.lru_entries.remove(&rel) {
-                self.lru_used_bytes = self.lru_used_bytes.saturating_sub(old.size_bytes);
-            }
-            self.evict_until_within(new_size)?;
-            self.access_counter += 1;
-            self.lru_used_bytes += new_size;
-            self.lru_entries.insert(
-                rel.clone(),
-                LruEntry {
-                    rel_path: rel,
-                    size_bytes: new_size,
-                    last_access_seq: self.access_counter,
-                },
-            );
-            return Ok(Some(full));
+            return Ok(self.register_downloaded_original(id, filename)?);
         }
         Ok(None)
     }

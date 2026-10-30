@@ -90,6 +90,7 @@
     bucket: string;
     access_key_id: string;
     has_secret_in_keychain: boolean;
+    s4_configured: boolean;
     space_limit_gb: number;
     cache_location: string;
     cache_limit_gb: number;
@@ -153,6 +154,7 @@
     bucket: "frames-library",
     access_key_id: "",
     has_secret_in_keychain: false,
+    s4_configured: false,
     space_limit_gb: 750,
     cache_location: "",
     cache_limit_gb: 10,
@@ -752,12 +754,16 @@
 
   // Settings & Sync actions
   async function handleSyncNow() {
-    const rep: any = await invoke("sync_now");
-    await loadBootstrap();
-    if (rep.offline) {
-      notify("Offline — changes safely queued in outbox");
-    } else {
-      notify(`Synced with S4 (${rep.batches_pushed} pushed, ${rep.batches_pulled} pulled)`);
+    try {
+      const rep: any = await invoke("sync_now");
+      await loadBootstrap();
+      if (rep.offline) {
+        notify("Offline — changes safely queued in outbox");
+      } else {
+        notify(`Synced with S4 (${rep.batches_pushed} pushed, ${rep.batches_pulled} pulled)`);
+      }
+    } catch (err: any) {
+      notify(String(err));
     }
   }
 
@@ -768,22 +774,26 @@
 
   async function handleSaveSettings(e: Event) {
     e.preventDefault();
-    settings = await invoke("save_settings", {
-      input: {
-        endpoint: settings.endpoint,
-        region: settings.region,
-        bucket: settings.bucket,
-        access_key_id: settings.access_key_id,
-        secret_access_key: secretInput.trim() ? secretInput : null,
-        space_limit_gb: Number(settings.space_limit_gb),
-        cache_location: settings.cache_location,
-        cache_limit_gb: Number(settings.cache_limit_gb),
-        use_real_s4: settings.use_real_s4
-      }
-    });
-    secretInput = "";
-    await loadBootstrap();
-    notify("Saved settings (S4 key stored in OS Keychain)");
+    try {
+      settings = await invoke("save_settings", {
+        input: {
+          endpoint: settings.endpoint,
+          region: settings.region,
+          bucket: settings.bucket,
+          access_key_id: settings.access_key_id,
+          secret_access_key: secretInput.trim() ? secretInput : null,
+          space_limit_gb: Number(settings.space_limit_gb),
+          cache_location: settings.cache_location,
+          cache_limit_gb: Number(settings.cache_limit_gb),
+          use_real_s4: settings.use_real_s4
+        }
+      });
+      secretInput = "";
+      await loadBootstrap();
+      notify("Saved settings (S4 key stored in OS Keychain)");
+    } catch (err: any) {
+      notify(String(err));
+    }
   }
 
   async function handleClearCache() {
@@ -793,24 +803,36 @@
   }
 
   async function handleCheckLibrary() {
-    checkReport = await invoke("run_check_library");
-    notify("Completed S4 bucket vs local index check");
+    try {
+      checkReport = await invoke("run_check_library");
+      notify("Completed S4 bucket vs local index check");
+    } catch (err: any) {
+      notify(String(err));
+    }
   }
 
   async function handleAddUnknownS4Files() {
     if (!checkReport || !checkReport.unknown_s4_keys?.length) return;
-    const added: number = await invoke("add_unknown_s4_files", {
-      keys: checkReport.unknown_s4_keys
-    });
-    checkReport = await invoke("run_check_library");
-    await loadBootstrap();
-    notify(`Added ${added} unknown S4 file(s) to the library`);
+    try {
+      const added: number = await invoke("add_unknown_s4_files", {
+        keys: checkReport.unknown_s4_keys
+      });
+      checkReport = await invoke("run_check_library");
+      await loadBootstrap();
+      notify(`Added ${added} unknown S4 file(s) to the library`);
+    } catch (err: any) {
+      notify(String(err));
+    }
   }
 
   async function handleRebuildDatabase() {
-    const rep: any = await invoke("run_rebuild_database");
-    await loadBootstrap();
-    notify(`Rebuilt local database from S4 (${rep.batches_pulled} log batches applied)`);
+    try {
+      const rep: any = await invoke("run_rebuild_database");
+      await loadBootstrap();
+      notify(`Rebuilt local database from S4 (${rep.batches_pulled} log batches applied)`);
+    } catch (err: any) {
+      notify(String(err));
+    }
   }
 
   // Keyboard shortcuts (Spec Section 9: Space quick look, arrows, Delete -> Trash, Cmd/Ctrl+A)
@@ -1040,6 +1062,14 @@
   <!-- Main Content Area -->
   <div class="main-area">
     <!-- Status & Error Banners (Spec Section 11) -->
+    {#if settings.use_real_s4 && !settings.s4_configured}
+      <div class="banner warn-banner">
+        <strong>MEGA S4 Not Configured:</strong> Enter your S4 Access Key ID and Secret Access Key in Settings before importing, or switch to Local Sandbox Mode.
+        <button class="btn-primary small" style="margin-left: 10px;" onclick={() => (activeNav = "settings")}>
+          ⚙️ Open Settings
+        </button>
+      </div>
+    {/if}
     {#if dbDamaged}
       <div class="banner warn-banner">
         <strong>Database Damaged:</strong> {dbDamaged}

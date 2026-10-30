@@ -35,9 +35,12 @@ use frames_core::sync::{
     run_import_concurrent, sync_once, ImportControl, ImportRunReport, LibraryCheckReport,
     SyncReport,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use frames_core::keys::{thumb_preview_key, thumb_small_key};
 use frames_core::trash::{
-    delete_trash_items_now, empty_trash, purge_expired_trash, trash_summary, PurgeReport,
-    TrashSummary,
+    delete_trash_items_now, empty_trash, purge_expired_trash_concurrent, trash_summary,
+    PurgeReport, TrashSummary,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +94,7 @@ pub struct SettingsView {
     pub bucket: String,
     pub access_key_id: String,
     pub has_secret_in_keychain: bool,
+    pub s4_configured: bool,
     pub space_limit_gb: u64,
     pub cache_location: String,
     pub cache_limit_gb: u64,
@@ -148,6 +152,7 @@ pub struct AppState {
     pub offline_mode: Mutex<bool>,
     pub db_damaged: Mutex<Option<String>>,
     pub import_control: Arc<ImportControl>,
+    pub thumb_sync_running: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -211,7 +216,9 @@ impl AppState {
         };
         let h264_encoder = detect_best_h264_encoder();
 
-        let state = Self {
+        // Do NOT run trash purge synchronously on startup so launching the app
+        // while offline never blocks the window from opening (Blocker 5).
+        Self {
             data_dir,
             store: Arc::new(Mutex::new(store)),
             cache: Arc::new(Mutex::new(cache)),
@@ -224,64 +231,65 @@ impl AppState {
             offline_mode: Mutex::new(false),
             db_damaged: Mutex::new(db_damaged_err),
             import_control: Arc::new(ImportControl::new()),
-        };
-
-        // Run daily 30-day trash auto-purge on startup only when S4 is configured (or demo mode is active)
-        if state.is_s4_ready_for_purge() {
-            let s4 = state.active_s4();
-            if let Ok(mut st) = state.store.lock() {
-                let _ = purge_expired_trash(&mut st, s4.as_ref(), Utc::now());
-            }
+            thumb_sync_running: Arc::new(AtomicBool::new(false)),
         }
-
-        state
     }
 
-    pub fn is_s4_ready_for_purge(&self) -> bool {
+    /// Resolve the active S4 object store, or return an explicit error if
+    /// `use_real_s4` is enabled without valid MEGA S4 credentials.
+    /// NEVER silently falls back to `demo_s4` when `use_real_s4` is `true` (Blocker 1).
+    pub fn require_s4(&self) -> Result<Arc<dyn ObjectStore>, String> {
         let st = self.settings.lock().unwrap().clone();
         if !st.use_real_s4 {
-            return true;
+            return Ok(Arc::new(self.demo_s4.clone()));
         }
-        if st.access_key_id.is_empty() {
-            return false;
-        }
-        self.secret_override.lock().unwrap().is_some()
-            || load_secret_from_os_keychain(&st.access_key_id)
-                .ok()
-                .flatten()
-                .is_some()
-    }
 
-    pub fn active_s4(&self) -> Arc<dyn ObjectStore> {
-        let st = self.settings.lock().unwrap().clone();
+        if st.endpoint.trim().is_empty() || st.bucket.trim().is_empty() {
+            return Err(
+                "MEGA S4 endpoint or bucket is empty. Open Settings to configure your S4 bucket."
+                    .into(),
+            );
+        }
+        if st.access_key_id.trim().is_empty() {
+            return Err(
+                "MEGA S4 Access Key ID is not configured. Open Settings to enter your S4 keys, or switch to Local Sandbox Mode."
+                    .into(),
+            );
+        }
+
         let secret = self
             .secret_override
             .lock()
             .unwrap()
             .clone()
             .or_else(|| {
-                if st.access_key_id.is_empty() {
-                    None
-                } else {
-                    load_secret_from_os_keychain(&st.access_key_id).ok().flatten()
-                }
+                load_secret_from_os_keychain(&st.access_key_id)
+                    .ok()
+                    .flatten()
             })
             .unwrap_or_default();
 
-        if st.use_real_s4 && !st.access_key_id.is_empty() && !secret.is_empty() {
-            let cfg = S4Config {
-                endpoint: st.endpoint,
-                region: st.region,
-                bucket: st.bucket,
-                access_key_id: st.access_key_id,
-                secret_access_key: secret,
-                space_limit_bytes: st.space_limit_gb.max(1) * 1_000_000_000,
-                ..Default::default()
-            };
-            Arc::new(S4Client::new(cfg))
-        } else {
-            Arc::new(self.demo_s4.clone())
+        if secret.trim().is_empty() {
+            return Err(
+                "MEGA S4 Secret Access Key is missing from the OS Keychain. Open Settings and save your Secret Access Key."
+                    .into(),
+            );
         }
+
+        let cfg = S4Config {
+            endpoint: st.endpoint,
+            region: st.region,
+            bucket: st.bucket,
+            access_key_id: st.access_key_id,
+            secret_access_key: secret,
+            space_limit_bytes: st.space_limit_gb.max(1) * 1_000_000_000,
+            ..Default::default()
+        };
+        Ok(Arc::new(S4Client::new(cfg)))
+    }
+
+    pub fn is_s4_ready_for_purge(&self) -> bool {
+        self.require_s4().is_ok()
     }
 
     fn settings_view(&self, device_id: String) -> SettingsView {
@@ -292,12 +300,18 @@ impl AppState {
                     .ok()
                     .flatten()
                     .is_some());
+        let s4_configured = !st.use_real_s4
+            || (!st.endpoint.trim().is_empty()
+                && !st.bucket.trim().is_empty()
+                && !st.access_key_id.trim().is_empty()
+                && has_secret);
         SettingsView {
             endpoint: st.endpoint,
             region: st.region,
             bucket: st.bucket,
             access_key_id: st.access_key_id,
             has_secret_in_keychain: has_secret,
+            s4_configured,
             space_limit_gb: st.space_limit_gb,
             cache_location: st.cache_location,
             cache_limit_gb: st.cache_limit_gb,
@@ -318,13 +332,135 @@ impl AppState {
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        let used_bytes = (used_in_db as u64).max(self.demo_s4.total_used_bytes());
+        let used_bytes = if st.use_real_s4 {
+            used_in_db as u64
+        } else {
+            (used_in_db as u64).max(self.demo_s4.total_used_bytes())
+        };
         SpaceUsage::compute(used_bytes, limit_bytes)
+    }
+
+    /// Spawn a non-blocking background worker to download any missing `s.webp`
+    /// small thumbnails from S4 without holding `cache.lock()` across network I/O
+    /// (Spec Section 10: "A new computer downloads small thumbnails in the background").
+    pub fn spawn_background_small_thumb_sync(&self) {
+        let Ok(s4) = self.require_s4() else {
+            return;
+        };
+        if self
+            .thumb_sync_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let store_arc = Arc::clone(&self.store);
+        let cache_arc = Arc::clone(&self.cache);
+        let running_flag = Arc::clone(&self.thumb_sync_running);
+
+        let _ = std::thread::Builder::new()
+            .name("frames-bg-small-thumbs".into())
+            .spawn(move || {
+                let all_ids: Vec<String> = {
+                    let Ok(st) = store_arc.lock() else {
+                        running_flag.store(false, Ordering::SeqCst);
+                        return;
+                    };
+                    st.list_timeline(None, None)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| a.id)
+                        .collect()
+                };
+                let missing: Vec<String> = {
+                    let Ok(c) = cache_arc.lock() else {
+                        running_flag.store(false, Ordering::SeqCst);
+                        return;
+                    };
+                    c.missing_small_thumbs(&all_ids)
+                };
+                for id in missing {
+                    let key = thumb_small_key(&id);
+                    match s4.get_object(&key) {
+                        Ok(Some(bytes)) => {
+                            if let Ok(c) = cache_arc.lock() {
+                                let _ = c.put_small_thumb(&id, &bytes);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
+                }
+                running_flag.store(false, Ordering::SeqCst);
+            });
     }
 }
 
-/// Serve `frames://localhost/<kind>/<id>` custom protocol requests directly as binary
-/// HTTP responses without base64 JSON serialization overhead (Spec Sections 5, 8, 9).
+/// Fetch `s.webp` small thumbnail path, releasing `cache.lock()` before any S4 download.
+fn fetch_small_thumb_unlocked(
+    cache_mutex: &Mutex<LocalCache>,
+    s4: Option<&dyn ObjectStore>,
+    id: &str,
+) -> Option<PathBuf> {
+    if let Ok(c) = cache_mutex.lock() {
+        if let Some(p) = c.get_small_thumb_path(id) {
+            return Some(p);
+        }
+    }
+    let s4 = s4?;
+    let bytes = s4.get_object(&thumb_small_key(id)).ok().flatten()?;
+    let c = cache_mutex.lock().ok()?;
+    c.put_small_thumb(id, &bytes).ok()
+}
+
+/// Fetch `m.webp` preview path, releasing `cache.lock()` before any S4 download.
+fn fetch_preview_unlocked(
+    cache_mutex: &Mutex<LocalCache>,
+    s4: Option<&dyn ObjectStore>,
+    id: &str,
+) -> Option<PathBuf> {
+    if let Ok(mut c) = cache_mutex.lock() {
+        if let Some(p) = c.get_preview_path(id) {
+            return Some(p);
+        }
+    }
+    if let Some(s4_store) = s4 {
+        if let Ok(Some(bytes)) = s4_store.get_object(&thumb_preview_key(id)) {
+            if let Ok(mut c) = cache_mutex.lock() {
+                if let Ok(p) = c.put_preview(id, &bytes) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    fetch_small_thumb_unlocked(cache_mutex, s4, id)
+}
+
+/// Fetch original file path, releasing `cache.lock()` before streaming from S4 to disk.
+fn fetch_original_unlocked(
+    cache_mutex: &Mutex<LocalCache>,
+    s4: Option<&dyn ObjectStore>,
+    id: &str,
+    filename: &str,
+    s4_key: &str,
+) -> Option<PathBuf> {
+    let target_disk_path = {
+        let mut c = cache_mutex.lock().ok()?;
+        if let Some(p) = c.get_original_path(id, filename) {
+            return Some(p);
+        }
+        c.original_disk_path(id, filename)
+    };
+    let s4_store = s4?;
+    if s4_store.get_object_to_file(s4_key, &target_disk_path).ok()? {
+        let mut c = cache_mutex.lock().ok()?;
+        return c.register_downloaded_original(id, filename).ok().flatten();
+    }
+    None
+}
+
+/// Serve `frames://localhost/<kind>/<id>` custom protocol requests asynchronously
+/// on a worker thread without holding `cache.lock()` across S4 downloads (Blocker 4).
 fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>>) -> Response<Vec<u8>> {
     let state = app.state::<AppState>();
     let uri = request.uri();
@@ -347,28 +483,12 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
             .unwrap();
     }
 
-    let s4 = state.active_s4();
+    let s4_opt = state.require_s4().ok();
+    let s4_ref = s4_opt.as_deref();
+
     match kind {
         "thumb" => {
-            let path_opt = {
-                let cache = match state.cache.lock() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Vec::new())
-                            .unwrap()
-                    }
-                };
-                cache.get_small_thumb_path(id).or_else(|| {
-                    let _ = cache.download_missing_small_thumbs(
-                        s4.as_ref(),
-                        &[id.to_string()],
-                    );
-                    cache.get_small_thumb_path(id)
-                })
-            };
-            if let Some(p) = path_opt {
+            if let Some(p) = fetch_small_thumb_unlocked(&state.cache, s4_ref, id) {
                 if let Ok(bytes) = fs::read(p) {
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -384,23 +504,7 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                 .unwrap()
         }
         "preview" => {
-            let path_opt = {
-                let mut cache = match state.cache.lock() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Vec::new())
-                            .unwrap()
-                    }
-                };
-                cache
-                    .get_or_fetch_preview(s4.as_ref(), id)
-                    .ok()
-                    .flatten()
-                    .or_else(|| cache.get_small_thumb_path(id))
-            };
-            if let Some(p) = path_opt {
+            if let Some(p) = fetch_preview_unlocked(&state.cache, s4_ref, id) {
                 if let Ok(bytes) = fs::read(p) {
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -435,28 +539,13 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                     .unwrap();
             };
 
-            let orig_path_opt = {
-                let mut cache = match state.cache.lock() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Vec::new())
-                            .unwrap()
-                    }
-                };
-                cache
-                    .get_or_fetch_original(
-                        s4.as_ref(),
-                        &detail.record.id,
-                        &detail.record.filename,
-                        &detail.record.key,
-                    )
-                    .ok()
-                    .flatten()
-            };
-
-            if let Some(orig_path) = orig_path_opt {
+            if let Some(orig_path) = fetch_original_unlocked(
+                &state.cache,
+                s4_ref,
+                &detail.record.id,
+                &detail.record.filename,
+                &detail.record.key,
+            ) {
                 if let Some((bytes, mime)) = prepare_photo_bytes_for_webview(&orig_path) {
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -468,15 +557,7 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
             }
 
             // Fallback to preview if original is not cached/reachable offline
-            let preview_opt = {
-                let mut cache = state.cache.lock().unwrap();
-                cache
-                    .get_or_fetch_preview(s4.as_ref(), id)
-                    .ok()
-                    .flatten()
-                    .or_else(|| cache.get_small_thumb_path(id))
-            };
-            if let Some(p) = preview_opt {
+            if let Some(p) = fetch_preview_unlocked(&state.cache, s4_ref, id) {
                 if let Ok(bytes) = fs::read(p) {
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -516,50 +597,55 @@ fn check_core_status(filename: &str) -> CoreStatus {
 #[tauri::command]
 fn get_app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
     let now = Utc::now();
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    let cache = state.cache.lock().map_err(|e| e.to_string())?;
+    let payload = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let cache = state.cache.lock().map_err(|e| e.to_string())?;
 
-    let device_id = store.device_id().map_err(|e| e.to_string())?;
-    let assets = store.list_timeline(None, None).map_err(|e| e.to_string())?;
-    let month_groups = store.timeline_month_groups().map_err(|e| e.to_string())?;
-    let albums = store.list_albums().map_err(|e| e.to_string())?;
-    let trash_items = store.list_trash(now).map_err(|e| e.to_string())?;
-    let trash_sum = trash_summary(&store, now).map_err(|e| e.to_string())?;
-    let import_progress = store.import_progress().map_err(|e| e.to_string())?;
-    let import_queue = store.list_import_queue().map_err(|e| e.to_string())?;
-    let outbox_pending = store.outbox_len().map_err(|e| e.to_string())?;
-    let cache_stats = cache.stats().unwrap_or(CacheStats {
-        small_thumb_count: 0,
-        small_thumb_bytes: 0,
-        lru_entry_count: 0,
-        lru_used_bytes: 0,
-        lru_limit_bytes: DEFAULT_CACHE_LIMIT_BYTES,
-    });
-    let space_usage = state.compute_space_usage(&store);
-    let settings = state.settings_view(device_id.clone());
-    let offline = *state.offline_mode.lock().unwrap();
-    let db_damaged = state.db_damaged.lock().unwrap().clone();
+        let device_id = store.device_id().map_err(|e| e.to_string())?;
+        let assets = store.list_timeline(None, None).map_err(|e| e.to_string())?;
+        let month_groups = store.timeline_month_groups().map_err(|e| e.to_string())?;
+        let albums = store.list_albums().map_err(|e| e.to_string())?;
+        let trash_items = store.list_trash(now).map_err(|e| e.to_string())?;
+        let trash_sum = trash_summary(&store, now).map_err(|e| e.to_string())?;
+        let import_progress = store.import_progress().map_err(|e| e.to_string())?;
+        let import_queue = store.list_import_queue().map_err(|e| e.to_string())?;
+        let outbox_pending = store.outbox_len().map_err(|e| e.to_string())?;
+        let cache_stats = cache.stats().unwrap_or(CacheStats {
+            small_thumb_count: 0,
+            small_thumb_bytes: 0,
+            lru_entry_count: 0,
+            lru_used_bytes: 0,
+            lru_limit_bytes: DEFAULT_CACHE_LIMIT_BYTES,
+        });
+        let space_usage = state.compute_space_usage(&store);
+        let settings = state.settings_view(device_id.clone());
+        let offline = *state.offline_mode.lock().unwrap();
+        let db_damaged = state.db_damaged.lock().unwrap().clone();
 
-    Ok(BootstrapPayload {
-        device_id,
-        timeline: TimelinePayload {
-            assets,
-            month_groups,
-        },
-        albums,
-        trash: TrashPayload {
-            items: trash_items,
-            summary: trash_sum,
-        },
-        import_progress,
-        import_queue,
-        settings,
-        cache_stats,
-        space_usage,
-        outbox_pending,
-        offline,
-        db_damaged,
-    })
+        BootstrapPayload {
+            device_id,
+            timeline: TimelinePayload {
+                assets,
+                month_groups,
+            },
+            albums,
+            trash: TrashPayload {
+                items: trash_items,
+                summary: trash_sum,
+            },
+            import_progress,
+            import_queue,
+            settings,
+            cache_stats,
+            space_usage,
+            outbox_pending,
+            offline,
+            db_damaged,
+        }
+    };
+
+    state.spawn_background_small_thumb_sync();
+    Ok(payload)
 }
 
 #[tauri::command]
@@ -591,20 +677,13 @@ fn get_thumbnail_data_url(
     preview: bool,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let s4 = state.active_s4();
-    let mut cache = state.cache.lock().map_err(|e| e.to_string())?;
+    let s4_opt = state.require_s4().ok();
+    let s4_ref = s4_opt.as_deref();
 
     let path_opt = if preview {
-        cache
-            .get_or_fetch_preview(s4.as_ref(), &id)
-            .ok()
-            .flatten()
-            .or_else(|| cache.get_small_thumb_path(&id))
+        fetch_preview_unlocked(&state.cache, s4_ref, &id)
     } else {
-        cache.get_small_thumb_path(&id).or_else(|| {
-            let _ = cache.download_missing_small_thumbs(s4.as_ref(), std::slice::from_ref(&id));
-            cache.get_small_thumb_path(&id)
-        })
+        fetch_small_thumb_unlocked(&state.cache, s4_ref, &id)
     };
 
     if let Some(p) = path_opt {
@@ -630,7 +709,7 @@ fn get_video_playback(
             .ok_or_else(|| format!("Asset not found: {id}"))?
     };
 
-    let s4 = state.active_s4();
+    let s4 = state.require_s4()?;
     let target_key = if detail.record.kind == AssetKind::Live {
         detail
             .record
@@ -711,7 +790,7 @@ async fn export_assets(
 ) -> Result<Vec<String>, String> {
     let store_arc = Arc::clone(&state.store);
     let cache_arc = Arc::clone(&state.cache);
-    let s4 = state.active_s4();
+    let s4 = state.require_s4()?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let store = store_arc.lock().map_err(|e| e.to_string())?;
@@ -933,15 +1012,15 @@ fn restore_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), St
 
 #[tauri::command]
 fn delete_trash_now(ids: Vec<String>, state: State<'_, AppState>) -> Result<PurgeReport, String> {
+    let s4 = state.require_s4()?;
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    let s4 = state.active_s4();
     delete_trash_items_now(&mut store, s4.as_ref(), &ids, Utc::now()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn empty_all_trash(state: State<'_, AppState>) -> Result<PurgeReport, String> {
+    let s4 = state.require_s4()?;
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    let s4 = state.active_s4();
     empty_trash(&mut store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
 }
 
@@ -956,9 +1035,12 @@ async fn import_from_paths(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ImportRunReport, String> {
+    if state.import_control.is_running() {
+        return Err("An import is already running.".into());
+    }
+    let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
     let cache_arc = Arc::clone(&state.cache);
-    let s4 = state.active_s4();
     let control = Arc::clone(&state.import_control);
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -1014,7 +1096,7 @@ fn get_import_status(state: State<'_, AppState>) -> Result<ImportStatusView, Str
 
 #[tauri::command]
 fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
-    // Enable demo S4 mode when seeding the sample library if real S4 has no credentials configured
+    // Explicitly switch to Local Sandbox Mode when seeding the demo library if real S4 is unconfigured
     {
         let mut st = state.settings.lock().unwrap();
         if st.access_key_id.is_empty() {
@@ -1022,9 +1104,9 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
         }
     }
 
+    let s4 = state.require_s4()?;
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     let mut cache = state.cache.lock().map_err(|e| e.to_string())?;
-    let s4 = state.active_s4();
     let now = Utc::now();
 
     let bali_id = "11111111-2222-3333-4444-555555555555".to_string();
@@ -1227,8 +1309,8 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
 
 #[tauri::command]
 async fn sync_now(state: State<'_, AppState>) -> Result<SyncReport, String> {
+    let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
-    let s4 = state.active_s4();
     let rep = tauri::async_runtime::spawn_blocking(move || {
         let mut store = store_arc.lock().map_err(|e| e.to_string())?;
         sync_once(&mut store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
@@ -1237,6 +1319,9 @@ async fn sync_now(state: State<'_, AppState>) -> Result<SyncReport, String> {
     .map_err(|e| e.to_string())??;
 
     *state.offline_mode.lock().unwrap() = rep.offline;
+    if !rep.offline {
+        state.spawn_background_small_thumb_sync();
+    }
     Ok(rep)
 }
 
@@ -1252,13 +1337,26 @@ fn save_settings(
     input: SettingsInput,
     state: State<'_, AppState>,
 ) -> Result<SettingsView, String> {
+    let access_key = input.access_key_id.trim();
     if let Some(ref secret) = input.secret_access_key {
         let trimmed = secret.trim();
         if !trimmed.is_empty() {
-            *state.secret_override.lock().unwrap() = Some(trimmed.to_string());
-            if !input.access_key_id.trim().is_empty() {
-                let _ = save_secret_in_os_keychain(input.access_key_id.trim(), trimmed);
+            if input.use_real_s4 {
+                if access_key.is_empty() {
+                    return Err(
+                        "Access Key ID is required when saving a Secret Access Key.".into(),
+                    );
+                }
+                // Never ignore Keychain save errors in real S4 mode (Blocker 1):
+                // if Keychain persistence fails, return an explicit error so the secret
+                // is never silently lost on next launch.
+                save_secret_in_os_keychain(access_key, trimmed).map_err(|e| {
+                    format!("Failed to save Secret Access Key to OS Keychain: {e}")
+                })?;
+            } else if !access_key.is_empty() {
+                let _ = save_secret_in_os_keychain(access_key, trimmed);
             }
+            *state.secret_override.lock().unwrap() = Some(trimmed.to_string());
         }
     }
 
@@ -1266,7 +1364,7 @@ fn save_settings(
         endpoint: input.endpoint.trim().to_string(),
         region: input.region.trim().to_string(),
         bucket: input.bucket.trim().to_string(),
-        access_key_id: input.access_key_id.trim().to_string(),
+        access_key_id: access_key.to_string(),
         space_limit_gb: input.space_limit_gb.max(1),
         cache_location: input.cache_location.trim().to_string(),
         cache_limit_gb: input.cache_limit_gb.max(1),
@@ -1274,9 +1372,10 @@ fn save_settings(
     };
 
     let settings_path = state.data_dir.join("settings.json");
-    if let Ok(json) = serde_json::to_string_pretty(&new_settings) {
-        let _ = fs::write(settings_path, json);
-    }
+    let json = serde_json::to_string_pretty(&new_settings)
+        .map_err(|e| format!("Failed to serialize settings: {e}"))?;
+    fs::write(&settings_path, json)
+        .map_err(|e| format!("Failed to write settings.json: {e}"))?;
 
     if let Ok(mut cache) = state.cache.lock() {
         let _ = cache.set_limit_bytes(new_settings.cache_limit_gb * 1_000_000_000);
@@ -1298,8 +1397,8 @@ fn clear_local_cache(state: State<'_, AppState>) -> Result<(u64, CacheStats), St
 
 #[tauri::command]
 async fn run_check_library(state: State<'_, AppState>) -> Result<LibraryCheckReport, String> {
+    let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
-    let s4 = state.active_s4();
     tauri::async_runtime::spawn_blocking(move || {
         let store = store_arc.lock().map_err(|e| e.to_string())?;
         check_library(&store, s4.as_ref()).map_err(|e| e.to_string())
@@ -1313,9 +1412,9 @@ async fn add_unknown_s4_files(
     keys: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
+    let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
     let cache_arc = Arc::clone(&state.cache);
-    let s4 = state.active_s4();
     tauri::async_runtime::spawn_blocking(move || {
         let mut store = store_arc.lock().map_err(|e| e.to_string())?;
         let mut cache = cache_arc.lock().map_err(|e| e.to_string())?;
@@ -1328,8 +1427,8 @@ async fn add_unknown_s4_files(
 
 #[tauri::command]
 async fn run_rebuild_database(state: State<'_, AppState>) -> Result<SyncReport, String> {
+    let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
-    let s4 = state.active_s4();
     let rep = tauri::async_runtime::spawn_blocking(move || {
         let mut store = store_arc.lock().map_err(|e| e.to_string())?;
         rebuild_from_s4(&mut store, s4.as_ref()).map_err(|e| e.to_string())
@@ -1338,6 +1437,7 @@ async fn run_rebuild_database(state: State<'_, AppState>) -> Result<SyncReport, 
     .map_err(|e| e.to_string())??;
 
     *state.db_damaged.lock().unwrap() = None;
+    state.spawn_background_small_thumb_sync();
     Ok(rep)
 }
 
@@ -1345,25 +1445,32 @@ async fn run_rebuild_database(state: State<'_, AppState>) -> Result<SyncReport, 
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::init())
-        .register_uri_scheme_protocol("frames", |ctx, request| {
-            handle_frames_protocol(ctx.app_handle(), request)
+        .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
+            let handle = ctx.app_handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let response = handle_frames_protocol(&handle, request);
+                responder.respond(response);
+            });
         })
         .setup(|app| {
-            // Spawn 24-hour background trash purge timer (Spec Section 11)
+            // Non-blocking background trash purge (Spec Section 11, Blocker 5):
+            // Runs 5 seconds after window launch and every 24 hours thereafter
+            // without holding `store.lock()` across S4 network DELETE requests.
             let handle = app.handle().clone();
             std::thread::Builder::new()
                 .name("frames-daily-trash-purge".into())
-                .spawn(move || loop {
-                    std::thread::sleep(Duration::from_secs(24 * 3600));
-                    let state = handle.state::<AppState>();
-                    if state.is_s4_ready_for_purge() {
-                        let s4 = state.active_s4();
-                        let res = if let Ok(mut st) = state.store.lock() {
-                            Some(purge_expired_trash(&mut st, s4.as_ref(), Utc::now()))
-                        } else {
-                            None
-                        };
-                        let _ = res;
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_secs(5));
+                    loop {
+                        let state = handle.state::<AppState>();
+                        if let Ok(s4) = state.require_s4() {
+                            let _ = purge_expired_trash_concurrent(
+                                &state.store,
+                                s4.as_ref(),
+                                Utc::now(),
+                            );
+                        }
+                        std::thread::sleep(Duration::from_secs(24 * 3600));
                     }
                 })
                 .ok();
@@ -1419,12 +1526,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_state_initialises_in_isolated_temp_dir() {
+    fn app_state_initialises_in_isolated_temp_dir_and_rejects_unconfigured_real_s4() {
         let tmp = std::env::temp_dir().join(format!("frames-shell-test-{}", fastrand::u64(..)));
         let state = AppState::init_with_dir(tmp.clone());
         let dev_id = state.store.lock().unwrap().device_id().unwrap();
         assert!(!dev_id.is_empty());
         assert!(state.db_damaged.lock().unwrap().is_none());
+
+        // By default `use_real_s4` is true and no S4 credentials are set:
+        // `require_s4` MUST return an error and NEVER silently fall back to `demo_s4`.
+        assert!(state.require_s4().is_err());
+        assert!(!state.settings_view(dev_id.clone()).s4_configured);
+
+        // Explicitly switching `use_real_s4 = false` (Local Sandbox Mode) enables `demo_s4`.
+        state.settings.lock().unwrap().use_real_s4 = false;
+        assert!(state.require_s4().is_ok());
+        assert!(state.settings_view(dev_id).s4_configured);
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

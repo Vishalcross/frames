@@ -62,6 +62,56 @@ pub fn purge_expired_trash(
     purge_candidates(store, s4, &candidates, now)
 }
 
+/// Concurrent-friendly 30-day auto-purge that only locks `store` briefly to read
+/// purge candidates and commit tombstones, never holding the DB mutex across S4
+/// network `DELETE` requests.
+pub fn purge_expired_trash_concurrent(
+    store: &std::sync::Mutex<Store>,
+    s4: &dyn ObjectStore,
+    now: DateTime<Utc>,
+) -> Result<PurgeReport> {
+    let candidates: Vec<PurgeCandidate> = {
+        let st = store
+            .lock()
+            .map_err(|_| StoreError::Io(std::io::Error::other("store mutex poisoned")))?;
+        st.assets_due_for_purge(now)?
+    };
+    if candidates.is_empty() {
+        return Ok(PurgeReport::default());
+    }
+
+    let mut purged_ids = Vec::with_capacity(candidates.len());
+    let mut s4_deleted = 0usize;
+
+    for cand in &candidates {
+        s4.delete_object(&cand.key)?;
+        s4_deleted += 1;
+
+        if let Some(ref m_key) = cand.motion_key {
+            s4.delete_object(m_key)?;
+            s4_deleted += 1;
+        }
+
+        s4.delete_object(&thumb_small_key(&cand.id))?;
+        s4.delete_object(&thumb_preview_key(&cand.id))?;
+        s4_deleted += 2;
+
+        purged_ids.push(cand.id.clone());
+    }
+
+    {
+        let mut st = store
+            .lock()
+            .map_err(|_| StoreError::Io(std::io::Error::other("store mutex poisoned")))?;
+        st.purge_assets(purged_ids.clone(), now)?;
+    }
+
+    Ok(PurgeReport {
+        purged_asset_ids: purged_ids,
+        s4_objects_deleted: s4_deleted,
+    })
+}
+
 /// Immediately purge specific trashed assets ("Delete now" in Trash view, spec section 9).
 pub fn delete_trash_items_now(
     store: &mut Store,

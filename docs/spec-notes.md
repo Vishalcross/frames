@@ -161,3 +161,28 @@ cargo test -p frames-core
      - #23: Implemented Unicode NFC filename normalisation (`keys::normalize_nfc` / `clean_filename`).
      - #24: Implemented `import_unknown_s4_keys` and `"Add Unknown Files to Library"` button in Check Library report.
      - #25: Fixed all `cargo clippy --workspace --all-targets` warnings (0 warnings across workspace).
+
+8. **Slice 8 — Second-Round Adversarial Review Blockers & Pre-Flight Hardening (`frames-core` + `frames-shell`)**:
+   - **Blocker 1 — Fake S4 fallback & ignored Keychain errors (`frames-shell/src-tauri/src/lib.rs`, `+page.svelte`)**:
+     - Added `AppState::require_s4(&self) -> Result<Arc<dyn ObjectStore>, String>`: when `use_real_s4` is `true` and S4 credentials (`endpoint`, `bucket`, `access_key_id`, or `secret`) are missing, all S4-bound commands (`import_from_paths`, `sync_now`, `export_assets`, `run_check_library`, `add_unknown_s4_files`, `run_rebuild_database`, `delete_now_assets`, `empty_trash`, and `frames://` protocol cold fetches) return an explicit error instead of silently falling back to the in-memory `demo_s4` store.
+     - `save_settings` now propagates OS Keychain / Credential Manager save errors (`save_secret_in_os_keychain(...)?`) instead of discarding them.
+     - `SettingsView` exposes `s4_configured: bool`, and `+page.svelte` renders a prominent warning banner when `use_real_s4 && !s4_configured`.
+   - **Blocker 2 — Retry backoff duration & `curl` exit code classification (`crates/frames-core/src/s4.rs`)**:
+     - `S4Config::retry_base_delay_ms` defaults to `1_000` ms (`compute_backoff_delay_ms` sleeps `1s, 2s, 4s, 8s, 16s = 31s` total across 5 retries; unit tests use `10` ms on `InMemoryObjectStore`).
+     - `classify_curl_exit_code` maps only `curl` exit codes `6` (`Couldn't resolve host`) and `7` (`Failed to connect`) to `S4Error::Offline` (pausing the import as offline), maps transient timeouts/partial transfers (`18`, `28`, `52`, `55`, `56`) to `S4Error::TransientTransport` (retried with exponential backoff), and maps TLS/URL/binary errors (`35`, `51`, `60`, etc.) to `S4Error::Transport` (failing the file without misleadingly pausing the import as offline).
+   - **Blocker 3 — Hashing a folder holds the database lock (`crates/frames-core/src/sync.rs`)**:
+     - `prepare_folder_assets_concurrent` hashes files (`sha256_file`) and extracts metadata (`read_metadata` / `ffprobe`) outside `store.lock()`, acquiring `store.lock()` only for brief microseconds to check duplicate hashes or update `import_queue`.
+   - **Blocker 4 — `frames://` protocol handler blocks UI thread, holds cache lock during S4 downloads, and missing background small-thumb sync (`frames-shell/src-tauri/src/lib.rs`)**:
+     - Switched to `.register_asynchronous_uri_scheme_protocol("frames", ...)` running on `tauri::async_runtime::spawn_blocking`.
+     - Added `fetch_small_thumb_unlocked`, `fetch_preview_unlocked`, and `fetch_original_unlocked` (using `LocalCache::original_disk_path` and `LocalCache::register_downloaded_original`) so `state.cache.lock()` is never held across S4 network I/O.
+     - Added `AppState::spawn_background_small_thumb_sync(&self)` invoked on bootstrap, `sync_now`, and `run_rebuild_database` to download missing `s.webp` thumbnails in the background on a new computer.
+   - **Blocker 5 — Startup can hang offline (`frames-shell/src-tauri/src/lib.rs`, `crates/frames-core/src/trash.rs`)**:
+     - Removed synchronous `purge_expired_trash` from `AppState::init_with_dir`.
+     - Added `purge_expired_trash_concurrent` (releasing `store.lock()` during S4 `DELETE` calls) and scheduled it on a background thread starting 5 seconds after window launch and repeating every 24 hours.
+   - **Blocker 6 — Concurrent imports, rigid 4-file batches, and delayed cancel (`crates/frames-core/src/sync.rs`, `crates/frames-core/src/s4.rs`)**:
+     - Added `ImportControl::try_start_run()` + `SyncError::AlreadyRunning` + `RunningGuard` RAII drop guard to prevent two imports from running simultaneously.
+     - Replaced `assets.chunks(4)` with a 4-worker work-stealing `Mutex<VecDeque<PreparedImportAsset>>` pool in `run_import_concurrent`.
+     - Added `upload_file_with_resume_cancel` checking `should_cancel` before each multipart chunk so pause and cancel take effect between 16 MB parts rather than waiting for an entire multi-GB video to finish.
+   - **Blocker 7 — Windows drag-and-drop & Local S3/MinIO + Live S4 tests (`tauri.conf.json`, `crates/frames-core/src/s4.rs`)**:
+     - Set `"dragDropEnabled": false` in `frames-shell/src-tauri/tauri.conf.json` so HTML5 drag-and-drop of thumbnails onto sidebar albums works on Windows WebView2 alongside external folder drag-and-drop.
+     - Added `s4_client_end_to_end_against_local_s3_minio_http_server` and `live_s4_bucket_smoke_test_if_configured` (`FRAMES_TEST_S4_*` env vars) in `crates/frames-core/src/s4.rs`.

@@ -1,7 +1,7 @@
 //! Cloud sync engine, end-to-end S4 importer runner, Check Library, Rebuild
 //! Database, and Export Originals (spec sections 6, 7, 9, 11).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +27,8 @@ use crate::media::{
 };
 use crate::ops::{AssetKind, AssetRecord, Batch};
 use crate::s4::{
-    retry_with_backoff, upload_file_with_resume, ObjectStore, S4Error, SpaceUsage,
+    retry_with_backoff_cfg, upload_file_with_resume, upload_file_with_resume_cancel, ObjectStore,
+    S4Error, SpaceUsage,
 };
 use crate::store::{
     ImportQueueRow, ImportState, Store, StoreError, DEFAULT_OUTBOX_MAX_ASSETS,
@@ -35,6 +36,8 @@ use crate::store::{
 
 #[derive(Debug, Error)]
 pub enum SyncError {
+    #[error("an import is already running")]
+    AlreadyRunning,
     #[error("store error: {0}")]
     Store(#[from] StoreError),
     #[error("s4 error: {0}")]
@@ -94,10 +97,34 @@ impl ImportControl {
         self.running.store(val, Ordering::SeqCst);
     }
 
+    /// Atomically claim the single-import lock. Returns `false` if another import
+    /// is already running.
+    pub fn try_start_run(&self) -> bool {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.paused.store(false, Ordering::SeqCst);
+            self.cancelled.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn reset_for_new_run(&self) {
         self.paused.store(false, Ordering::SeqCst);
         self.cancelled.store(false, Ordering::SeqCst);
         self.running.store(true, Ordering::SeqCst);
+    }
+}
+
+struct RunningGuard<'a>(&'a ImportControl);
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set_running(false);
     }
 }
 
@@ -116,11 +143,12 @@ pub fn flush_outbox(
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<usize> {
+    let base_delay = s4.config().retry_base_delay_ms;
     let mut pushed = 0usize;
     while let Some(pending) = store.peek_outbox_batch(DEFAULT_OUTBOX_MAX_ASSETS, now)? {
         let key = log_key(&pending.batch.device, pending.batch.seq);
         let payload = serde_json::to_vec(&pending.batch)?;
-        retry_with_backoff(3, || {
+        retry_with_backoff_cfg(5, base_delay, || {
             s4.put_object(&key, &payload, "application/json").map(|_| ())
         })?;
         store.mark_outbox_flushed(&pending)?;
@@ -132,7 +160,8 @@ pub fn flush_outbox(
 /// Pull and apply any change-log batches in S4 (`index/log/<device>/<seq>.json`)
 /// with `seq > store.applied_seq(device)`, in `(device, seq)` order.
 pub fn pull_remote_logs(store: &mut Store, s4: &dyn ObjectStore) -> Result<usize> {
-    let objects = retry_with_backoff(3, || s4.list_objects(LOG_PREFIX))?;
+    let base_delay = s4.config().retry_base_delay_ms;
+    let objects = retry_with_backoff_cfg(5, base_delay, || s4.list_objects(LOG_PREFIX))?;
 
     let mut to_fetch: Vec<(String, u64, String)> = Vec::new();
     for obj in objects {
@@ -148,7 +177,7 @@ pub fn pull_remote_logs(store: &mut Store, s4: &dyn ObjectStore) -> Result<usize
 
     let mut pulled = 0usize;
     for (_dev, _seq, key) in to_fetch {
-        let Some(bytes) = retry_with_backoff(3, || s4.get_object(&key))? else {
+        let Some(bytes) = retry_with_backoff_cfg(5, base_delay, || s4.get_object(&key))? else {
             continue;
         };
         let batch: Batch = serde_json::from_slice(&bytes)?;
@@ -168,8 +197,9 @@ pub fn write_snapshot_if_needed(
     if !store.needs_snapshot(now)? {
         return Ok(None);
     }
+    let base_delay = s4.config().retry_base_delay_ms;
     let (key, gz_bytes) = store.export_snapshot_gz(now)?;
-    retry_with_backoff(3, || {
+    retry_with_backoff_cfg(5, base_delay, || {
         s4.put_object(&key, &gz_bytes, "application/gzip").map(|_| ())
     })?;
     Ok(Some(key))
@@ -221,10 +251,11 @@ pub fn sync_once(
 pub fn rebuild_from_s4(store: &mut Store, s4: &dyn ObjectStore) -> Result<SyncReport> {
     store.reset_for_rebuild()?;
 
-    let snap_objs = retry_with_backoff(3, || s4.list_objects(SNAPSHOT_PREFIX))?;
+    let base_delay = s4.config().retry_base_delay_ms;
+    let snap_objs = retry_with_backoff_cfg(5, base_delay, || s4.list_objects(SNAPSHOT_PREFIX))?;
     let snap_keys: Vec<&str> = snap_objs.iter().map(|o| o.key.as_str()).collect();
     if let Some(latest_key) = newest_snapshot(snap_keys) {
-        if let Some(gz_bytes) = retry_with_backoff(3, || s4.get_object(latest_key))? {
+        if let Some(gz_bytes) = retry_with_backoff_cfg(5, base_delay, || s4.get_object(latest_key))? {
             store.import_snapshot_gz(&gz_bytes)?;
         }
     }
@@ -375,11 +406,12 @@ pub fn import_unknown_s4_keys(
 
         let s_key = thumb_small_key(&hash);
         let m_key = thumb_preview_key(&hash);
-        let _ = retry_with_backoff(3, || {
+        let base_delay = s4.config().retry_base_delay_ms;
+        let _ = retry_with_backoff_cfg(5, base_delay, || {
             s4.put_object(&s_key, &thumbs.small_webp, "image/webp")
                 .map(|_| ())
         });
-        let _ = retry_with_backoff(3, || {
+        let _ = retry_with_backoff_cfg(5, base_delay, || {
             s4.put_object(&m_key, &thumbs.preview_webp, "image/webp")
                 .map(|_| ())
         });
@@ -670,9 +702,156 @@ where
     Ok(report)
 }
 
-/// Concurrent background import runner (up to 4 files in parallel per folder batch)
+/// Prepare one folder's scanned candidates WITHOUT holding `store.lock()` across
+/// `sha256_file` or `read_metadata` (`ffprobe`), acquiring the SQLite mutex only
+/// for brief microseconds to check duplicate hashes or update `import_queue`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_folder_assets_concurrent(
+    folder_candidates: Vec<ScannedCandidate>,
+    album_id: Option<&str>,
+    store: &Arc<Mutex<Store>>,
+    control: &ImportControl,
+    seen_hashes: &mut HashSet<String>,
+    resume_map: &HashMap<PathBuf, (Option<String>, u32)>,
+    report: &mut ImportRunReport,
+    now: DateTime<Utc>,
+) -> Result<Vec<PreparedImportAsset>> {
+    let mut inspected_files: Vec<InspectedFile> = Vec::new();
+
+    for cand in folder_candidates {
+        if control.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        while control.is_paused() && !control.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if control.is_cancelled() {
+            return Ok(Vec::new());
+        }
+
+        let path_str = cand.path.to_string_lossy().to_string();
+        // Hash outside the DB lock so timeline & search never stall
+        let hash = match sha256_file(&cand.path) {
+            Ok(h) => h,
+            Err(err) => {
+                let msg = format!("unreadable: {err}");
+                if let Ok(mut st) = store.lock() {
+                    let _ = st.update_import_state(
+                        &path_str,
+                        ImportState::Failed,
+                        None,
+                        None,
+                        0,
+                        Some(&msg),
+                    );
+                }
+                report.failed_files.push(SkippedFile {
+                    path: cand.path,
+                    reason: msg,
+                });
+                continue;
+            }
+        };
+
+        let is_dup = if seen_hashes.contains(&hash) {
+            true
+        } else {
+            let st = store.lock().unwrap();
+            st.has_active_or_trashed_asset(&hash)?
+        };
+        if is_dup {
+            if let Ok(mut st) = store.lock() {
+                let _ = st.update_import_state(
+                    &path_str,
+                    ImportState::Skipped,
+                    Some(&hash),
+                    None,
+                    0,
+                    None,
+                );
+            }
+            report.duplicates_skipped += 1;
+            continue;
+        }
+        seen_hashes.insert(hash.clone());
+
+        // Extract EXIF / ffprobe metadata outside the DB lock
+        let metadata = match read_metadata(&cand.path) {
+            Ok(m) => m,
+            Err(err) => {
+                let msg = format!("unreadable: {err}");
+                if let Ok(mut st) = store.lock() {
+                    let _ = st.update_import_state(
+                        &path_str,
+                        ImportState::Failed,
+                        Some(&hash),
+                        None,
+                        0,
+                        Some(&msg),
+                    );
+                }
+                report.failed_files.push(SkippedFile {
+                    path: cand.path,
+                    reason: msg,
+                });
+                continue;
+            }
+        };
+        inspected_files.push(InspectedFile {
+            candidate: cand,
+            sha256: hash,
+            metadata,
+        });
+    }
+
+    let paired_items = pair_live_photos(inspected_files, now);
+    let mut prepared = Vec::with_capacity(paired_items.len());
+    for mut item in paired_items {
+        if let Some((existing_uid, parts_done)) = resume_map.get(&item.primary_path) {
+            item.existing_upload_id = existing_uid.clone();
+            item.parts_already_done = *parts_done;
+        }
+        let path_str = item.primary_path.to_string_lossy().to_string();
+        let state = if item.existing_upload_id.is_some() {
+            ImportState::Uploading
+        } else {
+            ImportState::Hashed
+        };
+        {
+            let mut st = store.lock().unwrap();
+            if let Some(ref mov_path) = item.motion_path {
+                let mov_str = mov_path.to_string_lossy().to_string();
+                let _ = st.update_import_state(
+                    &mov_str,
+                    ImportState::Skipped,
+                    item.record.motion_id.as_deref(),
+                    None,
+                    0,
+                    None,
+                );
+            }
+            st.enqueue_import(&ImportQueueRow {
+                path: path_str,
+                size: item.record.size + item.record.motion_size.unwrap_or(0),
+                mtime: item.primary_mtime_ms,
+                state,
+                asset_id: Some(item.record.id.clone()),
+                upload_id: item.existing_upload_id.clone(),
+                parts_done: item.parts_already_done,
+                album_id: album_id.map(str::to_string),
+                error: None,
+            })?;
+        }
+        prepared.push(item);
+    }
+
+    Ok(prepared)
+}
+
+/// Concurrent background import runner (work-stealing 4-worker pool per folder)
 /// with fine-grained `Mutex` locking on `Store` and `LocalCache` so UI timeline reads
-/// never stall, plus pause/resume/cancel via `ImportControl`.
+/// never stall during hashing or uploading, plus single-run enforcement and immediate
+/// pause/resume/cancel via `ImportControl`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_import_concurrent<I, P, F>(
     roots: I,
@@ -689,7 +868,11 @@ where
     P: AsRef<Path>,
     F: Fn(&ImportRunReport) + Send + Sync,
 {
-    control.reset_for_new_run();
+    if !control.try_start_run() {
+        return Err(SyncError::AlreadyRunning);
+    }
+    let _running_guard = RunningGuard(&control);
+
     let scan = scan_paths(roots);
     let mut report = ImportRunReport {
         unknown_files: scan.unknown_files,
@@ -700,28 +883,31 @@ where
     let mut by_folder: BTreeMap<PathBuf, Vec<ScannedCandidate>> = BTreeMap::new();
     let mut resume_map: HashMap<PathBuf, (Option<String>, u32)> = HashMap::new();
 
-    {
-        let mut st = store.lock().unwrap();
-        for cand in scan.candidates {
-            let path_str = cand.path.to_string_lossy().to_string();
-            let row = st.reconcile_import_candidate(&path_str, cand.size, cand.mtime_ms, album_id)?;
-            match row.state {
-                ImportState::Logged => continue,
-                ImportState::Skipped => {
-                    report.duplicates_skipped += 1;
-                    continue;
+    for cand in scan.candidates {
+        if control.is_cancelled() {
+            break;
+        }
+        let path_str = cand.path.to_string_lossy().to_string();
+        let row = {
+            let mut st = store.lock().unwrap();
+            st.reconcile_import_candidate(&path_str, cand.size, cand.mtime_ms, album_id)?
+        };
+        match row.state {
+            ImportState::Logged => continue,
+            ImportState::Skipped => {
+                report.duplicates_skipped += 1;
+                continue;
+            }
+            _ => {
+                if row.upload_id.is_some() || row.parts_done > 0 {
+                    resume_map.insert(cand.path.clone(), (row.upload_id, row.parts_done));
                 }
-                _ => {
-                    if row.upload_id.is_some() || row.parts_done > 0 {
-                        resume_map.insert(cand.path.clone(), (row.upload_id, row.parts_done));
-                    }
-                    let parent = cand
-                        .path
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
-                    by_folder.entry(parent).or_default().push(cand);
-                }
+                let parent = cand
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                by_folder.entry(parent).or_default().push(cand);
             }
         }
     }
@@ -740,114 +926,152 @@ where
             break;
         }
 
-        let assets = {
-            let mut st = store.lock().unwrap();
-            prepare_folder_assets(
-                folder_candidates,
-                album_id,
-                &mut st,
-                &mut seen_hashes,
-                &resume_map,
-                &mut report,
-                now,
-            )?
-        };
+        let assets = prepare_folder_assets_concurrent(
+            folder_candidates,
+            album_id,
+            &store,
+            &control,
+            &mut seen_hashes,
+            &resume_map,
+            &mut report,
+            now,
+        )?;
         on_progress(&report);
 
-        // Process up to 4 files in parallel (Spec Section 7 Step 6)
-        for chunk in assets.chunks(4) {
+        if assets.is_empty() || control.is_cancelled() {
             if control.is_cancelled() {
                 break 'folders;
             }
-            while control.is_paused() && !control.is_cancelled() {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if control.is_cancelled() {
-                break 'folders;
-            }
+            continue;
+        }
 
-            let results: Vec<std::result::Result<(), (PathBuf, String, SyncError)>> =
-                std::thread::scope(|s| {
-                    let mut handles = Vec::with_capacity(chunk.len());
-                    for item in chunk {
-                        let mut item_clone = item.clone();
-                        let store_ref = Arc::clone(&store);
-                        let s4_ref = Arc::clone(&s4);
-                        let cache_ref = Arc::clone(&cache);
-                        let alb = album_id.map(str::to_string);
-                        handles.push(s.spawn(move || {
-                            upload_and_log_concurrent(
-                                &mut item_clone,
-                                alb.as_deref(),
-                                &store_ref,
-                                s4_ref.as_ref(),
-                                &cache_ref,
-                                now,
-                            )
-                            .map_err(|e| (item_clone.primary_path, item_clone.record.id, e))
-                        }));
-                    }
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
+        // Work-stealing pool of up to 4 concurrent upload workers so fast photo
+        // uploads never stall waiting for a slow video upload in the same folder.
+        let worker_count = assets.len().min(4);
+        let work_queue = Mutex::new(VecDeque::from(assets));
+        let shared_report = Mutex::new(report);
+        let stop_folder_loop = AtomicBool::new(false);
 
-            let mut stop_folder_loop = false;
-            for res in results {
-                match res {
-                    Ok(()) => {
-                        report.imported_count += 1;
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                let queue_ref = &work_queue;
+                let report_ref = &shared_report;
+                let stop_ref = &stop_folder_loop;
+                let store_ref = Arc::clone(&store);
+                let s4_ref = Arc::clone(&s4);
+                let cache_ref = Arc::clone(&cache);
+                let control_ref = Arc::clone(&control);
+                let alb = album_id.map(str::to_string);
+                let progress_cb = &on_progress;
+
+                handles.push(s.spawn(move || loop {
+                    if control_ref.is_cancelled() || stop_ref.load(Ordering::SeqCst) {
+                        break;
                     }
-                    Err((_path, _id, SyncError::S4(S4Error::Offline(_)))) => {
-                        report.paused_offline = true;
-                        stop_folder_loop = true;
+                    while control_ref.is_paused() && !control_ref.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(100));
                     }
-                    Err((
-                        _path,
-                        _id,
-                        SyncError::S4(S4Error::SpaceFull {
+                    if control_ref.is_cancelled() || stop_ref.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let next_item = {
+                        let mut q = queue_ref.lock().unwrap();
+                        q.pop_front()
+                    };
+                    let Some(mut item) = next_item else {
+                        break;
+                    };
+
+                    let res = upload_and_log_concurrent(
+                        &mut item,
+                        alb.as_deref(),
+                        &store_ref,
+                        s4_ref.as_ref(),
+                        &cache_ref,
+                        &control_ref,
+                        now,
+                    );
+
+                    match res {
+                        Ok(()) => {
+                            if let Ok(mut rep) = report_ref.lock() {
+                                rep.imported_count += 1;
+                                progress_cb(&rep);
+                            }
+                        }
+                        Err(SyncError::S4(S4Error::Cancelled)) => {
+                            stop_ref.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        Err(SyncError::S4(S4Error::Offline(_))) => {
+                            if let Ok(mut rep) = report_ref.lock() {
+                                rep.paused_offline = true;
+                                progress_cb(&rep);
+                            }
+                            stop_ref.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        Err(SyncError::S4(S4Error::SpaceFull {
                             used_bytes,
                             limit_bytes,
-                        }),
-                    )) => {
-                        report.stopped_space_full = true;
-                        report.space_usage = Some(SpaceUsage::compute(used_bytes, limit_bytes));
-                        stop_folder_loop = true;
-                    }
-                    Err((path, id, err)) => {
-                        let msg = err.to_string();
-                        let path_str = path.to_string_lossy().to_string();
-                        if let Ok(mut st) = store.lock() {
-                            let _ = st.update_import_state(
-                                &path_str,
-                                ImportState::Failed,
-                                Some(&id),
-                                None,
-                                0,
-                                Some(&msg),
-                            );
+                        })) => {
+                            if let Ok(mut rep) = report_ref.lock() {
+                                rep.stopped_space_full = true;
+                                rep.space_usage =
+                                    Some(SpaceUsage::compute(used_bytes, limit_bytes));
+                                progress_cb(&rep);
+                            }
+                            stop_ref.store(true, Ordering::SeqCst);
+                            break;
                         }
-                        report.failed_files.push(SkippedFile { path, reason: msg });
+                        Err(err) => {
+                            let msg = err.to_string();
+                            let path_str = item.primary_path.to_string_lossy().to_string();
+                            if let Ok(mut st) = store_ref.lock() {
+                                let _ = st.update_import_state(
+                                    &path_str,
+                                    ImportState::Failed,
+                                    Some(&item.record.id),
+                                    None,
+                                    0,
+                                    Some(&msg),
+                                );
+                            }
+                            if let Ok(mut rep) = report_ref.lock() {
+                                rep.failed_files.push(SkippedFile {
+                                    path: item.primary_path,
+                                    reason: msg,
+                                });
+                                progress_cb(&rep);
+                            }
+                        }
                     }
-                }
+                }));
             }
-            on_progress(&report);
+            for h in handles {
+                let _ = h.join();
+            }
+        });
 
-            if !report.paused_offline {
-                if let Ok(mut st) = store.lock() {
-                    let _ = flush_outbox(&mut st, s4.as_ref(), now);
-                }
+        report = shared_report.into_inner().unwrap();
+
+        if !report.paused_offline && !control.is_cancelled() {
+            if let Ok(mut st) = store.lock() {
+                let _ = flush_outbox(&mut st, s4.as_ref(), now);
             }
-            if stop_folder_loop {
-                break 'folders;
-            }
+        }
+        if stop_folder_loop.load(Ordering::SeqCst) || control.is_cancelled() {
+            break 'folders;
         }
     }
 
-    if !report.paused_offline {
+    if !report.paused_offline && !control.is_cancelled() {
         if let Ok(mut st) = store.lock() {
             let _ = flush_outbox(&mut st, s4.as_ref(), now);
         }
     }
-    control.set_running(false);
     on_progress(&report);
     Ok(report)
 }
@@ -861,6 +1085,7 @@ fn upload_and_log_one_asset(
     now: DateTime<Utc>,
 ) -> Result<()> {
     let path_str = item.primary_path.to_string_lossy().to_string();
+    let base_delay = s4.config().retry_base_delay_ms;
 
     // Step 4b: Name clash check via S4 HEAD (spec section 4)
     let primary_clashed = s4.head_object(&item.record.key)?.is_some();
@@ -894,7 +1119,7 @@ fn upload_and_log_one_asset(
         "application/octet-stream",
         initial_uid.as_deref(),
         initial_parts,
-        3,
+        5,
         |uid, parts_done| {
             let _ = store.update_import_state(
                 &path_str,
@@ -916,7 +1141,7 @@ fn upload_and_log_one_asset(
             "video/quicktime",
             None,
             0,
-            3,
+            5,
             |_, _| {},
         )?;
     }
@@ -924,11 +1149,11 @@ fn upload_and_log_one_asset(
     // Upload small and preview thumbnails
     let s_key = thumb_small_key(&item.record.id);
     let m_key = thumb_preview_key(&item.record.id);
-    retry_with_backoff(3, || {
+    retry_with_backoff_cfg(5, base_delay, || {
         s4.put_object(&s_key, &thumbs.small_webp, "image/webp")
             .map(|_| ())
     })?;
-    retry_with_backoff(3, || {
+    retry_with_backoff_cfg(5, base_delay, || {
         s4.put_object(&m_key, &thumbs.preview_webp, "image/webp")
             .map(|_| ())
     })?;
@@ -962,9 +1187,22 @@ fn upload_and_log_concurrent(
     store: &Arc<Mutex<Store>>,
     s4: &dyn ObjectStore,
     cache: &Arc<Mutex<LocalCache>>,
+    control: &ImportControl,
     now: DateTime<Utc>,
 ) -> Result<()> {
     let path_str = item.primary_path.to_string_lossy().to_string();
+    let base_delay = s4.config().retry_base_delay_ms;
+
+    let should_cancel = || {
+        while control.is_paused() && !control.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        control.is_cancelled()
+    };
+
+    if should_cancel() {
+        return Err(SyncError::S4(S4Error::Cancelled));
+    }
 
     // Step 4b: Name clash check via S4 HEAD (no lock held!)
     let primary_clashed = s4.head_object(&item.record.key)?.is_some();
@@ -995,14 +1233,14 @@ fn upload_and_log_concurrent(
     }
 
     // Step 6: Upload original without holding the DB lock across network I/O
-    upload_file_with_resume(
+    upload_file_with_resume_cancel(
         s4,
         &item.primary_path,
         &item.record.key,
         "application/octet-stream",
         initial_uid.as_deref(),
         initial_parts,
-        3,
+        5,
         |uid, parts_done| {
             if let Ok(mut st) = store.lock() {
                 let _ = st.update_import_state(
@@ -1015,28 +1253,36 @@ fn upload_and_log_concurrent(
                 );
             }
         },
+        should_cancel,
     )?;
 
     if let (Some(ref mov_path), Some(ref mov_key)) = (&item.motion_path, &item.record.motion_key) {
-        upload_file_with_resume(
+        upload_file_with_resume_cancel(
             s4,
             mov_path,
             mov_key,
             "video/quicktime",
             None,
             0,
-            3,
+            5,
             |_, _| {},
+            should_cancel,
         )?;
     }
 
     let s_key = thumb_small_key(&item.record.id);
     let m_key = thumb_preview_key(&item.record.id);
-    retry_with_backoff(3, || {
+    retry_with_backoff_cfg(5, base_delay, || {
+        if should_cancel() {
+            return Err(S4Error::Cancelled);
+        }
         s4.put_object(&s_key, &thumbs.small_webp, "image/webp")
             .map(|_| ())
     })?;
-    retry_with_backoff(3, || {
+    retry_with_backoff_cfg(5, base_delay, || {
+        if should_cancel() {
+            return Err(S4Error::Cancelled);
+        }
         s4.put_object(&m_key, &thumbs.preview_webp, "image/webp")
             .map(|_| ())
     })?;
@@ -1337,5 +1583,57 @@ mod tests {
         let rep2 = run_import([&src_dir.0], None, &mut store, &s4, &mut cache, t(20)).unwrap();
         assert_eq!(rep2.imported_count, 1);
         assert_eq!(store.list_timeline(None, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn concurrent_import_enforces_single_run_and_imports_across_worker_pool() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        for i in 0..6 {
+            fs::write(
+                src_dir.0.join(format!("IMG_20240512_10000{i}.JPG")),
+                format!("photo-payload-{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+
+        let s4: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new(S4Config::default()));
+        let store = Arc::new(Mutex::new(Store::open_in_memory("mac-1").unwrap()));
+        let cache = Arc::new(Mutex::new(
+            LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap(),
+        ));
+        let control = Arc::new(ImportControl::new());
+
+        // Simulate an import already running: second call must fail with AlreadyRunning
+        assert!(control.try_start_run());
+        let dup_err = run_import_concurrent(
+            [&src_dir.0],
+            None,
+            Arc::clone(&store),
+            Arc::clone(&s4),
+            Arc::clone(&cache),
+            Arc::clone(&control),
+            t(10),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(dup_err, SyncError::AlreadyRunning));
+
+        // Release and run for real across the 4-worker pool
+        control.set_running(false);
+        let rep = run_import_concurrent(
+            [&src_dir.0],
+            None,
+            Arc::clone(&store),
+            Arc::clone(&s4),
+            Arc::clone(&cache),
+            Arc::clone(&control),
+            t(10),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(rep.imported_count, 6);
+        assert!(!control.is_running());
+        assert_eq!(store.lock().unwrap().list_timeline(None, None).unwrap().len(), 6);
     }
 }

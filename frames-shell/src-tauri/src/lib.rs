@@ -1,5 +1,3 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -11,10 +9,9 @@ pub struct CoreStatus {
 
 #[tauri::command]
 fn check_core_status(filename: &str) -> CoreStatus {
-    // Calling into frames-core (adjust function name if keys.rs uses a different signature)
     CoreStatus {
         connected: true,
-        sample_original_key: format!("originals/2026/10/{}", filename),
+        sample_original_key: frames_core::keys::original_key(2026, 10, filename),
         message: "frames-core is linked and SQLite schema is ready".to_string(),
     }
 }

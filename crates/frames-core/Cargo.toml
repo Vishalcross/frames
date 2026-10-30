@@ -7,10 +7,11 @@ description = "Frames core logic: bucket keys, dates, change-log types, local sc
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+fastrand = "2"
+flate2 = "1"
 regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
-# Used only to prove schema.sql loads (FTS5 included) on every machine.
-rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }

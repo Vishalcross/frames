@@ -81,9 +81,13 @@ pub fn date_from_filename(name: &str) -> Option<NaiveDateTime> {
 }
 
 /// `dt` plus `minutes` (negative moves it earlier).
-fn shift_minutes(dt: DateTime<Utc>, minutes: i32) -> DateTime<Utc> {
+pub fn shift_utc_minutes(dt: DateTime<Utc>, minutes: i32) -> DateTime<Utc> {
     let secs = dt.timestamp() + i64::from(minutes) * 60;
     DateTime::from_timestamp(secs, dt.timestamp_subsec_nanos()).unwrap_or(dt)
+}
+
+fn shift_minutes(dt: DateTime<Utc>, minutes: i32) -> DateTime<Utc> {
+    shift_utc_minutes(dt, minutes)
 }
 
 fn plausible(dt: DateTime<Utc>, now: DateTime<Utc>) -> bool {

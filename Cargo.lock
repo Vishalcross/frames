@@ -1056,10 +1056,14 @@ name = "frames-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "fastrand",
+ "flate2",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]

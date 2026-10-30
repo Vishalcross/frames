@@ -7,6 +7,7 @@
 pub mod dates;
 pub mod keys;
 pub mod ops;
+pub mod store;
 
 /// The local SQLite schema (spec section 5), applied when a database is created.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");

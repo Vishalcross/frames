@@ -1,21 +1,31 @@
 //! Cloud sync engine, end-to-end S4 importer runner, Check Library, Rebuild
 //! Database, and Export Originals (spec sections 6, 7, 9, 11).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::cache::LocalCache;
-use crate::importer::{prepare_import_plan, PreparedImportAsset, SkippedFile};
-use crate::keys::{
-    log_key, newest_snapshot, parse_log_key, thumb_preview_key, thumb_small_key, LOG_PREFIX,
-    SNAPSHOT_PREFIX,
+use crate::dates::{choose_taken, Candidates};
+use crate::importer::{
+    pair_live_photos, scan_paths, InspectedFile, PreparedImportAsset, ScannedCandidate,
+    SkippedFile,
 };
-use crate::ops::Batch;
+use crate::keys::{
+    clash_filename, clean_filename, log_key, newest_snapshot, parse_log_key, thumb_preview_key,
+    thumb_small_key, LOG_PREFIX, SNAPSHOT_PREFIX,
+};
+use crate::media::{
+    classify_path, generate_thumbnails, read_metadata, sha256_file, FileClassification,
+};
+use crate::ops::{AssetKind, AssetRecord, Batch};
 use crate::s4::{
     retry_with_backoff, upload_file_with_resume, ObjectStore, S4Error, SpaceUsage,
 };
@@ -42,6 +52,54 @@ impl From<rusqlite::Error> for SyncError {
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
+
+#[derive(Debug, Default)]
+pub struct ImportControl {
+    paused: AtomicBool,
+    cancelled: AtomicBool,
+    running: AtomicBool,
+}
+
+impl ImportControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn set_running(&self, val: bool) {
+        self.running.store(val, Ordering::SeqCst);
+    }
+
+    pub fn reset_for_new_run(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.running.store(true, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncReport {
@@ -272,6 +330,103 @@ pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheck
     })
 }
 
+/// Add unknown `originals/...` S4 objects (discovered by `check_library`) into the
+/// library by streaming each object to a temporary file, hashing it, extracting
+/// metadata and thumbnails, uploading thumbnails, and logging `asset.add` (spec §11).
+pub fn import_unknown_s4_keys(
+    store: &mut Store,
+    s4: &dyn ObjectStore,
+    cache: &mut LocalCache,
+    keys: &[String],
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let mut added = 0usize;
+    let tmp_dir = std::env::temp_dir().join(format!("frames-unknown-{}", fastrand::u64(..)));
+    fs::create_dir_all(&tmp_dir)?;
+
+    for (idx, key) in keys.iter().enumerate() {
+        let raw_name = key.rsplit('/').next().unwrap_or("recovered.jpg");
+        let filename = clean_filename(raw_name);
+        let is_video = match classify_path(Path::new(&filename)) {
+            FileClassification::Photo { .. } => false,
+            FileClassification::Video { .. } => true,
+            _ => continue,
+        };
+        let tmp_file = tmp_dir.join(format!("{idx}_{filename}"));
+        let downloaded = s4.get_object_to_file(key, &tmp_file)?;
+        if !downloaded {
+            continue;
+        }
+        let hash = sha256_file(&tmp_file)?;
+        if store.has_active_or_trashed_asset(&hash)? {
+            let _ = fs::remove_file(&tmp_file);
+            continue;
+        }
+        let size = fs::metadata(&tmp_file).map(|m| m.len()).unwrap_or(0);
+        let meta = read_metadata(&tmp_file).unwrap_or_default();
+        let kind = if is_video {
+            AssetKind::Video
+        } else {
+            AssetKind::Photo
+        };
+        let thumbs = generate_thumbnails(&tmp_file, kind, &meta);
+        let _ = cache.put_small_thumb(&hash, &thumbs.small_webp);
+        let _ = cache.put_preview(&hash, &thumbs.preview_webp);
+
+        let s_key = thumb_small_key(&hash);
+        let m_key = thumb_preview_key(&hash);
+        let _ = retry_with_backoff(3, || {
+            s4.put_object(&s_key, &thumbs.small_webp, "image/webp")
+                .map(|_| ())
+        });
+        let _ = retry_with_backoff(3, || {
+            s4.put_object(&m_key, &thumbs.preview_webp, "image/webp")
+                .map(|_| ())
+        });
+
+        let taken = choose_taken(&Candidates {
+            exif_local: meta.exif_local,
+            exif_offset_minutes: meta.exif_offset_minutes,
+            quicktime_utc: meta.quicktime_utc,
+            filename: &filename,
+            modified: now,
+            now,
+        });
+
+        let record = AssetRecord {
+            id: hash,
+            kind,
+            key: key.clone(),
+            filename,
+            size,
+            taken_at: taken.utc,
+            tz_offset: taken.tz_offset_minutes,
+            date_guessed: taken.guessed,
+            width: meta.width,
+            height: meta.height,
+            duration_ms: meta.duration_ms,
+            container: meta.container,
+            video_codec: meta.video_codec,
+            audio_codec: meta.audio_codec,
+            camera_make: meta.camera_make,
+            camera_model: meta.camera_model,
+            motion_id: None,
+            motion_key: None,
+            motion_size: None,
+            thumb_failed: thumbs.thumb_failed,
+        };
+        store.add_asset(record, None, now)?;
+        let _ = fs::remove_file(&tmp_file);
+        added += 1;
+    }
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+    if added > 0 {
+        let _ = flush_outbox(store, s4, now);
+    }
+    Ok(added)
+}
+
 // =============================================================================
 // End-to-End Importer Pipeline (Spec Section 7, Steps 1–7)
 // =============================================================================
@@ -287,14 +442,128 @@ pub struct ImportRunReport {
     pub space_usage: Option<SpaceUsage>,
 }
 
-/// Run the full import pipeline (spec section 7, steps 1–7):
-/// 1. Scan & classify
-/// 2. Stream SHA-256 & skip duplicates
-/// 3. Extract metadata & date taken
-/// 4. Pair Live Photos
-/// 5. Generate `s.webp` and `m.webp` thumbnails (caching `s.webp` and `m.webp` locally)
-/// 6. Check S4 `HEAD` for name clashes, upload original (multipart >64 MB), motion file, and thumbnails
-/// 7. Log `asset.add` (and `album.add` if `album_id` is set) to SQLite + `outbox`, and flush batches
+/// Prepare one folder's scanned candidates lazily (hashing only this folder's files,
+/// skipping duplicates in `store` or `seen_hashes`, pairing Live Photos within the folder,
+/// and attaching any resumable `upload_id` and `parts_done` from `resume_map`).
+fn prepare_folder_assets(
+    folder_candidates: Vec<ScannedCandidate>,
+    album_id: Option<&str>,
+    store: &mut Store,
+    seen_hashes: &mut HashSet<String>,
+    resume_map: &HashMap<PathBuf, (Option<String>, u32)>,
+    report: &mut ImportRunReport,
+    now: DateTime<Utc>,
+) -> Result<Vec<PreparedImportAsset>> {
+    let mut inspected_files: Vec<InspectedFile> = Vec::new();
+
+    for cand in folder_candidates {
+        let path_str = cand.path.to_string_lossy().to_string();
+        let hash = match sha256_file(&cand.path) {
+            Ok(h) => h,
+            Err(err) => {
+                let msg = format!("unreadable: {err}");
+                let _ = store.update_import_state(
+                    &path_str,
+                    ImportState::Failed,
+                    None,
+                    None,
+                    0,
+                    Some(&msg),
+                );
+                report.failed_files.push(SkippedFile {
+                    path: cand.path,
+                    reason: msg,
+                });
+                continue;
+            }
+        };
+
+        if seen_hashes.contains(&hash) || store.has_active_or_trashed_asset(&hash)? {
+            let _ = store.update_import_state(
+                &path_str,
+                ImportState::Skipped,
+                Some(&hash),
+                None,
+                0,
+                None,
+            );
+            report.duplicates_skipped += 1;
+            continue;
+        }
+        seen_hashes.insert(hash.clone());
+
+        let metadata = match read_metadata(&cand.path) {
+            Ok(m) => m,
+            Err(err) => {
+                let msg = format!("unreadable: {err}");
+                let _ = store.update_import_state(
+                    &path_str,
+                    ImportState::Failed,
+                    Some(&hash),
+                    None,
+                    0,
+                    Some(&msg),
+                );
+                report.failed_files.push(SkippedFile {
+                    path: cand.path,
+                    reason: msg,
+                });
+                continue;
+            }
+        };
+        inspected_files.push(InspectedFile {
+            candidate: cand,
+            sha256: hash,
+            metadata,
+        });
+    }
+
+    let paired_items = pair_live_photos(inspected_files, now);
+    let mut prepared = Vec::with_capacity(paired_items.len());
+    for mut item in paired_items {
+        if let Some((existing_uid, parts_done)) = resume_map.get(&item.primary_path) {
+            item.existing_upload_id = existing_uid.clone();
+            item.parts_already_done = *parts_done;
+        }
+        // If this paired Live Photo absorbed a companion MOV file, mark the companion MOV row as Skipped
+        // in import_queue so it doesn't linger as 'scanned'.
+        if let Some(ref mov_path) = item.motion_path {
+            let mov_str = mov_path.to_string_lossy().to_string();
+            let _ = store.update_import_state(
+                &mov_str,
+                ImportState::Skipped,
+                item.record.motion_id.as_deref(),
+                None,
+                0,
+                None,
+            );
+        }
+        let path_str = item.primary_path.to_string_lossy().to_string();
+        let state = if item.existing_upload_id.is_some() {
+            ImportState::Uploading
+        } else {
+            ImportState::Hashed
+        };
+        store.enqueue_import(&ImportQueueRow {
+            path: path_str,
+            size: item.record.size + item.record.motion_size.unwrap_or(0),
+            mtime: item.primary_mtime_ms,
+            state,
+            asset_id: Some(item.record.id.clone()),
+            upload_id: item.existing_upload_id.clone(),
+            parts_done: item.parts_already_done,
+            album_id: album_id.map(str::to_string),
+            error: None,
+        })?;
+        prepared.push(item);
+    }
+
+    Ok(prepared)
+}
+
+/// Run the full import pipeline (spec section 7, steps 1–7) lazily folder-by-folder,
+/// honouring existing `import_queue` state so interrupted imports resume without
+/// re-hashing or re-uploading completed parts.
 pub fn run_import<I, P>(
     roots: I,
     album_id: Option<&str>,
@@ -307,62 +576,88 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
-    let plan = prepare_import_plan(roots, store, now)?;
+    let scan = scan_paths(roots);
     let mut report = ImportRunReport {
-        duplicates_skipped: plan.duplicates_skipped,
-        unknown_files: plan.unknown_files,
-        failed_files: plan.unreadable_files,
+        unknown_files: scan.unknown_files,
+        failed_files: scan.unreadable_files,
         ..Default::default()
     };
 
-    // Enqueue all prepared assets into `import_queue` so progress & resume work across restarts
-    for item in &plan.assets {
-        let path_str = item.primary_path.to_string_lossy().to_string();
-        store.enqueue_import(&ImportQueueRow {
-            path: path_str,
-            size: item.record.size + item.record.motion_size.unwrap_or(0),
-            mtime: item.primary_mtime_ms,
-            state: ImportState::Hashed,
-            asset_id: Some(item.record.id.clone()),
-            upload_id: None,
-            parts_done: 0,
-            album_id: album_id.map(str::to_string),
-            error: None,
-        })?;
+    let mut by_folder: BTreeMap<PathBuf, Vec<ScannedCandidate>> = BTreeMap::new();
+    let mut resume_map: HashMap<PathBuf, (Option<String>, u32)> = HashMap::new();
+
+    for cand in scan.candidates {
+        let path_str = cand.path.to_string_lossy().to_string();
+        let row = store.reconcile_import_candidate(&path_str, cand.size, cand.mtime_ms, album_id)?;
+        match row.state {
+            ImportState::Logged => {
+                // Already imported and logged in a prior run
+                continue;
+            }
+            ImportState::Skipped => {
+                report.duplicates_skipped += 1;
+                continue;
+            }
+            _ => {
+                if row.upload_id.is_some() || row.parts_done > 0 {
+                    resume_map.insert(cand.path.clone(), (row.upload_id, row.parts_done));
+                }
+                let parent = cand
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                by_folder.entry(parent).or_default().push(cand);
+            }
+        }
     }
 
-    for mut item in plan.assets {
-        let path_str = item.primary_path.to_string_lossy().to_string();
-        match upload_and_log_one_asset(&mut item, album_id, store, s4, cache, now) {
-            Ok(()) => {
-                report.imported_count += 1;
-            }
-            Err(SyncError::S4(S4Error::Offline(_))) => {
-                report.paused_offline = true;
-                break;
-            }
-            Err(SyncError::S4(S4Error::SpaceFull {
-                used_bytes,
-                limit_bytes,
-            })) => {
-                report.stopped_space_full = true;
-                report.space_usage = Some(SpaceUsage::compute(used_bytes, limit_bytes));
-                break;
-            }
-            Err(err) => {
-                let msg = err.to_string();
-                store.update_import_state(
-                    &path_str,
-                    ImportState::Failed,
-                    Some(&item.record.id),
-                    None,
-                    0,
-                    Some(&msg),
-                )?;
-                report.failed_files.push(SkippedFile {
-                    path: item.primary_path,
-                    reason: msg,
-                });
+    let mut seen_hashes: HashSet<String> = HashSet::new();
+
+    'folders: for (_folder, folder_candidates) in by_folder {
+        let assets = prepare_folder_assets(
+            folder_candidates,
+            album_id,
+            store,
+            &mut seen_hashes,
+            &resume_map,
+            &mut report,
+            now,
+        )?;
+
+        for mut item in assets {
+            let path_str = item.primary_path.to_string_lossy().to_string();
+            match upload_and_log_one_asset(&mut item, album_id, store, s4, cache, now) {
+                Ok(()) => {
+                    report.imported_count += 1;
+                }
+                Err(SyncError::S4(S4Error::Offline(_))) => {
+                    report.paused_offline = true;
+                    break 'folders;
+                }
+                Err(SyncError::S4(S4Error::SpaceFull {
+                    used_bytes,
+                    limit_bytes,
+                })) => {
+                    report.stopped_space_full = true;
+                    report.space_usage = Some(SpaceUsage::compute(used_bytes, limit_bytes));
+                    break 'folders;
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    store.update_import_state(
+                        &path_str,
+                        ImportState::Failed,
+                        Some(&item.record.id),
+                        None,
+                        0,
+                        Some(&msg),
+                    )?;
+                    report.failed_files.push(SkippedFile {
+                        path: item.primary_path,
+                        reason: msg,
+                    });
+                }
             }
         }
     }
@@ -372,6 +667,188 @@ where
         let _ = flush_outbox(store, s4, now);
     }
 
+    Ok(report)
+}
+
+/// Concurrent background import runner (up to 4 files in parallel per folder batch)
+/// with fine-grained `Mutex` locking on `Store` and `LocalCache` so UI timeline reads
+/// never stall, plus pause/resume/cancel via `ImportControl`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_import_concurrent<I, P, F>(
+    roots: I,
+    album_id: Option<&str>,
+    store: Arc<Mutex<Store>>,
+    s4: Arc<dyn ObjectStore>,
+    cache: Arc<Mutex<LocalCache>>,
+    control: Arc<ImportControl>,
+    now: DateTime<Utc>,
+    on_progress: F,
+) -> Result<ImportRunReport>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+    F: Fn(&ImportRunReport) + Send + Sync,
+{
+    control.reset_for_new_run();
+    let scan = scan_paths(roots);
+    let mut report = ImportRunReport {
+        unknown_files: scan.unknown_files,
+        failed_files: scan.unreadable_files,
+        ..Default::default()
+    };
+
+    let mut by_folder: BTreeMap<PathBuf, Vec<ScannedCandidate>> = BTreeMap::new();
+    let mut resume_map: HashMap<PathBuf, (Option<String>, u32)> = HashMap::new();
+
+    {
+        let mut st = store.lock().unwrap();
+        for cand in scan.candidates {
+            let path_str = cand.path.to_string_lossy().to_string();
+            let row = st.reconcile_import_candidate(&path_str, cand.size, cand.mtime_ms, album_id)?;
+            match row.state {
+                ImportState::Logged => continue,
+                ImportState::Skipped => {
+                    report.duplicates_skipped += 1;
+                    continue;
+                }
+                _ => {
+                    if row.upload_id.is_some() || row.parts_done > 0 {
+                        resume_map.insert(cand.path.clone(), (row.upload_id, row.parts_done));
+                    }
+                    let parent = cand
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    by_folder.entry(parent).or_default().push(cand);
+                }
+            }
+        }
+    }
+    on_progress(&report);
+
+    let mut seen_hashes: HashSet<String> = HashSet::new();
+
+    'folders: for (_folder, folder_candidates) in by_folder {
+        if control.is_cancelled() {
+            break;
+        }
+        while control.is_paused() && !control.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if control.is_cancelled() {
+            break;
+        }
+
+        let assets = {
+            let mut st = store.lock().unwrap();
+            prepare_folder_assets(
+                folder_candidates,
+                album_id,
+                &mut st,
+                &mut seen_hashes,
+                &resume_map,
+                &mut report,
+                now,
+            )?
+        };
+        on_progress(&report);
+
+        // Process up to 4 files in parallel (Spec Section 7 Step 6)
+        for chunk in assets.chunks(4) {
+            if control.is_cancelled() {
+                break 'folders;
+            }
+            while control.is_paused() && !control.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if control.is_cancelled() {
+                break 'folders;
+            }
+
+            let results: Vec<std::result::Result<(), (PathBuf, String, SyncError)>> =
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(chunk.len());
+                    for item in chunk {
+                        let mut item_clone = item.clone();
+                        let store_ref = Arc::clone(&store);
+                        let s4_ref = Arc::clone(&s4);
+                        let cache_ref = Arc::clone(&cache);
+                        let alb = album_id.map(str::to_string);
+                        handles.push(s.spawn(move || {
+                            upload_and_log_concurrent(
+                                &mut item_clone,
+                                alb.as_deref(),
+                                &store_ref,
+                                s4_ref.as_ref(),
+                                &cache_ref,
+                                now,
+                            )
+                            .map_err(|e| (item_clone.primary_path, item_clone.record.id, e))
+                        }));
+                    }
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+
+            let mut stop_folder_loop = false;
+            for res in results {
+                match res {
+                    Ok(()) => {
+                        report.imported_count += 1;
+                    }
+                    Err((_path, _id, SyncError::S4(S4Error::Offline(_)))) => {
+                        report.paused_offline = true;
+                        stop_folder_loop = true;
+                    }
+                    Err((
+                        _path,
+                        _id,
+                        SyncError::S4(S4Error::SpaceFull {
+                            used_bytes,
+                            limit_bytes,
+                        }),
+                    )) => {
+                        report.stopped_space_full = true;
+                        report.space_usage = Some(SpaceUsage::compute(used_bytes, limit_bytes));
+                        stop_folder_loop = true;
+                    }
+                    Err((path, id, err)) => {
+                        let msg = err.to_string();
+                        let path_str = path.to_string_lossy().to_string();
+                        if let Ok(mut st) = store.lock() {
+                            let _ = st.update_import_state(
+                                &path_str,
+                                ImportState::Failed,
+                                Some(&id),
+                                None,
+                                0,
+                                Some(&msg),
+                            );
+                        }
+                        report.failed_files.push(SkippedFile { path, reason: msg });
+                    }
+                }
+            }
+            on_progress(&report);
+
+            if !report.paused_offline {
+                if let Ok(mut st) = store.lock() {
+                    let _ = flush_outbox(&mut st, s4.as_ref(), now);
+                }
+            }
+            if stop_folder_loop {
+                break 'folders;
+            }
+        }
+    }
+
+    if !report.paused_offline {
+        if let Ok(mut st) = store.lock() {
+            let _ = flush_outbox(&mut st, s4.as_ref(), now);
+        }
+    }
+    control.set_running(false);
+    on_progress(&report);
     Ok(report)
 }
 
@@ -399,12 +876,14 @@ fn upload_and_log_one_asset(
     let _ = cache.put_preview(&item.record.id, &thumbs.preview_webp);
 
     // Step 6: Upload original (with resumable multipart support)
+    let initial_uid = item.existing_upload_id.clone();
+    let initial_parts = item.parts_already_done;
     store.update_import_state(
         &path_str,
         ImportState::Uploading,
         Some(&item.record.id),
-        None,
-        0,
+        initial_uid.as_deref(),
+        initial_parts,
         None,
     )?;
 
@@ -413,8 +892,8 @@ fn upload_and_log_one_asset(
         &item.primary_path,
         &item.record.key,
         "application/octet-stream",
-        None,
-        0,
+        initial_uid.as_deref(),
+        initial_parts,
         3,
         |uid, parts_done| {
             let _ = store.update_import_state(
@@ -477,12 +956,123 @@ fn upload_and_log_one_asset(
     Ok(())
 }
 
+fn upload_and_log_concurrent(
+    item: &mut PreparedImportAsset,
+    album_id: Option<&str>,
+    store: &Arc<Mutex<Store>>,
+    s4: &dyn ObjectStore,
+    cache: &Arc<Mutex<LocalCache>>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let path_str = item.primary_path.to_string_lossy().to_string();
+
+    // Step 4b: Name clash check via S4 HEAD (no lock held!)
+    let primary_clashed = s4.head_object(&item.record.key)?.is_some();
+    let motion_clashed = match item.record.motion_key.as_deref() {
+        Some(mk) => s4.head_object(mk)?.is_some(),
+        None => false,
+    };
+    item.apply_name_clash(primary_clashed, motion_clashed);
+
+    // Step 5: Generate thumbnails outside the DB lock
+    let thumbs = item.build_thumbnails();
+    if let Ok(mut c) = cache.lock() {
+        let _ = c.put_small_thumb(&item.record.id, &thumbs.small_webp);
+        let _ = c.put_preview(&item.record.id, &thumbs.preview_webp);
+    }
+
+    let initial_uid = item.existing_upload_id.clone();
+    let initial_parts = item.parts_already_done;
+    if let Ok(mut st) = store.lock() {
+        st.update_import_state(
+            &path_str,
+            ImportState::Uploading,
+            Some(&item.record.id),
+            initial_uid.as_deref(),
+            initial_parts,
+            None,
+        )?;
+    }
+
+    // Step 6: Upload original without holding the DB lock across network I/O
+    upload_file_with_resume(
+        s4,
+        &item.primary_path,
+        &item.record.key,
+        "application/octet-stream",
+        initial_uid.as_deref(),
+        initial_parts,
+        3,
+        |uid, parts_done| {
+            if let Ok(mut st) = store.lock() {
+                let _ = st.update_import_state(
+                    &path_str,
+                    ImportState::Uploading,
+                    Some(&item.record.id),
+                    uid,
+                    parts_done,
+                    None,
+                );
+            }
+        },
+    )?;
+
+    if let (Some(ref mov_path), Some(ref mov_key)) = (&item.motion_path, &item.record.motion_key) {
+        upload_file_with_resume(
+            s4,
+            mov_path,
+            mov_key,
+            "video/quicktime",
+            None,
+            0,
+            3,
+            |_, _| {},
+        )?;
+    }
+
+    let s_key = thumb_small_key(&item.record.id);
+    let m_key = thumb_preview_key(&item.record.id);
+    retry_with_backoff(3, || {
+        s4.put_object(&s_key, &thumbs.small_webp, "image/webp")
+            .map(|_| ())
+    })?;
+    retry_with_backoff(3, || {
+        s4.put_object(&m_key, &thumbs.preview_webp, "image/webp")
+            .map(|_| ())
+    })?;
+
+    // Step 7: Short lock to record Uploaded + add_asset + Logged
+    if let Ok(mut st) = store.lock() {
+        st.update_import_state(
+            &path_str,
+            ImportState::Uploaded,
+            Some(&item.record.id),
+            None,
+            1,
+            None,
+        )?;
+        st.add_asset(item.record.clone(), album_id, now)?;
+        st.update_import_state(
+            &path_str,
+            ImportState::Logged,
+            Some(&item.record.id),
+            None,
+            1,
+            None,
+        )?;
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // Export Originals to a Local Folder (Spec Section 2, 8, 9)
 // =============================================================================
 
 /// Export the original files (and Live Photo motion `.MOV` files) for `asset_ids`
 /// into `destination_dir`, reading from `cache` when available or downloading from S4.
+/// Disambiguates colliding filenames with `-<hash8>` (spec section 4) so no exported
+/// file overwrites another file in the destination folder.
 pub fn export_originals(
     asset_ids: &[String],
     destination_dir: impl AsRef<Path>,
@@ -493,6 +1083,7 @@ pub fn export_originals(
     let dest = destination_dir.as_ref();
     fs::create_dir_all(dest)?;
     let mut exported = Vec::new();
+    let mut used_names: HashSet<String> = HashSet::new();
 
     for id in asset_ids {
         let Some(detail) = store.get_asset(id)? else {
@@ -502,7 +1093,15 @@ pub fn export_originals(
         if let Some(cached_path) =
             cache.get_or_fetch_original(s4, &rec.id, &rec.filename, &rec.key)?
         {
-            let target = dest.join(&rec.filename);
+            let chosen_name = if used_names.contains(&rec.filename)
+                || dest.join(&rec.filename).exists()
+            {
+                clash_filename(&rec.filename, &rec.id)
+            } else {
+                rec.filename.clone()
+            };
+            used_names.insert(chosen_name.clone());
+            let target = dest.join(&chosen_name);
             fs::copy(&cached_path, &target)?;
             exported.push(target);
         }
@@ -515,7 +1114,15 @@ pub fn export_originals(
             if let Some(cached_mov) =
                 cache.get_or_fetch_original(s4, m_id, &mov_name, m_key)?
             {
-                let target = dest.join(&mov_name);
+                let chosen_mov = if used_names.contains(&mov_name)
+                    || dest.join(&mov_name).exists()
+                {
+                    clash_filename(&mov_name, m_id)
+                } else {
+                    mov_name.clone()
+                };
+                used_names.insert(chosen_mov.clone());
+                let target = dest.join(&chosen_mov);
                 fs::copy(&cached_mov, &target)?;
                 exported.push(target);
             }
@@ -528,6 +1135,7 @@ pub fn export_originals(
 mod tests {
     use super::*;
     use crate::cache::DEFAULT_CACHE_LIMIT_BYTES;
+    use crate::media::sha256_bytes;
     use crate::ops::AssetKind;
     use crate::s4::{InMemoryObjectStore, S4Config};
     use chrono::TimeZone;
@@ -643,5 +1251,91 @@ mod tests {
         let albums = win.list_albums().unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].name, "Offline Edits");
+    }
+
+    #[test]
+    fn export_originals_disambiguates_colliding_filenames() {
+        let dir1 = TempDir::new();
+        let dir2 = TempDir::new();
+        let cache_dir = TempDir::new();
+        let export_dir = TempDir::new();
+
+        fs::write(dir1.0.join("IMG_20240512_143022.JPG"), b"camera-one-bytes").unwrap();
+        fs::write(dir2.0.join("IMG_20240512_143022.JPG"), b"camera-two-bytes").unwrap();
+
+        let s4 = InMemoryObjectStore::new(S4Config::default());
+        let mut store = Store::open_in_memory("mac-1").unwrap();
+        let mut cache = LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+
+        let rep = run_import([&dir1.0, &dir2.0], None, &mut store, &s4, &mut cache, t(10)).unwrap();
+        assert_eq!(rep.imported_count, 2);
+
+        let timeline = store.list_timeline(None, None).unwrap();
+        assert_eq!(timeline.len(), 2);
+        let ids: Vec<String> = timeline.into_iter().map(|a| a.id).collect();
+
+        let exported = export_originals(&ids, &export_dir.0, &store, &s4, &mut cache).unwrap();
+        assert_eq!(exported.len(), 2);
+        assert_ne!(exported[0], exported[1]);
+        assert!(exported[0].exists());
+        assert!(exported[1].exists());
+        let b0 = fs::read(&exported[0]).unwrap();
+        let b1 = fs::read(&exported[1]).unwrap();
+        assert_ne!(b0, b1);
+    }
+
+    #[test]
+    fn import_unknown_s4_keys_adds_unindexed_objects_to_library() {
+        let cache_dir = TempDir::new();
+        let s4 = InMemoryObjectStore::new(S4Config::default());
+        let mut store = Store::open_in_memory("mac-1").unwrap();
+        let mut cache = LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+
+        let key = "originals/2024/05/IMG_20240512_143022.JPG";
+        let bytes = b"unindexed-s4-photo-bytes";
+        s4.put_object(key, bytes, "image/jpeg").unwrap();
+
+        let check = check_library(&store, &s4).unwrap();
+        assert_eq!(check.unknown_s4_keys, vec![key.to_string()]);
+
+        let added = import_unknown_s4_keys(
+            &mut store,
+            &s4,
+            &mut cache,
+            &check.unknown_s4_keys,
+            t(50),
+        )
+        .unwrap();
+        assert_eq!(added, 1);
+
+        let expected_id = sha256_bytes(bytes);
+        assert!(store.has_active_or_trashed_asset(&expected_id).unwrap());
+
+        let check_after = check_library(&store, &s4).unwrap();
+        assert!(check_after.unknown_s4_keys.is_empty());
+    }
+
+    #[test]
+    fn run_import_resumes_interrupted_upload_and_skips_already_logged_files() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        let p1 = src_dir.0.join("IMG_20240512_100000.JPG");
+        let p2 = src_dir.0.join("IMG_20240512_100001.JPG");
+        fs::write(&p1, b"already-logged-photo-bytes").unwrap();
+        fs::write(&p2, b"pending-photo-bytes").unwrap();
+
+        let s4 = InMemoryObjectStore::new(S4Config::default());
+        let mut store = Store::open_in_memory("mac-1").unwrap();
+        let mut cache = LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+
+        // First import only p1
+        let rep1 = run_import([&p1], None, &mut store, &s4, &mut cache, t(10)).unwrap();
+        assert_eq!(rep1.imported_count, 1);
+
+        // Now run import on the whole directory: p1 is already 'logged' in import_queue
+        // with matching size & mtime, so only p2 is hashed and uploaded.
+        let rep2 = run_import([&src_dir.0], None, &mut store, &s4, &mut cache, t(20)).unwrap();
+        assert_eq!(rep2.imported_count, 1);
+        assert_eq!(store.list_timeline(None, None).unwrap().len(), 2);
     }
 }

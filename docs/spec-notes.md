@@ -59,8 +59,12 @@ spec's order (batch `at`, then device id).
   `outbox` is flushed into a `Batch`, `mark_outbox_flushed` aligns the local
   stamps and `created_at` / `trashed_at` with the canonical `batch.at`, so all
   devices converge on identical row metadata.
-- **Not handled yet:** Unicode normalisation of file names. macOS stores them
-  decomposed; the same name typed on Windows is a different key.
+- **Unicode NFC filename normalisation (`keys::normalize_nfc`).** All scanned
+  filenames, S4 object keys (`originals/YYYY/MM/<filename>`), and name-clash
+  disambiguations (`<name>-<hash8>.<ext>`) are normalised to Unicode NFC
+  (canonical composition, including Hangul Jamo UAX #15 and Latin/Greek/Cyrillic/Kana
+  combining marks) so macOS decomposed NFD and Windows composed NFC produce
+  identical keys and index rows.
 
 ## Implementation Progress & Handover Notes (for AI Agents / Developers)
 
@@ -118,9 +122,9 @@ cargo test -p frames-core
      - `prepare_photo_for_webview`: Extracts embedded JPEG from RAW files (`dng`, `cr2`, `cr3`, `nef`, `arw`) and decodes `heic` to JPEG in memory on platforms where the webview lacks native HEIC support.
      - `LoopbackStreamServer`: Binds `127.0.0.1:0` with a random 128-bit hex session token, validates `/stream/<session_id>?token=<tok>&t=<seek_secs>`, streams `ffmpeg` stdout directly to the player without touching disk/S4, and returns HTTP 500 `"Can't play here"` if conversion fails.
 
-### Completed Slices (1–6)
+### Completed Slices (1–7)
 
-6. **Slice 6 — Tauri 2 Command Bridge & Apple Photos-Style Svelte 5 UI (`frames-shell`)**
+6. **Slice 6 — Tauri 2 Command Bridge & Apple Photos-Style Svelte 5 UI (`frames-shell`) (`a0c4200`)**
    - `frames-shell/src-tauri/src/lib.rs`:
      - `AppState`: Manages `Store` (`frames.sqlite3`), `LocalCache`, `PersistedSettings` (`settings.json` + OS Keychain for secret access key), `S4Client` / `InMemoryObjectStore` fallback, `LoopbackStreamServer`, and runs the 30-day Trash auto-purge on startup.
      - 25 Tauri commands bridging Timeline (`get_app_bootstrap`, `get_timeline`, `get_asset_detail`, `get_thumbnail_data_url`), Video Player (`get_video_playback`, `get_video_seek_url`), Date Adjust & Export (`adjust_asset_date`, `export_assets`), Albums (`list_albums`, `get_album_assets`, `create_album`, `rename_album`, `delete_album`, `add_to_album`, `remove_from_album`, `move_to_album`), Search (`get_search_suggestions`, `search_assets`), Trash (`get_trash`, `trash_assets`, `restore_assets`, `delete_trash_now`, `empty_all_trash`), Imports (`import_from_paths`, `seed_sample_library`), and Sync/Settings (`sync_now`, `toggle_offline_mode`, `save_settings`, `clear_local_cache`, `run_check_library`, `run_rebuild_database`).
@@ -131,3 +135,29 @@ cargo test -p frames-core
      - Full-screen Viewer (`Space` quick look / double-click / `Enter`, arrow navigation with neighbour prefetch, scroll/button zoom, `● LIVE` hover/hold motion trigger, video scrubber with seek & `"Can't play here"` + Export fallback, Info panel with Adjust Date & Export).
      - Search box with grouped autocomplete suggestions (Albums, Dates, Cameras, Types, Filenames) and combinable filter chips.
      - Trash view with days remaining and confirmation modal showing item count and GB.
+
+7. **Slice 7 — Adversarial Review Fixes (`frames_review.md`, all 26 items P0–P2)**
+   - **P0 Fixes (`s4`, `store`, `sync`, `frames-shell`)**:
+     - #1: `PersistedSettings::default()` now defaults `use_real_s4: true` and uses `"app.frames.desktop"` for application data/cache directories.
+     - #2: Startup 30-day Trash auto-purge runs against `active_s4()` only when S4 credentials are configured (or demo mode is explicitly active), plus a 24-hour background timer thread (`frames-daily-trash-purge`) runs `purge_expired_trash` while the app stays open.
+     - #3: Implemented `ObjectStore::list_parts` (`GET /bucket/key?uploadId=...` + `parse_list_parts_xml`). `upload_file_with_resume` queries `list_parts` when resuming an `existing_upload_id`, reuses server-returned ETags for already-uploaded parts, and falls back to `create_multipart_upload` if the upload ID expired (`404 NoSuchUpload`).
+     - #4: Added `Store::reconcile_import_candidate` and updated `run_import` / `run_import_concurrent` to honour `import_queue` state across restarts (skipping `logged` and `skipped` rows when `size` and `mtime` match, and passing `upload_id` + `parts_done` into `upload_file_with_resume`).
+     - #5: Refactored `run_import` and `run_import_concurrent` to process folders lazily (one folder at a time instead of hashing 550 GB upfront), upload up to 4 files in parallel (`std::thread::scope`), and support `ImportControl` (`pause_import`, `resume_import`, `cancel_import`, `get_import_status`) with live `"frames://import-progress"` events.
+     - #6: Fixed `S4Client` `curl` invocation (`build_curl_args`) to pass `-I` (`--head`) for `HEAD` requests without `--data-binary`, added `--connect-timeout 15 --max-time 300 --speed-time 30 --speed-limit 1024`, and added `get_object_to_file` / `put_object_from_file` so large originals stream directly to/from disk without buffering in RAM.
+     - #7: Hardened OS Keychain / Credential Manager integration: macOS pipes `add-generic-password` / `find-generic-password` via stdin to `/usr/bin/security -i` (never exposing secrets in `argv`/`ps`), and Windows uses in-process `Advapi32.dll` `CredWriteW` / `CredReadW` / `CredFree` FFI.
+   - **P1 Fixes (`media`, `player`, `sync`, `frames-shell`, `+page.svelte`)**:
+     - #8: Added `resolve_tool_binary` (searching sidecar/bundle paths, `/opt/homebrew/bin`, `/usr/local/bin`, and `PATH`) and `spawn_hidden_command` (setting `CREATE_NO_WINDOW = 0x0800_0000` on Windows).
+     - #9 & #10: Loopback streaming server (`player.rs`) now sets `.stderr(Stdio::null())` on `ffmpeg` to prevent stderr pipe deadlocks, tracks per-session `active_generation` to kill superseded `ffmpeg` processes immediately on seek, bounds retained sessions (`MAX_ACTIVE_SESSIONS = 16`) and concurrent streams (`MAX_CONCURRENT_STREAMS = 4`), refreshes presigned S4 URLs via `UrlRefresher`, and removes `Access-Control-Allow-Origin: *`.
+     - #11: Registered custom `frames://localhost/{thumb,preview,original}/<id>` URI scheme protocol in Tauri to serve binary WebP thumbnails, previews, and `prepare_photo_bytes_for_webview` originals (including RAW embedded JPEGs and Windows HEIC decoding) directly with HTTP caching headers, and upgraded the Viewer to load `frames://localhost/original/<id>` after initial preview display.
+     - #12: Implemented row virtualization (`virtualizedGroups`) in the Timeline grid so only visible rows (+ overscan) are mounted in the DOM.
+     - #13: Updated `export_originals` to disambiguate colliding filenames using `clash_filename` (`<name>-<hash8>.<ext>`).
+     - #14: Converted heavy Tauri commands (`import_from_paths`, `sync_now`, `export_assets`, `run_check_library`, `add_unknown_s4_files`, `run_rebuild_database`) to `async fn` using `spawn_blocking` and short-lived mutex locks.
+     - #15: Added `tauri://drag-drop` window listener for OS drag-and-drop import and `pick_folder_dialog` native folder picker buttons.
+     - #16 & #17: Added `AppState::init_with_dir` for isolated test runs and `db_damaged` recovery banner in the UI when SQLite fails to open.
+     - #18 & #19: Configured an explicit CSP in `tauri.conf.json` and added timezone offset display (`UTC±HH:MM` or `"Camera local time (no timezone offset recorded)"`) in the Viewer Info panel.
+   - **P2 Fixes (`media`, `keys`, `sync`, `tauri.conf.json`, `Cargo.toml`)**:
+     - #20 & #21: Added lossy WebP flags (`-quality 80 -compression_level 4`) and RAW embedded JPEG `stdin` piping (`run_ffmpeg_webp_stdin`) in `media.rs`.
+     - #22 & #26: Configured `productName: "Frames"`, `identifier: "app.frames.desktop"`, `edition = "2021"`, and `windowEffects` (`underWindowBackground`, `mica`).
+     - #23: Implemented Unicode NFC filename normalisation (`keys::normalize_nfc` / `clean_filename`).
+     - #24: Implemented `import_unknown_s4_keys` and `"Add Unknown Files to Library"` button in Check Library report.
+     - #25: Fixed all `cargo clippy --workspace --all-targets` warnings (0 warnings across workspace).

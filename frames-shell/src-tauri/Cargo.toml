@@ -1,9 +1,9 @@
 [package]
 name = "frames-shell"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-edition = "2024"
+description = "Frames desktop photo and video library"
+authors = ["Frames"]
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

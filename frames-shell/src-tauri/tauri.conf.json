@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "frames-shell",
+  "productName": "Frames",
   "version": "0.1.0",
-  "identifier": "com.vishal.frames-shell",
+  "identifier": "app.frames.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -16,11 +16,17 @@
         "width": 1280,
         "height": 820,
         "minWidth": 900,
-        "minHeight": 600
+        "minHeight": 600,
+        "windowEffects": {
+          "effects": [
+            "underWindowBackground",
+            "mica"
+          ]
+        }
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' data: blob: frames: http://frames.localhost https://frames.localhost; media-src 'self' blob: frames: http://frames.localhost http://127.0.0.1:* https://*.mega.io https://*; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost frames: http://frames.localhost http://127.0.0.1:*"
     }
   },
   "bundle": {

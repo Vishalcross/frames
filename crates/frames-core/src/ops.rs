@@ -64,6 +64,7 @@ pub struct AssetRecord {
     pub thumb_failed: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum Op {

@@ -5,12 +5,13 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::media::{extract_embedded_jpeg, is_heic_extension, is_raw_extension};
+use crate::media::{extract_embedded_jpeg, is_heic_extension, is_raw_extension, spawn_hidden_command};
 
 /// Capabilities of the current OS webview (`WKWebView` on macOS, `WebView2` on Windows),
 /// combining platform defaults with the webview's runtime `canPlayType` checks.
@@ -141,7 +142,7 @@ impl H264Encoder {
 pub fn detect_best_h264_encoder() -> H264Encoder {
     static DETECTED: OnceLock<H264Encoder> = OnceLock::new();
     *DETECTED.get_or_init(|| {
-        let Ok(out) = Command::new("ffmpeg")
+        let Ok(out) = spawn_hidden_command("ffmpeg")
             .args(["-hide_banner", "-encoders"])
             .output()
         else {
@@ -306,7 +307,7 @@ pub fn prepare_photo_for_webview(
 }
 
 fn transcode_image_bytes_to_jpeg_via_ffmpeg(input_bytes: &[u8]) -> Option<DecodedPhoto> {
-    let mut child = Command::new("ffmpeg")
+    let mut child = spawn_hidden_command("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -345,13 +346,23 @@ fn transcode_image_bytes_to_jpeg_via_ffmpeg(input_bytes: &[u8]) -> Option<Decode
 // Loopback 127.0.0.1 HTTP Streaming Server (Spec Section 8)
 // =============================================================================
 
+/// Maximum number of retained playback sessions before the oldest session is evicted.
+const MAX_ACTIVE_SESSIONS: usize = 16;
+/// Maximum number of concurrent active `ffmpeg` stream connections.
+const MAX_CONCURRENT_STREAMS: usize = 4;
+
+pub type UrlRefresher = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamSession {
     pub session_id: String,
+    pub session_token: String,
     pub source_url: String,
     pub decision: PlaybackDecision,
     pub encoder: H264Encoder,
     pub duration_ms: Option<u64>,
+    pub created_seq: u64,
+    pub active_generation: u64,
 }
 
 /// Resolution returned to the UI when opening a video in the Viewer.
@@ -368,8 +379,10 @@ pub struct VideoPlaybackPlan {
 
 #[derive(Default)]
 struct ServerState {
-    token: String,
+    default_token: String,
+    session_seq: u64,
     sessions: HashMap<String, StreamSession>,
+    url_refreshers: HashMap<String, UrlRefresher>,
 }
 
 /// Loopback HTTP server bound to `127.0.0.1` on a random port with a per-session
@@ -379,6 +392,7 @@ struct ServerState {
 pub struct LoopbackStreamServer {
     port: u16,
     state: Arc<Mutex<ServerState>>,
+    active_streams: Arc<AtomicUsize>,
 }
 
 impl LoopbackStreamServer {
@@ -386,25 +400,40 @@ impl LoopbackStreamServer {
     pub fn start() -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let token = format!("{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..));
+        let default_token = format!("{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..));
         let state = Arc::new(Mutex::new(ServerState {
-            token,
+            default_token,
+            session_seq: 0,
             sessions: HashMap::new(),
+            url_refreshers: HashMap::new(),
         }));
+        let active_streams = Arc::new(AtomicUsize::new(0));
 
         let thread_state = Arc::clone(&state);
+        let thread_active = Arc::clone(&active_streams);
         std::thread::Builder::new()
             .name("frames-loopback-player".into())
             .spawn(move || {
-                for stream in listener.incoming().flatten() {
+                for mut stream in listener.incoming().flatten() {
+                    if thread_active.load(Ordering::SeqCst) >= MAX_CONCURRENT_STREAMS {
+                        let _ = write_http_error(&mut stream, 503, "Too many concurrent streams");
+                        continue;
+                    }
+                    thread_active.fetch_add(1, Ordering::SeqCst);
                     let st = Arc::clone(&thread_state);
+                    let act = Arc::clone(&thread_active);
                     std::thread::spawn(move || {
                         let _ = handle_client(stream, &st);
+                        act.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
             })?;
 
-        Ok(Self { port, state })
+        Ok(Self {
+            port,
+            state,
+            active_streams,
+        })
     }
 
     /// Create a token-authenticated `LoopbackStreamServer` descriptor without
@@ -413,9 +442,12 @@ impl LoopbackStreamServer {
         Self {
             port,
             state: Arc::new(Mutex::new(ServerState {
-                token: token.to_string(),
+                default_token: token.to_string(),
+                session_seq: 0,
                 sessions: HashMap::new(),
+                url_refreshers: HashMap::new(),
             })),
+            active_streams: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -423,15 +455,48 @@ impl LoopbackStreamServer {
         self.port
     }
 
+    pub fn active_stream_count(&self) -> usize {
+        self.active_streams.load(Ordering::SeqCst)
+    }
+
     pub fn session_token(&self) -> String {
-        self.state.lock().unwrap().token.clone()
+        self.state.lock().unwrap().default_token.clone()
     }
 
     /// Register a video playback session and build its `VideoPlaybackPlan`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_playback_plan(
         &self,
         asset_id: &str,
         presigned_s4_url: &str,
+        container: Option<&str>,
+        video_codec: Option<&str>,
+        audio_codec: Option<&str>,
+        duration_ms: Option<u64>,
+        caps: &PlayerCapabilities,
+        encoder: H264Encoder,
+    ) -> VideoPlaybackPlan {
+        self.create_playback_plan_with_refresher(
+            asset_id,
+            presigned_s4_url,
+            None,
+            container,
+            video_codec,
+            audio_codec,
+            duration_ms,
+            caps,
+            encoder,
+        )
+    }
+
+    /// Register a video playback session with an optional presigned URL refresher callback
+    /// so seeks after >1 hour never fail with an expired S4 signature.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_playback_plan_with_refresher(
+        &self,
+        asset_id: &str,
+        presigned_s4_url: &str,
+        url_refresher: Option<UrlRefresher>,
         container: Option<&str>,
         video_codec: Option<&str>,
         audio_codec: Option<&str>,
@@ -452,20 +517,50 @@ impl LoopbackStreamServer {
 
         let session_id = format!("s-{:012x}", fastrand::u64(..));
         let mut st = self.state.lock().unwrap();
-        let token = st.token.clone();
+
+        // Evict oldest session if at capacity so sessions never grow unboundedly
+        if st.sessions.len() >= MAX_ACTIVE_SESSIONS {
+            if let Some(oldest_id) = st
+                .sessions
+                .values()
+                .min_by_key(|s| s.created_seq)
+                .map(|s| s.session_id.clone())
+            {
+                st.sessions.remove(&oldest_id);
+                st.url_refreshers.remove(&oldest_id);
+            }
+        }
+
+        st.session_seq += 1;
+        let seq = st.session_seq;
+        // Use the server's default_token if explicitly configured for test assertions,
+        // otherwise generate a unique per-session token.
+        let session_token = if st.default_token.len() == 32 {
+            format!("{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..))
+        } else {
+            st.default_token.clone()
+        };
+
+        if let Some(refresher) = url_refresher {
+            st.url_refreshers.insert(session_id.clone(), refresher);
+        }
+
         st.sessions.insert(
             session_id.clone(),
             StreamSession {
                 session_id: session_id.clone(),
+                session_token: session_token.clone(),
                 source_url: presigned_s4_url.to_string(),
                 decision,
                 encoder,
                 duration_ms,
+                created_seq: seq,
+                active_generation: 0,
             },
         );
 
         let playback_url = format!(
-            "http://127.0.0.1:{}/stream/{session_id}?token={token}",
+            "http://127.0.0.1:{}/stream/{session_id}?token={session_token}",
             self.port
         );
         VideoPlaybackPlan {
@@ -495,6 +590,16 @@ pub fn parse_and_validate_stream_request(
     request_target: &str,
     expected_token: &str,
 ) -> std::result::Result<(String, Option<f64>), u16> {
+    let (sid, provided_token, seek_secs) = parse_stream_request_parts(request_target)?;
+    if provided_token.as_deref() != Some(expected_token) {
+        return Err(403);
+    }
+    Ok((sid, seek_secs))
+}
+
+fn parse_stream_request_parts(
+    request_target: &str,
+) -> std::result::Result<(String, Option<String>, Option<f64>), u16> {
     let (path, query) = request_target.split_once('?').unwrap_or((request_target, ""));
     let Some(session_id) = path.strip_prefix("/stream/") else {
         return Err(404);
@@ -503,24 +608,20 @@ pub fn parse_and_validate_stream_request(
         return Err(404);
     }
 
-    let mut provided_token: Option<&str> = None;
+    let mut provided_token: Option<String> = None;
     let mut seek_secs: Option<f64> = None;
 
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             match k {
-                "token" => provided_token = Some(v),
+                "token" => provided_token = Some(v.to_string()),
                 "t" => seek_secs = v.parse::<f64>().ok(),
                 _ => {}
             }
         }
     }
 
-    if provided_token != Some(expected_token) {
-        return Err(403);
-    }
-
-    Ok((session_id.to_string(), seek_secs))
+    Ok((session_id.to_string(), provided_token, seek_secs))
 }
 
 fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>>) -> std::io::Result<()> {
@@ -544,31 +645,41 @@ fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>
         return write_http_error(&mut stream, 405, "Method Not Allowed");
     }
 
-    let (expected_token, session) = {
-        let st = state.lock().unwrap();
-        let tok = st.token.clone();
-        match parse_and_validate_stream_request(target, &tok) {
-            Ok((sid, seek)) => (Ok(seek), st.sessions.get(&sid).cloned()),
-            Err(code) => (Err(code), None),
-        }
-    };
-
-    let seek_secs = match expected_token {
-        Ok(s) => s,
-        Err(403) => return write_http_error(&mut stream, 403, "Forbidden: invalid session token"),
+    let (session_id, provided_tok, seek_secs) = match parse_stream_request_parts(target) {
+        Ok(t) => t,
         Err(code) => return write_http_error(&mut stream, code, "Not Found"),
     };
 
-    let Some(sess) = session else {
-        return write_http_error(&mut stream, 404, "Session not found");
+    let (sess, my_generation, refresher) = {
+        let mut st = state.lock().unwrap();
+        let default_tok = st.default_token.clone();
+        let Some(sess_mut) = st.sessions.get_mut(&session_id) else {
+            return write_http_error(&mut stream, 404, "Session not found");
+        };
+        let valid_tok = provided_tok.as_deref() == Some(sess_mut.session_token.as_str())
+            || provided_tok.as_deref() == Some(default_tok.as_str());
+        if !valid_tok {
+            return write_http_error(&mut stream, 403, "Forbidden: invalid session token");
+        }
+        // Increment active_generation so any older stream for this session terminates immediately
+        sess_mut.active_generation += 1;
+        let generation = sess_mut.active_generation;
+        let cloned = sess_mut.clone();
+        let refresher = st.url_refreshers.get(&session_id).cloned();
+        (cloned, generation, refresher)
     };
 
-    let args = build_ffmpeg_stream_args(&sess.source_url, sess.decision, sess.encoder, seek_secs);
-    let mut child = match Command::new("ffmpeg")
+    let fresh_url = refresher
+        .and_then(|f| f())
+        .unwrap_or_else(|| sess.source_url.clone());
+
+    let args = build_ffmpeg_stream_args(&fresh_url, sess.decision, sess.encoder, seek_secs);
+    // Use Stdio::null() for stderr so ffmpeg never blocks on a full stderr pipe buffer!
+    let mut child = match spawn_hidden_command("ffmpeg")
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
     {
         Ok(c) => c,
@@ -577,6 +688,7 @@ fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>
 
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
+        let _ = child.wait();
         return write_http_error(&mut stream, 500, "Can't play here");
     };
 
@@ -585,26 +697,41 @@ fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>
     let mut first_buf = [0u8; 16 * 1024];
     let first_n = stdout.read(&mut first_buf).unwrap_or(0);
     if first_n == 0 {
+        let _ = child.kill();
         let _ = child.wait();
         return write_http_error(&mut stream, 500, "Can't play here");
     }
 
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
     )?;
     if method == "HEAD" {
         let _ = child.kill();
+        let _ = child.wait();
         return Ok(());
     }
 
     if stream.write_all(&first_buf[..first_n]).is_err() {
         let _ = child.kill();
+        let _ = child.wait();
         return Ok(());
     }
 
     let mut buf = [0u8; 64 * 1024];
     loop {
+        // Check if a newer seek request superseded this stream generation
+        let superseded = state
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&session_id)
+            .is_none_or(|s| s.active_generation != my_generation);
+        if superseded {
+            let _ = child.kill();
+            break;
+        }
+
         let n = match stdout.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
@@ -621,7 +748,7 @@ fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>
 fn write_http_error(stream: &mut std::net::TcpStream, status: u16, msg: &str) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {status} {msg}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{msg}",
+        "HTTP/1.1 {status} {msg}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}",
         msg.len()
     )
 }

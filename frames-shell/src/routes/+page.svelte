@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
   type AssetKind = "photo" | "video" | "live";
@@ -39,12 +40,6 @@
     record: AssetRecord;
     trashed_at: string | null;
     albums: AlbumRef[];
-  }
-
-  interface MonthGroup {
-    year: number;
-    month: number;
-    count: number;
   }
 
   interface AlbumSummary {
@@ -132,6 +127,7 @@
   let deviceId = $state("");
   let offline = $state(false);
   let outboxPending = $state(0);
+  let dbDamaged = $state<string | null>(null);
   let statusNotice = $state<string | null>(null);
 
   // Data collections
@@ -148,6 +144,8 @@
     skipped_duplicates: 0,
     failed_files: 0
   });
+  let importRunning = $state(false);
+  let importPaused = $state(false);
   let lastImportReport = $state<any>(null);
   let settings = $state<SettingsView>({
     endpoint: "https://s3.eu-central-1.s4.mega.io",
@@ -158,7 +156,7 @@
     space_limit_gb: 750,
     cache_location: "",
     cache_limit_gb: 10,
-    use_real_s4: false,
+    use_real_s4: true,
     device_id: ""
   });
   let secretInput = $state("");
@@ -182,6 +180,7 @@
   let thumbUrls = $state<Record<string, string>>({});
   let scrollTop = $state(0);
   let viewportHeight = $state(800);
+  let timelineWidth = $state(960);
 
   // Selection & Drag-and-Drop State
   let selectedIds = $state<Set<string>>(new Set());
@@ -213,6 +212,8 @@
   let viewerIndex = $state<number | null>(null);
   let viewerDetail = $state<AssetDetail | null>(null);
   let viewerZoom = $state(1);
+  let viewerPhotoSrc = $state<string | null>(null);
+  let viewerOriginalReady = $state(false);
   let showInfoPanel = $state(true);
   let adjustDateValue = $state("");
   let livePlaying = $state(false);
@@ -224,9 +225,12 @@
   const MONTH_NAMES = [
     "",
     "January", "February", "March", "April", "May", "June",
-    "July", "August", "June", "October", "November", "December"
+    "July", "August", "September", "October", "November", "December"
   ];
-  MONTH_NAMES[9] = "September";
+
+  function protocolUrl(kind: "thumb" | "preview" | "original", id: string): string {
+    return `frames://localhost/${kind}/${encodeURIComponent(id)}`;
+  }
 
   function notify(msg: string) {
     statusNotice = msg;
@@ -248,6 +252,17 @@
     const min = Math.floor(totalSec / 60);
     const sec = totalSec % 60;
     return `${min}:${sec.toString().padStart(2, "0")}`;
+  }
+
+  function formatTzOffset(tzMinutes: number | null): string {
+    if (tzMinutes === null || tzMinutes === undefined) {
+      return "Camera local time (no timezone offset recorded)";
+    }
+    const sign = tzMinutes >= 0 ? "+" : "-";
+    const abs = Math.abs(tzMinutes);
+    const hh = Math.floor(abs / 60).toString().padStart(2, "0");
+    const mm = (abs % 60).toString().padStart(2, "0");
+    return `UTC${sign}${hh}:${mm}`;
   }
 
   function localYearMonth(asset: AssetSummary): { year: number; month: number; key: string; label: string } {
@@ -286,6 +301,49 @@
     return groups;
   });
 
+  // Virtualized Month Layout (Spec Section 9: keeps DOM node count bounded for 100k+ items)
+  let virtualizedGroups = $derived.by(() => {
+    const cols = Math.max(3, Math.min(15, zoomColumns));
+    const cellPx = Math.max(64, Math.floor((Math.max(400, timelineWidth) - 36) / cols));
+    const rowHeight = cellPx + 4;
+    const headerHeight = 44;
+    const overscanPx = 700;
+    const viewStart = Math.max(0, scrollTop - overscanPx);
+    const viewEnd = scrollTop + viewportHeight + overscanPx;
+
+    let cursorY = 0;
+    return groupedByMonth.map((group) => {
+      const totalRows = Math.ceil(group.items.length / cols);
+      const groupBodyStart = cursorY + headerHeight;
+      const groupEnd = groupBodyStart + totalRows * rowHeight;
+
+      let startRow = 0;
+      let endRow = totalRows;
+      if (groupEnd < viewStart) {
+        startRow = totalRows;
+        endRow = totalRows;
+      } else if (groupBodyStart > viewEnd) {
+        startRow = 0;
+        endRow = 0;
+      } else {
+        startRow = Math.max(0, Math.floor((viewStart - groupBodyStart) / rowHeight));
+        endRow = Math.min(totalRows, Math.ceil((viewEnd - groupBodyStart) / rowHeight));
+      }
+
+      const topPad = startRow * rowHeight;
+      const bottomPad = Math.max(0, (totalRows - endRow) * rowHeight);
+      const visibleItems = group.items.slice(startRow * cols, endRow * cols);
+      cursorY = groupEnd;
+
+      return {
+        ...group,
+        visibleItems,
+        topPad,
+        bottomPad
+      };
+    });
+  });
+
   // Distinct years for the right-hand Date Scrubber
   let distinctYears = $derived.by(() => {
     const years: number[] = [];
@@ -309,6 +367,7 @@
       spaceUsage = data.space_usage;
       outboxPending = data.outbox_pending;
       offline = data.offline;
+      dbDamaged = data.db_damaged ?? null;
       await refreshDisplayedAssets();
     } catch (e) {
       notify(`Failed to load library: ${e}`);
@@ -347,16 +406,13 @@
     } else {
       displayedAssets = timelineAssets;
     }
-    prefetchVisibleThumbnails();
   }
 
-  async function prefetchVisibleThumbnails() {
-    for (const a of displayedAssets.slice(0, 120)) {
-      if (!thumbUrls[a.id]) {
-        invoke<string | null>("get_thumbnail_data_url", { id: a.id, preview: false }).then((url) => {
-          if (url) thumbUrls[a.id] = url;
-        });
-      }
+  function handleThumbError(id: string) {
+    if (!thumbUrls[id]) {
+      invoke<string | null>("get_thumbnail_data_url", { id, preview: false }).then((url) => {
+        if (url) thumbUrls[id] = url;
+      });
     }
   }
 
@@ -398,7 +454,7 @@
     selectedIds = next;
   }
 
-  // Viewer navigation & neighbour prefetch (Spec Section 9)
+  // Viewer navigation, Original fetch, & neighbour prefetch (Spec Section 8 & 9)
   async function openViewer(idx: number) {
     if (idx < 0 || idx >= displayedAssets.length) return;
     viewerIndex = idx;
@@ -406,15 +462,36 @@
     livePlaying = false;
     videoError = false;
     videoPlan = null;
+    viewerOriginalReady = false;
     const target = displayedAssets[idx];
+    viewerPhotoSrc = thumbUrls[target.id] || protocolUrl("preview", target.id);
+
     viewerDetail = await invoke("get_asset_detail", { id: target.id });
     if (viewerDetail) {
       adjustDateValue = viewerDetail.record.taken_at.slice(0, 19) + "Z";
     }
-    // Load high-res preview
-    invoke<string | null>("get_thumbnail_data_url", { id: target.id, preview: true }).then((url) => {
-      if (url) thumbUrls[target.id] = url;
-    });
+
+    // Upgrade from preview (m.webp) to full-resolution decoded original (or RAW embedded JPEG / HEIC decode)
+    if (target.kind !== "video") {
+      const origUrl = protocolUrl("original", target.id);
+      const img = new Image();
+      img.onload = () => {
+        if (viewerIndex === idx) {
+          viewerPhotoSrc = origUrl;
+          viewerOriginalReady = true;
+        }
+      };
+      img.onerror = () => {
+        invoke<string | null>("get_thumbnail_data_url", { id: target.id, preview: true }).then((url) => {
+          if (url && viewerIndex === idx) {
+            thumbUrls[target.id] = url;
+            viewerPhotoSrc = url;
+          }
+        });
+      };
+      img.src = origUrl;
+    }
+
     // Prepare video or Live Photo motion playback plan
     if (target.kind === "video" || target.kind === "live") {
       try {
@@ -431,13 +508,13 @@
         videoError = true;
       }
     }
-    // Prefetch neighbours (idx - 1 and idx + 1)
+
+    // Prefetch neighbour previews (idx - 1 and idx + 1)
     for (const nIdx of [idx - 1, idx + 1]) {
       if (nIdx >= 0 && nIdx < displayedAssets.length) {
         const nid = displayedAssets[nIdx].id;
-        invoke<string | null>("get_thumbnail_data_url", { id: nid, preview: true }).then((url) => {
-          if (url) thumbUrls[nid] = url;
-        });
+        const pre = new Image();
+        pre.src = protocolUrl("preview", nid);
       }
     }
   }
@@ -479,6 +556,20 @@
     } catch (e) {
       notify(`Export failed: ${e}`);
     }
+  }
+
+  async function pickFolderFor(target: "import" | "export" | "cache") {
+    const prompt =
+      target === "import"
+        ? "Select Photo / Video Folder to Import (Read-Only)"
+        : target === "export"
+          ? "Select Destination Folder for Exported Originals"
+          : "Select Local Cache Directory";
+    const chosen: string | null = await invoke("pick_folder_dialog", { prompt });
+    if (!chosen) return;
+    if (target === "import") importFolderPath = chosen;
+    else if (target === "export") exportFolderPath = chosen;
+    else settings.cache_location = chosen;
   }
 
   // Search Suggestions & Chips
@@ -610,21 +701,53 @@
     await loadBootstrap();
   }
 
-  // Import actions
-  async function handleRunImport(e: Event) {
-    e.preventDefault();
-    if (!importFolderPath.trim()) return;
+  // Import actions (including OS Drag-and-Drop and Pause/Resume/Cancel)
+  async function startImportPaths(paths: string[], albumId: string | null) {
+    if (paths.length === 0) return;
+    importRunning = true;
+    importPaused = false;
     try {
       const rep: any = await invoke("import_from_paths", {
-        paths: [importFolderPath.trim()],
-        albumId: importTargetAlbum || null
+        paths,
+        albumId
       });
       lastImportReport = rep;
       await loadBootstrap();
       notify(`Imported ${rep.imported_count} item(s) (${rep.duplicates_skipped} duplicates skipped)`);
     } catch (err) {
       notify(`Import error: ${err}`);
+    } finally {
+      importRunning = false;
+      importPaused = false;
     }
+  }
+
+  async function handleRunImport(e: Event) {
+    e.preventDefault();
+    if (!importFolderPath.trim()) return;
+    await startImportPaths([importFolderPath.trim()], importTargetAlbum || null);
+  }
+
+  async function handlePauseImport() {
+    const status: any = await invoke("pause_import");
+    importPaused = status.paused;
+    importProgress = status.progress;
+    notify("Import paused");
+  }
+
+  async function handleResumeImport() {
+    const status: any = await invoke("resume_import");
+    importPaused = status.paused;
+    importProgress = status.progress;
+    notify("Import resumed");
+  }
+
+  async function handleCancelImport() {
+    const status: any = await invoke("cancel_import");
+    importRunning = status.running;
+    importPaused = status.paused;
+    importProgress = status.progress;
+    notify("Import cancelled");
   }
 
   // Settings & Sync actions
@@ -672,6 +795,16 @@
   async function handleCheckLibrary() {
     checkReport = await invoke("run_check_library");
     notify("Completed S4 bucket vs local index check");
+  }
+
+  async function handleAddUnknownS4Files() {
+    if (!checkReport || !checkReport.unknown_s4_keys?.length) return;
+    const added: number = await invoke("add_unknown_s4_files", {
+      keys: checkReport.unknown_s4_keys
+    });
+    checkReport = await invoke("run_check_library");
+    await loadBootstrap();
+    notify(`Added ${added} unknown S4 file(s) to the library`);
   }
 
   async function handleRebuildDatabase() {
@@ -732,6 +865,38 @@
 
   onMount(() => {
     loadBootstrap();
+
+    let unlistenDrop: (() => void) | null = null;
+    let unlistenProgress: (() => void) | null = null;
+
+    // Listen for OS file/folder drops onto the window (Spec Section 9: Drag-and-Drop Import)
+    listen<{ paths?: string[] }>("tauri://drag-drop", (event) => {
+      const dropped = event.payload?.paths ?? [];
+      if (dropped.length > 0) {
+        const targetAlbum = activeNav === "album" ? activeAlbumId : null;
+        notify(`Importing ${dropped.length} dropped folder(s)/file(s)...`);
+        startImportPaths(dropped, targetAlbum);
+      }
+    }).then((fn) => {
+      unlistenDrop = fn;
+    }).catch(() => {});
+
+    // Listen for live background import progress updates
+    listen<any>("frames://import-progress", (event) => {
+      lastImportReport = event.payload;
+      invoke<any>("get_import_status").then((st) => {
+        importProgress = st.progress;
+        importRunning = st.running;
+        importPaused = st.paused;
+      }).catch(() => {});
+    }).then((fn) => {
+      unlistenProgress = fn;
+    }).catch(() => {});
+
+    return () => {
+      if (unlistenDrop) unlistenDrop();
+      if (unlistenProgress) unlistenProgress();
+    };
   });
 </script>
 
@@ -875,6 +1040,14 @@
   <!-- Main Content Area -->
   <div class="main-area">
     <!-- Status & Error Banners (Spec Section 11) -->
+    {#if dbDamaged}
+      <div class="banner warn-banner">
+        <strong>Database Damaged:</strong> {dbDamaged}
+        <button class="btn-primary small" style="margin-left: 10px;" onclick={handleRebuildDatabase}>
+          ♻️ Rebuild Local Database from S4
+        </button>
+      </div>
+    {/if}
     {#if offline}
       <div class="banner offline-banner">
         <strong>Offline</strong> — Browsing, search, and album changes still work. Changes wait in the outbox ({outboxPending} pending); uploads pause until back online.
@@ -1094,11 +1267,12 @@
           class="timeline-scroll"
           onscroll={(e) => (scrollTop = (e.currentTarget as HTMLElement).scrollTop)}
           bind:clientHeight={viewportHeight}
+          bind:clientWidth={timelineWidth}
         >
           {#if displayedAssets.length === 0}
             <div class="empty-state">
               <h3>No photos or videos here yet</h3>
-              <p>Import a folder from your external disk or load the sample library to explore Timeline, Live Photos, RAWs, Albums, and Video playback.</p>
+              <p>Drop a folder onto this window, import from your external disk, or load the sample library to explore Timeline, Live Photos, RAWs, Albums, and Video playback.</p>
               <div class="empty-actions">
                 <button class="btn-primary" onclick={handleSeedSampleLibrary}>
                   ✨ Load Sample Set (HEIC, RAW, Live Photo, MOV, MKV)
@@ -1109,7 +1283,7 @@
               </div>
             </div>
           {:else}
-            {#each groupedByMonth as group (group.key)}
+            {#each virtualizedGroups as group (group.key)}
               <section class="month-section" id="year-anchor-{group.year}">
                 <div class="sticky-month-header">
                   <span class="month-title">{group.label}</span>
@@ -1122,11 +1296,15 @@
                   </button>
                 </div>
 
+                {#if group.topPad > 0}
+                  <div style="height: {group.topPad}px;"></div>
+                {/if}
+
                 <div
                   class="thumb-grid"
                   style="grid-template-columns: repeat({zoomColumns}, minmax(0, 1fr));"
                 >
-                  {#each group.items as { asset, globalIdx } (asset.id)}
+                  {#each group.visibleItems as { asset, globalIdx } (asset.id)}
                     <div
                       class="thumb-cell"
                       class:selected={selectedIds.has(asset.id)}
@@ -1144,13 +1322,12 @@
                         if (e.key === "Enter") openViewer(globalIdx);
                       }}
                     >
-                      {#if thumbUrls[asset.id]}
-                        <img src={thumbUrls[asset.id]} alt={asset.filename} loading="lazy" />
-                      {:else}
-                        <div class="thumb-placeholder">
-                          <span>{asset.filename}</span>
-                        </div>
-                      {/if}
+                      <img
+                        src={thumbUrls[asset.id] || protocolUrl("thumb", asset.id)}
+                        alt={asset.filename}
+                        loading="lazy"
+                        onerror={() => handleThumbError(asset.id)}
+                      />
 
                       <!-- Badges: video length, LIVE, date guessed, thumb failed (Spec Section 9) -->
                       <div class="thumb-badges-top">
@@ -1174,6 +1351,10 @@
                     </div>
                   {/each}
                 </div>
+
+                {#if group.bottomPad > 0}
+                  <div style="height: {group.bottomPad}px;"></div>
+                {/if}
               </section>
             {/each}
           {/if}
@@ -1198,18 +1379,23 @@
       <div class="panel-view">
         <h2>Import Photos & Videos</h2>
         <p class="muted">
-          The source folder is opened strictly read-only. Exact SHA-256 duplicates are skipped automatically, and Live Photos (Photo + MOV) are paired into a single asset.
+          The source folder is opened strictly read-only. You can also drag and drop folders or files directly onto the Frames window. Exact SHA-256 duplicates are skipped automatically, and Live Photos (Photo + MOV) are paired into a single asset.
         </p>
 
         <form class="card-form" onsubmit={handleRunImport}>
           <div class="form-row">
             <label for="import-path">Source Folder Path (External Disk or Local Folder)</label>
-            <input
-              id="import-path"
-              type="text"
-              placeholder="/Volumes/PhotosDisk/DCIM or C:\Photos"
-              bind:value={importFolderPath}
-            />
+            <div class="input-with-btn">
+              <input
+                id="import-path"
+                type="text"
+                placeholder="/Volumes/PhotosDisk/DCIM or C:\Photos"
+                bind:value={importFolderPath}
+              />
+              <button type="button" class="btn-secondary" onclick={() => pickFolderFor("import")}>
+                📁 Browse…
+              </button>
+            </div>
           </div>
           <div class="form-row">
             <label for="import-album">Add Imported Items to Album (Optional)</label>
@@ -1221,7 +1407,23 @@
             </select>
           </div>
           <div class="form-actions">
-            <button type="submit" class="btn-primary">Start / Resume Import</button>
+            <button type="submit" class="btn-primary" disabled={importRunning}>
+              {importRunning ? "Importing…" : "Start / Resume Import"}
+            </button>
+            {#if importRunning}
+              {#if importPaused}
+                <button type="button" class="btn-secondary" onclick={handleResumeImport}>
+                  ▶ Resume
+                </button>
+              {:else}
+                <button type="button" class="btn-secondary" onclick={handlePauseImport}>
+                  ⏸ Pause
+                </button>
+              {/if}
+              <button type="button" class="btn-danger" onclick={handleCancelImport}>
+                ✕ Cancel
+              </button>
+            {/if}
             <button type="button" class="btn-secondary" onclick={handleSeedSampleLibrary}>
               ✨ Seed Sample Set
             </button>
@@ -1378,7 +1580,12 @@
           <div class="form-row two-col">
             <div>
               <label for="cache-loc">Cache Directory</label>
-              <input id="cache-loc" type="text" bind:value={settings.cache_location} />
+              <div class="input-with-btn">
+                <input id="cache-loc" type="text" bind:value={settings.cache_location} />
+                <button type="button" class="btn-secondary small" onclick={() => pickFolderFor("cache")}>
+                  Browse…
+                </button>
+              </div>
             </div>
             <div>
               <label for="cache-cap">Preview & Original LRU Cap (GB)</label>
@@ -1387,7 +1594,12 @@
           </div>
           <div class="form-row">
             <label for="export-loc">Default Export Originals Folder</label>
-            <input id="export-loc" type="text" bind:value={exportFolderPath} />
+            <div class="input-with-btn">
+              <input id="export-loc" type="text" bind:value={exportFolderPath} />
+              <button type="button" class="btn-secondary small" onclick={() => pickFolderFor("export")}>
+                Browse…
+              </button>
+            </div>
           </div>
 
           <div class="form-actions">
@@ -1414,13 +1626,20 @@
           </div>
 
           {#if checkReport}
-            <div class="report-card">
+            <div class="report-card" style="margin-top: 14px;">
               <h4>Check Library Report</h4>
               <p>
                 Missing originals in S4: <strong>{checkReport.missing_originals.length}</strong> ·
                 Unknown files in S4: <strong>{checkReport.unknown_s4_keys.length}</strong> ·
                 Crashed multipart uploads tidied: <strong>{checkReport.tidied_multipart_uploads}</strong>
               </p>
+              {#if checkReport.unknown_s4_keys.length > 0}
+                <div style="margin-top: 10px;">
+                  <button type="button" class="btn-primary small" onclick={handleAddUnknownS4Files}>
+                    ➕ Add {checkReport.unknown_s4_keys.length} Unknown File(s) to Library
+                  </button>
+                </div>
+              {/if}
             </div>
           {/if}
         </div>
@@ -1471,6 +1690,9 @@
           >
             ● LIVE {livePlaying ? "(Playing Motion)" : "(Hover / Hold)"}
           </button>
+        {/if}
+        {#if current.kind !== "video" && viewerOriginalReady}
+          <span class="playback-mode-pill">Original Ready</span>
         {/if}
         {#if videoPlan && (current.kind === "video" || livePlaying)}
           <span class="playback-mode-pill">
@@ -1545,9 +1767,8 @@
                 src={videoCurrentUrl}
                 controls
                 autoplay
-                poster={thumbUrls[current.id]}
+                poster={thumbUrls[current.id] || protocolUrl("preview", current.id)}
                 onerror={() => {
-                  // Only trigger fallback if real remote/loopback stream failed outside demo sample
                   if (!current.id.startsWith("a10")) videoError = true;
                 }}
               ></video>
@@ -1567,9 +1788,9 @@
               {/if}
             </div>
           {/if}
-        {:else if thumbUrls[current.id]}
+        {:else if viewerPhotoSrc}
           <img
-            src={thumbUrls[current.id]}
+            src={viewerPhotoSrc}
             alt={current.filename}
             class="viewer-img"
             style="transform: scale({viewerZoom});"
@@ -1599,6 +1820,9 @@
                 <span class="badge guessed-badge">Guessed from file mtime</span>
               {/if}
             </dd>
+
+            <dt>Timezone Offset</dt>
+            <dd>{formatTzOffset(viewerDetail.record.tz_offset)}</dd>
 
             <dt>Camera</dt>
             <dd>
@@ -2072,18 +2296,6 @@
     display: block;
   }
 
-  .thumb-placeholder {
-    width: 100%;
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 11px;
-    color: var(--text-muted);
-    padding: 6px;
-    text-align: center;
-  }
-
   .thumb-badges-top {
     position: absolute;
     top: 5px;
@@ -2177,6 +2389,16 @@
     gap: 12px;
   }
 
+  .input-with-btn {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .input-with-btn input {
+    flex: 1;
+  }
+
   .form-row label {
     font-size: 12.5px;
     color: var(--text-muted);
@@ -2198,6 +2420,7 @@
     display: flex;
     gap: 10px;
     margin-top: 10px;
+    flex-wrap: wrap;
   }
 
   .stats-grid {

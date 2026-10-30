@@ -217,6 +217,7 @@ impl ImportState {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "hashed" => Self::Hashed,
@@ -1454,6 +1455,67 @@ impl Store {
         Ok(())
     }
 
+    pub fn get_import_queue_row(&self, path: &str) -> Result<Option<ImportQueueRow>> {
+        self.conn
+            .query_row(
+                "SELECT path, size, mtime, state, asset_id, upload_id, parts_done, album_id, error
+                 FROM import_queue WHERE path = ?1",
+                [path],
+                |r| {
+                    Ok(ImportQueueRow {
+                        path: r.get(0)?,
+                        size: r.get::<_, i64>(1)? as u64,
+                        mtime: r.get(2)?,
+                        state: ImportState::from_str(&r.get::<_, String>(3)?),
+                        asset_id: r.get(4)?,
+                        upload_id: r.get(5)?,
+                        parts_done: r.get::<_, i64>(6)? as u32,
+                        album_id: r.get(7)?,
+                        error: r.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Reconcile a scanned file against `import_queue` so interrupted imports
+    /// resume from `import_queue` (`logged`, `skipped`, `uploading` with `upload_id`
+    /// and `parts_done`, or `hashed`) if `size` and `mtime` match (spec section 5 & 7).
+    pub fn reconcile_import_candidate(
+        &mut self,
+        path: &str,
+        size: u64,
+        mtime: i64,
+        album_id: Option<&str>,
+    ) -> Result<ImportQueueRow> {
+        if let Some(mut existing) = self.get_import_queue_row(path)? {
+            if existing.size == size
+                && existing.mtime == mtime
+                && existing.state != ImportState::Failed
+            {
+                if album_id.is_some() && existing.album_id.is_none() {
+                    existing.album_id = album_id.map(str::to_string);
+                    self.enqueue_import(&existing)?;
+                }
+                return Ok(existing);
+            }
+        }
+        let fresh = ImportQueueRow {
+            path: path.to_string(),
+            size,
+            mtime,
+            state: ImportState::Pending,
+            asset_id: None,
+            upload_id: None,
+            parts_done: 0,
+            album_id: album_id.map(str::to_string),
+            error: None,
+        };
+        self.enqueue_import(&fresh)?;
+        Ok(fresh)
+    }
+
     pub fn list_import_queue(&self) -> Result<Vec<ImportQueueRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, size, mtime, state, asset_id, upload_id, parts_done, album_id, error
@@ -1869,7 +1931,7 @@ fn apply_album_membership(
             )
             .optional()?;
 
-        if existing_at.as_deref().map_or(true, |old| stamp >= old) {
+        if existing_at.as_deref().is_none_or(|old| stamp >= old) {
             tx.execute(
                 "INSERT INTO album_items (album_id, asset_id, in_album, at)
                  VALUES (?1, ?2, ?3, ?4)
@@ -1901,10 +1963,19 @@ fn refresh_fts_for_album_members(tx: &Transaction<'_>, album_id: &str) -> Result
     Ok(())
 }
 
+type FtsAssetRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn refresh_fts_for_asset(tx: &Transaction<'_>, asset_id: &str) -> Result<()> {
     delete_fts_for_asset(tx, asset_id)?;
 
-    let row: Option<(String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = tx
+    let row: Option<FtsAssetRow> = tx
         .query_row(
             "SELECT kind, filename, camera_make, camera_model, trashed_at, purged_at
              FROM assets WHERE id = ?1",

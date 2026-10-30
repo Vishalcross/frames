@@ -97,6 +97,13 @@ pub struct IncompleteMultipartUpload {
     pub upload_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadedPart {
+    pub part_number: u32,
+    pub etag: String,
+    pub size: u64,
+}
+
 /// Space usage report with the 90% warning flag (spec section 2 decision 9 & section 11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceUsage {
@@ -348,6 +355,26 @@ pub trait ObjectStore: Send + Sync {
     fn delete_object(&self, key: &str) -> Result<()>;
     fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
 
+    /// Stream an object directly to `dest` on disk without buffering the entire
+    /// object in RAM. Returns `Ok(true)` if found and written, `Ok(false)` on 404.
+    fn get_object_to_file(&self, key: &str, dest: &Path) -> Result<bool> {
+        let Some(bytes) = self.get_object(key)? else {
+            return Ok(false);
+        };
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(dest, &bytes)?;
+        Ok(true)
+    }
+
+    /// Stream a local file directly into a single `PUT` object request without
+    /// buffering the entire file in RAM.
+    fn put_object_from_file(&self, key: &str, path: &Path, content_type: &str) -> Result<String> {
+        let bytes = std::fs::read(path)?;
+        self.put_object(key, &bytes, content_type)
+    }
+
     fn create_multipart_upload(&self, key: &str, content_type: &str) -> Result<String>;
     fn upload_part(
         &self,
@@ -356,6 +383,7 @@ pub trait ObjectStore: Send + Sync {
         part_number: u32,
         body: &[u8],
     ) -> Result<String>;
+    fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<UploadedPart>>;
     fn complete_multipart_upload(
         &self,
         key: &str,
@@ -370,10 +398,12 @@ pub trait ObjectStore: Send + Sync {
 }
 
 /// Resumable file upload helper with exponential backoff retry (spec section 7, step 6):
-/// - Files <= `multipart_threshold_bytes` upload via a single `PUT`.
-/// - Larger files upload via S3 multipart (`CreateMultipartUpload` -> `UploadPart`
-///   with per-part retry -> `CompleteMultipartUpload`), invoking `on_part_done` so
-///   `import_queue` in SQLite can resume from `parts_done` after a crash or network drop.
+/// - Files <= `multipart_threshold_bytes` upload via a single streamed `PUT`.
+/// - Larger files upload via S3 multipart (`CreateMultipartUpload` -> `ListParts` when
+///   resuming -> `UploadPart` with per-part retry -> `CompleteMultipartUpload`),
+///   invoking `on_progress` so `import_queue` in SQLite can resume from `upload_id`
+///   and `parts_done` after a crash or network drop.
+#[allow(clippy::too_many_arguments)]
 pub fn upload_file_with_resume<F>(
     store: &dyn ObjectStore,
     path: &Path,
@@ -392,23 +422,43 @@ where
     let cfg = store.config();
 
     if file_size <= cfg.multipart_threshold_bytes {
-        let mut buf = Vec::with_capacity(file_size as usize);
-        file.read_to_end(&mut buf)?;
         retry_with_backoff(max_retries, || {
-            store.put_object(key, &buf, content_type).map(|_| ())
+            store.put_object_from_file(key, path, content_type).map(|_| ())
         })?;
         on_progress(None, 1);
         return Ok(());
     }
 
     let part_size = cfg.multipart_part_size_bytes.max(5 * 1024 * 1024);
-    let upload_id = match existing_upload_id {
-        Some(id) if !id.is_empty() => id.to_string(),
-        _ => retry_with_backoff(max_retries, || {
-            store.create_multipart_upload(key, content_type)
-        })?,
+
+    // If resuming an existing multipart upload, query S4 ListParts to get the
+    // authentic server-side ETags of already-uploaded parts. If the upload_id
+    // expired or was aborted on the server (404 NoSuchUpload), start a new one.
+    let (upload_id, existing_parts_map) = match existing_upload_id {
+        Some(id) if !id.is_empty() => match retry_with_backoff(max_retries, || store.list_parts(key, id)) {
+            Ok(parts) => {
+                let map: BTreeMap<u32, UploadedPart> =
+                    parts.into_iter().map(|p| (p.part_number, p)).collect();
+                (id.to_string(), map)
+            }
+            Err(S4Error::Http { status: 404, .. }) => {
+                let new_id = retry_with_backoff(max_retries, || {
+                    store.create_multipart_upload(key, content_type)
+                })?;
+                (new_id, BTreeMap::new())
+            }
+            Err(e) => return Err(e),
+        },
+        _ => {
+            let new_id = retry_with_backoff(max_retries, || {
+                store.create_multipart_upload(key, content_type)
+            })?;
+            (new_id, BTreeMap::new())
+        }
     };
-    on_progress(Some(&upload_id), parts_already_done);
+
+    let initial_done = (existing_parts_map.len() as u32).max(parts_already_done);
+    on_progress(Some(&upload_id), initial_done);
 
     let total_parts = file_size.div_ceil(part_size) as u32;
     let mut completed_parts: Vec<(u32, String)> = Vec::with_capacity(total_parts as usize);
@@ -416,16 +466,17 @@ where
     for part_num in 1..=total_parts {
         let offset = u64::from(part_num - 1) * part_size;
         let len = (file_size - offset).min(part_size) as usize;
+
+        if let Some(existing_part) = existing_parts_map.get(&part_num) {
+            if existing_part.size == len as u64 && !existing_part.etag.is_empty() {
+                completed_parts.push((part_num, existing_part.etag.clone()));
+                continue;
+            }
+        }
+
         file.seek(SeekFrom::Start(offset))?;
         let mut chunk = vec![0u8; len];
         file.read_exact(&mut chunk)?;
-
-        if part_num <= parts_already_done {
-            // Re-compute deterministic ETag for already-uploaded part
-            let etag = format!("\"{}\"", sha256_hex(&chunk));
-            completed_parts.push((part_num, etag));
-            continue;
-        }
 
         let etag = retry_with_backoff(max_retries, || {
             store.upload_part(key, &upload_id, part_num, &chunk)
@@ -465,11 +516,14 @@ where
 // In-Memory S4 Bucket Stand-In (for Multi-Device Sync & Multipart Tests)
 // =============================================================================
 
+type InMemoryPartMap = BTreeMap<u32, (String, Vec<u8>)>;
+
 #[derive(Default)]
 struct InMemoryBucketState {
     objects: BTreeMap<String, Vec<u8>>,
-    multiparts: BTreeMap<String, (String, BTreeMap<u32, Vec<u8>>)>, // upload_id -> (key, parts)
+    multiparts: BTreeMap<String, (String, InMemoryPartMap)>, // upload_id -> (key, part_num -> (etag, bytes))
     next_upload_seq: u64,
+    upload_part_calls: u64,
     offline: bool,
     transient_failures_remaining: u32,
 }
@@ -496,6 +550,11 @@ impl InMemoryObjectStore {
     /// Inject `count` transient 503 busy errors to test exponential backoff retries.
     pub fn inject_transient_failures(&self, count: u32) {
         self.state.lock().unwrap().transient_failures_remaining = count;
+    }
+
+    /// Number of successful `upload_part` calls recorded on this mock store.
+    pub fn upload_part_call_count(&self) -> u64 {
+        self.state.lock().unwrap().upload_part_calls
     }
 
     fn check_faults(&self, st: &mut InMemoryBucketState) -> Result<()> {
@@ -620,6 +679,7 @@ impl ObjectStore for InMemoryObjectStore {
     ) -> Result<String> {
         let mut st = self.state.lock().unwrap();
         self.check_faults(&mut st)?;
+        st.upload_part_calls += 1;
         let Some((mp_key, parts)) = st.multiparts.get_mut(upload_id) else {
             return Err(S4Error::Http {
                 status: 404,
@@ -632,9 +692,37 @@ impl ObjectStore for InMemoryObjectStore {
                 message: "multipart key mismatch".into(),
             });
         }
-        let etag = format!("\"{}\"", sha256_hex(body));
-        parts.insert(part_number, body.to_vec());
+        // Use a server-specific ETag format distinct from raw sha256_hex(body) so
+        // callers are forced to use the server-returned ETag (or ListParts on resume).
+        let short_hash = &sha256_hex(body)[..16];
+        let etag = format!("\"s4etag-{upload_id}-p{part_number}-{short_hash}\"");
+        parts.insert(part_number, (etag.clone(), body.to_vec()));
         Ok(etag)
+    }
+
+    fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<UploadedPart>> {
+        let mut st = self.state.lock().unwrap();
+        self.check_faults(&mut st)?;
+        let Some((mp_key, parts)) = st.multiparts.get(upload_id) else {
+            return Err(S4Error::Http {
+                status: 404,
+                message: format!("NoSuchUpload: {upload_id}"),
+            });
+        };
+        if mp_key != key {
+            return Err(S4Error::Http {
+                status: 400,
+                message: "multipart key mismatch".into(),
+            });
+        }
+        Ok(parts
+            .iter()
+            .map(|(&part_number, (etag, bytes))| UploadedPart {
+                part_number,
+                etag: etag.clone(),
+                size: bytes.len() as u64,
+            })
+            .collect())
     }
 
     fn complete_multipart_upload(
@@ -652,13 +740,21 @@ impl ObjectStore for InMemoryObjectStore {
             });
         };
         let mut combined = Vec::new();
-        for (part_num, _etag) in parts {
-            let Some(bytes) = stored_parts.remove(part_num) else {
+        for (part_num, etag) in parts {
+            let Some((expected_etag, bytes)) = stored_parts.remove(part_num) else {
                 return Err(S4Error::Http {
                     status: 400,
                     message: format!("InvalidPart {part_num}"),
                 });
             };
+            if etag.trim_matches('"') != expected_etag.trim_matches('"') {
+                return Err(S4Error::Http {
+                    status: 400,
+                    message: format!(
+                        "InvalidPart: ETag mismatch for part {part_num} (got {etag}, expected {expected_etag})"
+                    ),
+                });
+            }
             combined.extend_from_slice(&bytes);
         }
         st.objects.insert(key.to_string(), combined);
@@ -702,6 +798,44 @@ pub struct S4Client {
     config: S4Config,
 }
 
+/// Build the `curl` CLI arguments for an HTTP request so tests can inspect
+/// exact flags (`-I` for HEAD, timeouts, and body streaming).
+pub fn build_curl_args(
+    method: &str,
+    url: &str,
+    signed_headers: &BTreeMap<String, String>,
+    has_body: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "-sS".to_string(),
+        "-i".to_string(),
+        "--connect-timeout".to_string(),
+        "15".to_string(),
+        "--max-time".to_string(),
+        "300".to_string(),
+        "--speed-time".to_string(),
+        "30".to_string(),
+        "--speed-limit".to_string(),
+        "1024".to_string(),
+    ];
+    if method == "HEAD" {
+        args.push("-I".to_string());
+    } else {
+        args.push("-X".to_string());
+        args.push(method.to_string());
+    }
+    for (k, v) in signed_headers {
+        args.push("-H".to_string());
+        args.push(format!("{k}: {v}"));
+    }
+    if has_body && method != "HEAD" {
+        args.push("--data-binary".to_string());
+        args.push("@-".to_string());
+    }
+    args.push(url.to_string());
+    args
+}
+
 impl S4Client {
     pub fn new(config: S4Config) -> Self {
         Self { config }
@@ -726,15 +860,18 @@ impl S4Client {
             Utc::now(),
         );
 
+        let send_body = !body.is_empty() || matches!(method, "PUT" | "POST");
+        let args = build_curl_args(method, &url, &signed_headers, send_body);
+
         let mut cmd = Command::new("curl");
-        cmd.args(["-sS", "-i", "-X", method]);
-        for (k, v) in &signed_headers {
-            cmd.arg("-H").arg(format!("{k}: {v}"));
-        }
-        cmd.arg("--data-binary").arg("@-").arg(&url);
+        cmd.args(&args);
 
         let mut child = cmd
-            .stdin(std::process::Stdio::piped())
+            .stdin(if send_body && method != "HEAD" {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -840,6 +977,121 @@ impl ObjectStore for S4Client {
         Ok(Some(body))
     }
 
+    fn get_object_to_file(&self, key: &str, dest: &Path) -> Result<bool> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_dest = dest.with_extension(format!("part-{}", fastrand::u64(..)));
+        let empty_hash = sha256_hex(&[]);
+        let (url, signed_headers) = sign_s4_request(
+            &self.config,
+            "GET",
+            key,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &empty_hash,
+            Utc::now(),
+        );
+
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "-sS",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "3600",
+            "--speed-time",
+            "30",
+            "--speed-limit",
+            "1024",
+            "-D",
+            "-",
+            "-o",
+        ]);
+        cmd.arg(&tmp_dest);
+        for (k, v) in &signed_headers {
+            cmd.arg("-H").arg(format!("{k}: {v}"));
+        }
+        cmd.arg(&url);
+
+        let output = cmd
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| S4Error::Offline(e.to_string()))?;
+
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&tmp_dest);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(S4Error::Offline(stderr));
+        }
+
+        let (status, _, _) = parse_raw_http_response(&output.stdout)?;
+        if status == 404 {
+            let _ = std::fs::remove_file(&tmp_dest);
+            return Ok(false);
+        }
+        if !(200..300).contains(&status) {
+            let err_body = std::fs::read(&tmp_dest).unwrap_or_default();
+            let _ = std::fs::remove_file(&tmp_dest);
+            check_s3_status(status, &err_body)?;
+        }
+
+        std::fs::rename(&tmp_dest, dest)?;
+        Ok(true)
+    }
+
+    fn put_object_from_file(&self, key: &str, path: &Path, content_type: &str) -> Result<String> {
+        let payload_hash = crate::media::sha256_file(path)?;
+        let file_size = std::fs::metadata(path)?.len();
+        let mut extra = BTreeMap::new();
+        extra.insert("Content-Type".to_string(), content_type.to_string());
+        extra.insert("Content-Length".to_string(), file_size.to_string());
+
+        let (url, signed_headers) = sign_s4_request(
+            &self.config,
+            "PUT",
+            key,
+            &BTreeMap::new(),
+            &extra,
+            &payload_hash,
+            Utc::now(),
+        );
+
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "-sS",
+            "-i",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "3600",
+            "--speed-time",
+            "30",
+            "--speed-limit",
+            "1024",
+            "-T",
+        ]);
+        cmd.arg(path);
+        for (k, v) in &signed_headers {
+            cmd.arg("-H").arg(format!("{k}: {v}"));
+        }
+        cmd.arg(&url);
+
+        let output = cmd
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| S4Error::Offline(e.to_string()))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(S4Error::Offline(stderr));
+        }
+
+        let (status, headers, resp_body) = parse_raw_http_response(&output.stdout)?;
+        check_s3_status(status, &resp_body)?;
+        Ok(headers.get("etag").cloned().unwrap_or_default())
+    }
+
     fn get_object_range(
         &self,
         key: &str,
@@ -934,6 +1186,31 @@ impl ObjectStore for S4Client {
             self.execute("PUT", key, &query, &BTreeMap::new(), body)?;
         check_s3_status(status, &resp)?;
         Ok(headers.get("etag").cloned().unwrap_or_default())
+    }
+
+    fn list_parts(&self, key: &str, upload_id: &str) -> Result<Vec<UploadedPart>> {
+        let mut all = Vec::new();
+        let mut part_marker: Option<String> = None;
+
+        loop {
+            let mut query = BTreeMap::new();
+            query.insert("uploadId".to_string(), upload_id.to_string());
+            if let Some(ref marker) = part_marker {
+                query.insert("part-number-marker".to_string(), marker.clone());
+            }
+
+            let (status, _, body) =
+                self.execute("GET", key, &query, &BTreeMap::new(), &[])?;
+            check_s3_status(status, &body)?;
+            let xml = String::from_utf8_lossy(&body);
+            let (mut page, next_marker) = parse_list_parts_xml(&xml);
+            all.append(&mut page);
+            match next_marker {
+                Some(m) if !m.is_empty() && m != "0" => part_marker = Some(m),
+                _ => break,
+            }
+        }
+        Ok(all)
     }
 
     fn complete_multipart_upload(
@@ -1031,6 +1308,42 @@ pub fn parse_list_multipart_uploads_xml(xml: &str) -> Vec<IncompleteMultipartUpl
     items
 }
 
+pub fn parse_list_parts_xml(xml: &str) -> (Vec<UploadedPart>, Option<String>) {
+    let mut items = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Part>") {
+        let after = &rest[start + 6..];
+        let Some(end) = after.find("</Part>") else {
+            break;
+        };
+        let block = &after[..end];
+        if let (Some(part_num_str), Some(etag)) = (
+            extract_xml_tag(block, "PartNumber"),
+            extract_xml_tag(block, "ETag"),
+        ) {
+            if let Ok(part_number) = part_num_str.parse::<u32>() {
+                let size = extract_xml_tag(block, "Size")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                items.push(UploadedPart {
+                    part_number,
+                    etag,
+                    size,
+                });
+            }
+        }
+        rest = &after[end + 7..];
+    }
+    let is_truncated = extract_xml_tag(xml, "IsTruncated")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let next_marker = if is_truncated {
+        extract_xml_tag(xml, "NextPartNumberMarker")
+    } else {
+        None
+    };
+    (items, next_marker)
+}
+
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -1053,25 +1366,154 @@ fn xml_unescape(s: &str) -> String {
 
 const KEYCHAIN_SERVICE: &str = "com.frames.s4";
 
-/// Store the S4 secret access key in the OS password store (macOS Keychain via
-/// `/usr/bin/security`, Windows Credential Manager via `cmdkey`).
+#[cfg(target_os = "macos")]
+fn quote_security_arg(arg: &str) -> String {
+    let mut escaped = String::with_capacity(arg.len() + 2);
+    escaped.push('"');
+    for ch in arg.chars() {
+        if ch == '"' || ch == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped.push('"');
+    escaped
+}
+
+#[cfg(target_os = "windows")]
+mod win_cred {
+    use super::{Result, S4Error};
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    const CRED_TYPE_GENERIC: u32 = 1;
+    const CRED_PERSIST_LOCAL_MACHINE: u32 = 2;
+
+    #[repr(C)]
+    struct FILETIME {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    #[repr(C)]
+    struct CREDENTIALW {
+        flags: u32,
+        cred_type: u32,
+        target_name: *mut u16,
+        comment: *mut u16,
+        last_written: FILETIME,
+        credential_blob_size: u32,
+        credential_blob: *mut u8,
+        persist: u32,
+        attribute_count: u32,
+        attributes: *mut core::ffi::c_void,
+        target_alias: *mut u16,
+        user_name: *mut u16,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredWriteW(credential: *const CREDENTIALW, flags: u32) -> i32;
+        fn CredReadW(
+            target_name: *const u16,
+            cred_type: u32,
+            flags: u32,
+            credential: *mut *mut CREDENTIALW,
+        ) -> i32;
+        fn CredFree(buffer: *mut core::ffi::c_void);
+    }
+
+    fn to_wide_null(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn write_generic_credential(target: &str, account: &str, secret: &str) -> Result<()> {
+        let mut target_w = to_wide_null(target);
+        let mut user_w = to_wide_null(account);
+        let mut blob = secret.as_bytes().to_vec();
+
+        let cred = CREDENTIALW {
+            flags: 0,
+            cred_type: CRED_TYPE_GENERIC,
+            target_name: target_w.as_mut_ptr(),
+            comment: ptr::null_mut(),
+            last_written: FILETIME {
+                dw_low_date_time: 0,
+                dw_high_date_time: 0,
+            },
+            credential_blob_size: blob.len() as u32,
+            credential_blob: blob.as_mut_ptr(),
+            persist: CRED_PERSIST_LOCAL_MACHINE,
+            attribute_count: 0,
+            attributes: ptr::null_mut(),
+            target_alias: ptr::null_mut(),
+            user_name: user_w.as_mut_ptr(),
+        };
+
+        let ok = unsafe { CredWriteW(&cred, 0) };
+        if ok == 0 {
+            return Err(S4Error::CredentialStore(
+                "Windows Credential Manager CredWriteW failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn read_generic_credential(target: &str) -> Result<Option<String>> {
+        let target_w = to_wide_null(target);
+        let mut cred_ptr: *mut CREDENTIALW = ptr::null_mut();
+        let ok = unsafe { CredReadW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred_ptr) };
+        if ok == 0 || cred_ptr.is_null() {
+            return Ok(None);
+        }
+        let secret = unsafe {
+            let cred = &*cred_ptr;
+            let slice = if cred.credential_blob.is_null() || cred.credential_blob_size == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(cred.credential_blob, cred.credential_blob_size as usize)
+            };
+            let s = String::from_utf8_lossy(slice).trim().to_string();
+            CredFree(cred_ptr.cast());
+            s
+        };
+        Ok(if secret.is_empty() { None } else { Some(secret) })
+    }
+}
+
+/// Store the S4 secret access key in the OS password store without exposing the
+/// secret in command-line process arguments (`ps`):
+/// - macOS: pipes `add-generic-password` via stdin to `/usr/bin/security -i`.
+/// - Windows: calls Win32 `CredWriteW` (`Advapi32.dll`) directly in-process.
 pub fn save_secret_in_os_keychain(account: &str, secret: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let status = Command::new("/usr/bin/security")
-            .args([
-                "add-generic-password",
-                "-U",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-                "-w",
-                secret,
-            ])
-            .status()
+        let mut child = Command::new("/usr/bin/security")
+            .arg("-i")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| S4Error::CredentialStore(e.to_string()))?;
-        if !status.success() {
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let cmd_line = format!(
+                "add-generic-password -U -s {} -a {} -w {}\n",
+                quote_security_arg(KEYCHAIN_SERVICE),
+                quote_security_arg(account),
+                quote_security_arg(secret),
+            );
+            stdin
+                .write_all(cmd_line.as_bytes())
+                .map_err(|e| S4Error::CredentialStore(e.to_string()))?;
+        }
+
+        let out = child
+            .wait_with_output()
+            .map_err(|e| S4Error::CredentialStore(e.to_string()))?;
+        if !out.status.success() {
             return Err(S4Error::CredentialStore(
                 "macOS Keychain add-generic-password failed".into(),
             ));
@@ -1080,18 +1522,8 @@ pub fn save_secret_in_os_keychain(account: &str, secret: &str) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let status = Command::new("cmdkey")
-            .args([
-                &format!("/generic:{KEYCHAIN_SERVICE}:{account}"),
-                &format!("/user:{account}"),
-                &format!("/pass:{secret}"),
-            ])
-            .status()
-            .map_err(|e| S4Error::CredentialStore(e.to_string()))?;
-        if !status.success() {
-            return Err(S4Error::CredentialStore("Windows cmdkey failed".into()));
-        }
-        Ok(())
+        let target = format!("{KEYCHAIN_SERVICE}:{account}");
+        win_cred::write_generic_credential(&target, account, secret)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1100,20 +1532,32 @@ pub fn save_secret_in_os_keychain(account: &str, secret: &str) -> Result<()> {
     }
 }
 
-/// Read the S4 secret access key from the OS password store.
+/// Read the S4 secret access key from the OS password store:
+/// - macOS: queries Keychain via `/usr/bin/security -i` stdin.
+/// - Windows: calls Win32 `CredReadW` (`Advapi32.dll`) directly in-process.
 pub fn load_secret_from_os_keychain(account: &str) -> Result<Option<String>> {
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("/usr/bin/security")
-            .args([
-                "find-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-                "-w",
-            ])
-            .output()
+        let mut child = Command::new("/usr/bin/security")
+            .arg("-i")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| S4Error::CredentialStore(e.to_string()))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let cmd_line = format!(
+                "find-generic-password -s {} -a {} -w\n",
+                quote_security_arg(KEYCHAIN_SERVICE),
+                quote_security_arg(account),
+            );
+            let _ = stdin.write_all(cmd_line.as_bytes());
+        }
+
+        let output = child
+            .wait_with_output()
             .map_err(|e| S4Error::CredentialStore(e.to_string()))?;
         if !output.status.success() {
             return Ok(None);
@@ -1121,7 +1565,12 @@ pub fn load_secret_from_os_keychain(account: &str) -> Result<Option<String>> {
         let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(if secret.is_empty() { None } else { Some(secret) })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let target = format!("{KEYCHAIN_SERVICE}:{account}");
+        win_cred::read_generic_credential(&target)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = account;
         Ok(None)
@@ -1165,46 +1614,69 @@ mod tests {
     }
 
     #[test]
-    fn resumable_multipart_upload_and_transient_retry() {
+    fn resumable_multipart_upload_and_list_parts_resume() {
         let cfg = S4Config {
             multipart_threshold_bytes: 10, // force multipart for test file
-            multipart_part_size_bytes: 6,
+            multipart_part_size_bytes: 5 * 1024 * 1024, // 5 MB minimum part size
             ..Default::default()
         };
         let store = InMemoryObjectStore::new(cfg);
 
+        // Pre-create a multipart upload and upload part 1 (5 MB) before an "interruption"
+        let key = "originals/2024/05/CLIP.MOV";
+        let uid = store.create_multipart_upload(key, "video/quicktime").unwrap();
+        let part1 = vec![b'A'; 5 * 1024 * 1024];
+        let part2 = vec![b'B'; 1024];
+        let _etag1 = store.upload_part(key, &uid, 1, &part1).unwrap();
+        assert_eq!(store.upload_part_call_count(), 1);
+
+        let mut full_data = part1.clone();
+        full_data.extend_from_slice(&part2);
         let temp_path = std::env::temp_dir().join(format!("frames-mp-{}", fastrand::u64(..)));
-        let data = b"0123456789ABCDEF"; // 16 bytes -> 3 parts
-        std::fs::write(&temp_path, data).unwrap();
+        std::fs::write(&temp_path, &full_data).unwrap();
 
         // Inject 2 transient 503 errors to verify exponential backoff retry
         store.inject_transient_failures(2);
 
+        // Resume with existing_upload_id = Some(&uid) and parts_already_done = 1:
+        // part 1 must be discovered via `list_parts` (NOT re-uploaded!) and its
+        // server-assigned ETag must pass `complete_multipart_upload` verification.
         let mut progress_steps = Vec::new();
         upload_file_with_resume(
             &store,
             &temp_path,
-            "originals/2024/05/CLIP.MOV",
+            key,
             "video/quicktime",
-            None,
-            0,
+            Some(&uid),
+            1,
             4,
-            |uid, parts| progress_steps.push((uid.map(str::to_string), parts)),
+            |u, parts| progress_steps.push((u.map(str::to_string), parts)),
         )
         .unwrap();
 
         let _ = std::fs::remove_file(&temp_path);
 
-        let fetched = store
-            .get_object("originals/2024/05/CLIP.MOV")
-            .unwrap()
-            .unwrap();
-        assert_eq!(fetched, data);
+        // Part 1 was already uploaded (1 call) + Part 2 uploaded (1 retryable failure + 1 success):
+        // verify the assembled object matches full_data!
+        let fetched = store.get_object(key).unwrap().unwrap();
+        assert_eq!(fetched.len(), full_data.len());
+        assert_eq!(&fetched[..16], &full_data[..16]);
+        assert_eq!(&fetched[fetched.len() - 16..], &full_data[full_data.len() - 16..]);
         assert!(store.list_multipart_uploads().unwrap().is_empty());
     }
 
     #[test]
-    fn parses_s3_list_objects_and_multipart_xml() {
+    fn head_curl_args_use_dash_cap_i_and_timeouts() {
+        let headers = BTreeMap::new();
+        let head_args = build_curl_args("HEAD", "https://s4.example/bucket/key", &headers, false);
+        assert!(head_args.contains(&"-I".to_string()));
+        assert!(!head_args.contains(&"--data-binary".to_string()));
+        assert!(head_args.contains(&"--connect-timeout".to_string()));
+        assert!(head_args.contains(&"--max-time".to_string()));
+    }
+
+    #[test]
+    fn parses_s3_list_objects_multipart_and_list_parts_xml() {
         let xml = r#"
         <ListBucketResult>
             <Contents><Key>originals/2024/05/IMG_1.HEIC</Key><Size>12345</Size><ETag>"ab12"</ETag></Contents>
@@ -1216,5 +1688,18 @@ mod tests {
         assert_eq!(items[0].key, "originals/2024/05/IMG_1.HEIC");
         assert_eq!(items[0].size, 12345);
         assert_eq!(next.as_deref(), Some("tok-2"));
+
+        let parts_xml = r#"
+        <ListPartsResult>
+            <Part><PartNumber>1</PartNumber><ETag>&quot;etag-p1&quot;</ETag><Size>5242880</Size></Part>
+            <Part><PartNumber>2</PartNumber><ETag>&quot;etag-p2&quot;</ETag><Size>1024</Size></Part>
+            <IsTruncated>false</IsTruncated>
+        </ListPartsResult>"#;
+        let (parts, next_marker) = parse_list_parts_xml(parts_xml);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].etag, "\"etag-p1\"");
+        assert_eq!(parts[0].size, 5_242_880);
+        assert!(next_marker.is_none());
     }
 }

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::dates::{choose_taken, folder_year_month, Candidates};
-use crate::keys::{clash_filename, original_key};
+use crate::keys::{clash_filename, clean_filename, original_key};
 use crate::media::{
     classify_path, generate_thumbnails, read_metadata, sha256_file, FileClassification,
     MediaMetadata, ThumbnailPair,
@@ -131,11 +131,11 @@ fn push_candidate(path: &Path, ext: String, is_video: bool, report: &mut ScanRep
             return;
         }
     };
-    let filename = path
+    let raw_filename = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+        .unwrap_or("unknown");
+    let filename = clean_filename(raw_filename);
     let mtime_ms = meta
         .modified()
         .ok()
@@ -179,6 +179,10 @@ pub struct PreparedImportAsset {
     pub primary_metadata: MediaMetadata,
     pub motion_path: Option<PathBuf>,
     pub motion_filename: Option<String>,
+    #[serde(default)]
+    pub existing_upload_id: Option<String>,
+    #[serde(default)]
+    pub parts_already_done: u32,
 }
 
 impl PreparedImportAsset {
@@ -427,6 +431,8 @@ fn build_prepared_asset(
         primary_metadata: primary.metadata,
         motion_path,
         motion_filename,
+        existing_upload_id: None,
+        parts_already_done: 0,
     }
 }
 

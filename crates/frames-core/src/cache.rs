@@ -211,7 +211,8 @@ impl LocalCache {
         self.put_lru_entry(&rel, bytes)
     }
 
-    /// Fetch an original file from local LRU cache, or download from S4 (`s4_key`) and cache it.
+    /// Fetch an original file from local LRU cache, or stream it directly from S4
+    /// (`s4_key`) to disk without buffering the entire file in RAM.
     pub fn get_or_fetch_original(
         &mut self,
         s4: &dyn ObjectStore,
@@ -222,9 +223,25 @@ impl LocalCache {
         if let Some(p) = self.get_original_path(id, filename) {
             return Ok(Some(p));
         }
-        if let Some(bytes) = s4.get_object(s4_key)? {
-            let p = self.put_original(id, filename, &bytes)?;
-            return Ok(Some(p));
+        let rel = Self::original_rel_path(id, filename);
+        let full = self.root.join(&rel);
+        if s4.get_object_to_file(s4_key, &full)? {
+            let new_size = fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+            if let Some(old) = self.lru_entries.remove(&rel) {
+                self.lru_used_bytes = self.lru_used_bytes.saturating_sub(old.size_bytes);
+            }
+            self.evict_until_within(new_size)?;
+            self.access_counter += 1;
+            self.lru_used_bytes += new_size;
+            self.lru_entries.insert(
+                rel.clone(),
+                LruEntry {
+                    rel_path: rel,
+                    size_bytes: new_size,
+                    last_access_seq: self.access_counter,
+                },
+            );
+            return Ok(Some(full));
         }
         Ok(None)
     }

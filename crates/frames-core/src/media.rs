@@ -90,6 +90,60 @@ pub fn is_heic_extension(ext: &str) -> bool {
     matches!(ext.to_ascii_lowercase().as_str(), "heic" | "heif")
 }
 
+/// Resolve a bundled sidecar or system binary (`"ffmpeg"` or `"ffprobe"`), checking:
+/// 1. Adjacent to `std::env::current_exe()` and `../Resources/bin` (bundled app resources).
+/// 2. Common macOS Homebrew locations (`/opt/homebrew/bin`, `/usr/local/bin`).
+/// 3. Fallback to `PATH`.
+pub fn resolve_tool_binary(tool: &str) -> std::path::PathBuf {
+    let exe_name = if cfg!(target_os = "windows") && !tool.ends_with(".exe") {
+        format!("{tool}.exe")
+    } else {
+        tool.to_string()
+    };
+
+    if let Ok(cur_exe) = std::env::current_exe() {
+        if let Some(dir) = cur_exe.parent() {
+            for candidate in [
+                dir.join(&exe_name),
+                dir.join("bin").join(&exe_name),
+                dir.join("../Resources").join(&exe_name),
+                dir.join("../Resources/bin").join(&exe_name),
+            ] {
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            let candidate = Path::new(dir).join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    std::path::PathBuf::from(exe_name)
+}
+
+/// Create a `Command` for `tool` (`"ffmpeg"` or `"ffprobe"`) using `resolve_tool_binary`
+/// and setting `CREATE_NO_WINDOW` (`0x0800_0000`) on Windows so console windows never flash.
+pub fn spawn_hidden_command(tool: &str) -> Command {
+    let bin = resolve_tool_binary(tool);
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(bin);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 // =============================================================================
 // Streamed SHA-256 Fingerprinting (Spec Section 7, Step 2)
 // =============================================================================
@@ -675,7 +729,7 @@ pub fn extract_embedded_jpeg(bytes: &[u8]) -> Option<&[u8]> {
             while j + 1 < bytes.len() {
                 if bytes[j] == 0xFF && bytes[j + 1] == 0xD9 {
                     let candidate = &bytes[start..j + 2];
-                    if best.map_or(true, |b| candidate.len() > b.len()) {
+                    if best.is_none_or(|b| candidate.len() > b.len()) {
                         best = Some(candidate);
                     }
                     i = j + 2;
@@ -750,7 +804,7 @@ fn find_tiff_jpeg_preview<'a>(
     if let (Some(off), Some(len)) = (jpeg_off, jpeg_len) {
         if len > 0 && off + len <= tiff.len() && tiff[off..off + len].starts_with(&[0xFF, 0xD8]) {
             let slice = &tiff[off..off + len];
-            if best.map_or(true, |b| slice.len() > b.len()) {
+            if best.is_none_or(|b| slice.len() > b.len()) {
                 *best = Some(slice);
             }
         }
@@ -834,7 +888,7 @@ fn walk_iso_boxes(data: &[u8], meta: &mut MediaMetadata, depth: u8) {
                 // HEIC ImageSpatialExtentsProperty: version(1)+flags(3) + width(4) + height(4)
                 let w = BigEndian::read_u32(&body[4..8]);
                 let h = BigEndian::read_u32(&body[8..12]);
-                if w > 0 && h > 0 && meta.width.map_or(true, |cur| w > cur) {
+                if w > 0 && h > 0 && meta.width.is_none_or(|cur| w > cur) {
                     meta.width = Some(w);
                     meta.height = Some(h);
                 }
@@ -1077,7 +1131,7 @@ struct FfprobeFormat {
 }
 
 fn probe_with_ffprobe(path: &Path, meta: &mut MediaMetadata) {
-    let Ok(output) = Command::new("ffprobe")
+    let Ok(output) = spawn_hidden_command("ffprobe")
         .args([
             "-v",
             "quiet",
@@ -1304,7 +1358,7 @@ pub fn encode_webp_lossless(img: &RgbImage) -> Vec<u8> {
     } else {
         [128, 128, 128]
     };
-    let is_solid = img.data.chunks_exact(3).all(|p| p == first);
+    let is_solid = img.data.as_chunks::<3>().0.iter().all(|p| *p == first);
 
     let mut bw = BitWriter::default();
     // VP8L signature byte (0x2f)
@@ -1334,7 +1388,7 @@ pub fn encode_webp_lossless(img: &RgbImage) -> Vec<u8> {
         write_flat_byte_tree_256(&mut bw);
         write_simple_single_symbol_tree(&mut bw, 255); // Alpha = 255
         write_simple_single_symbol_tree(&mut bw, 0); // Distance unused
-        for px in img.data.chunks_exact(3) {
+        for px in img.data.as_chunks::<3>().0 {
             // Canonical 8-bit code for symbol `s` in a flat 256-entry tree is bit-reversed `s`
             bw.write_bits(u32::from(px[1].reverse_bits()), 8); // G
             bw.write_bits(u32::from(px[0].reverse_bits()), 8); // R
@@ -1466,7 +1520,7 @@ pub fn decode_png_rgb(bytes: &[u8]) -> Option<RgbImage> {
             rgb.extend_from_slice(slice);
         }
         png::ColorType::Rgba => {
-            for px in slice.chunks_exact(4) {
+            for px in slice.as_chunks::<4>().0 {
                 rgb.extend_from_slice(&px[0..3]);
             }
         }
@@ -1476,7 +1530,7 @@ pub fn decode_png_rgb(bytes: &[u8]) -> Option<RgbImage> {
             }
         }
         png::ColorType::GrayscaleAlpha => {
-            for px in slice.chunks_exact(2) {
+            for px in slice.as_chunks::<2>().0 {
                 rgb.extend_from_slice(&[px[0], px[0], px[0]]);
             }
         }
@@ -1553,13 +1607,32 @@ fn generate_thumbnails_via_ffmpeg(
     let preview_filter =
         "scale='if(gt(iw,ih),min(1600,iw),-1)':'if(gt(iw,ih),-1,min(1600,ih))'";
 
+    // Spec section 7 step 5: "RAW via its embedded JPEG preview".
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_raw_extension(&ext) {
+        if let Ok(raw_bytes) = std::fs::read(path) {
+            if let Some(jpeg) = extract_embedded_jpeg(&raw_bytes) {
+                if let (Some(small), Some(preview)) = (
+                    run_ffmpeg_webp_stdin(jpeg, small_filter),
+                    run_ffmpeg_webp_stdin(jpeg, preview_filter),
+                ) {
+                    return Some((small, preview));
+                }
+            }
+        }
+    }
+
     let small = run_ffmpeg_webp(path, seek_arg, small_filter)?;
     let preview = run_ffmpeg_webp(path, seek_arg, preview_filter)?;
     Some((small, preview))
 }
 
 fn run_ffmpeg_webp(path: &Path, seek: Option<&str>, vf: &str) -> Option<Vec<u8>> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = spawn_hidden_command("ffmpeg");
     cmd.arg("-hide_banner").arg("-loglevel").arg("error");
     if let Some(ss) = seek {
         cmd.arg("-ss").arg(ss);
@@ -1570,12 +1643,122 @@ fn run_ffmpeg_webp(path: &Path, seek: Option<&str>, vf: &str) -> Option<Vec<u8>>
         .arg("1")
         .arg("-vf")
         .arg(vf)
+        .arg("-quality")
+        .arg("80")
+        .arg("-compression_level")
+        .arg("4")
         .arg("-f")
         .arg("webp")
         .arg("pipe:1");
 
     let out = cmd.output().ok()?;
     if out.status.success() && out.stdout.len() >= 12 && &out.stdout[0..4] == b"RIFF" {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+fn run_ffmpeg_webp_stdin(input_jpeg: &[u8], vf: &str) -> Option<Vec<u8>> {
+    let mut child = spawn_hidden_command("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            vf,
+            "-quality",
+            "80",
+            "-compression_level",
+            "4",
+            "-f",
+            "webp",
+            "pipe:1",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(input_jpeg);
+    }
+    let out = child.wait_with_output().ok()?;
+    if out.status.success() && out.stdout.len() >= 12 && &out.stdout[0..4] == b"RIFF" {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+/// Prepare a cached original photo for display in the webview (spec section 8):
+/// - For RAW files (`.dng`, `.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`),
+///   extracts the embedded full-size JPEG preview (or decodes via `ffmpeg`).
+/// - On Windows, converts `.heic`/`.heif`/`.tiff` via `ffmpeg` if available so
+///   WebView2 can display them without external store codecs.
+/// - For standard webview-native formats, returns the original bytes and MIME type.
+pub fn prepare_photo_bytes_for_webview(path: impl AsRef<Path>) -> Option<(Vec<u8>, &'static str)> {
+    let path = path.as_ref();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if is_raw_extension(&ext) {
+        let raw_bytes = std::fs::read(path).ok()?;
+        if let Some(jpeg) = extract_embedded_jpeg(&raw_bytes) {
+            return Some((jpeg.to_vec(), "image/jpeg"));
+        }
+        if let Some(decoded) = run_ffmpeg_jpeg(path) {
+            return Some((decoded, "image/jpeg"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if matches!(ext.as_str(), "heic" | "heif" | "tif" | "tiff") {
+        if let Some(decoded) = run_ffmpeg_jpeg(path) {
+            return Some((decoded, "image/jpeg"));
+        }
+    }
+
+    let bytes = std::fs::read(path).ok()?;
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "heic" | "heif" => "image/heic",
+        "avif" => "image/avif",
+        "tif" | "tiff" => "image/tiff",
+        _ => "image/jpeg",
+    };
+    Some((bytes, mime))
+}
+
+fn run_ffmpeg_jpeg(path: &Path) -> Option<Vec<u8>> {
+    let out = spawn_hidden_command("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ])
+        .output()
+        .ok()?;
+    if out.status.success() && out.stdout.starts_with(&[0xFF, 0xD8]) {
         Some(out.stdout)
     } else {
         None

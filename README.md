@@ -44,7 +44,7 @@ git-ignored and must stay out of the repo.
 
 ## Status
 
-Slices 1–5 are complete and verified (`60` passing tests in `frames-core`: all 8 core Rust modules from spec section 3 are implemented and unit-tested).
-Next up:
-- **Slice 6**: Tauri 2 command bridge + Apple Photos-style Svelte 5 UI in `frames-shell`.
+All 6 slices (100% of v1 architecture in [docs/design-spec.md](docs/design-spec.md)) are implemented and verified:
+- **Slices 1–5 (`frames-core`)**: `keys`, `dates`, `ops`, `store`, `media`, `importer`, `s4`, `cache`, `trash`, `sync`, and `player` (`60` passing unit and integration tests).
+- **Slice 6 (`frames-shell`)**: Tauri 2 Rust command bridge + Apple Photos-style Svelte 5 desktop UI.
 See [docs/spec-notes.md](docs/spec-notes.md) for detailed handover notes.

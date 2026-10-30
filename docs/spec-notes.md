@@ -118,8 +118,16 @@ cargo test -p frames-core
      - `prepare_photo_for_webview`: Extracts embedded JPEG from RAW files (`dng`, `cr2`, `cr3`, `nef`, `arw`) and decodes `heic` to JPEG in memory on platforms where the webview lacks native HEIC support.
      - `LoopbackStreamServer`: Binds `127.0.0.1:0` with a random 128-bit hex session token, validates `/stream/<session_id>?token=<tok>&t=<seek_secs>`, streams `ffmpeg` stdout directly to the player without touching disk/S4, and returns HTTP 500 `"Can't play here"` if conversion fails.
 
-### Remaining Slice
+### Completed Slices (1–6)
 
-6. **Slice 6 — Tauri 2 Commands & Apple Photos-Style Svelte 5 UI (`frames-shell`)**
-   - Wire `Store`, `S4Client` / `InMemoryObjectStore`, `LocalCache`, `sync`, `trash`, and `player` into `frames-shell/src-tauri/src/lib.rs` state and Tauri commands.
-   - Build the full Svelte 5 UI in `frames-shell/src/routes/+page.svelte` (Sidebar with Library/Albums/Imports/Trash/Settings, virtualized square-thumbnail Timeline with sticky month headers, zoom slider 3–15 columns, year scrubber, multi-select + bulk action bar, Photo/Video/Live Photo Viewer with neighbour prefetch, zoom, info panel, Adjust Date & Export, Search bar with grouped suggestions & chips, Imports progress, Trash view, and Settings modal).
+6. **Slice 6 — Tauri 2 Command Bridge & Apple Photos-Style Svelte 5 UI (`frames-shell`)**
+   - `frames-shell/src-tauri/src/lib.rs`:
+     - `AppState`: Manages `Store` (`frames.sqlite3`), `LocalCache`, `PersistedSettings` (`settings.json` + OS Keychain for secret access key), `S4Client` / `InMemoryObjectStore` fallback, `LoopbackStreamServer`, and runs the 30-day Trash auto-purge on startup.
+     - 25 Tauri commands bridging Timeline (`get_app_bootstrap`, `get_timeline`, `get_asset_detail`, `get_thumbnail_data_url`), Video Player (`get_video_playback`, `get_video_seek_url`), Date Adjust & Export (`adjust_asset_date`, `export_assets`), Albums (`list_albums`, `get_album_assets`, `create_album`, `rename_album`, `delete_album`, `add_to_album`, `remove_from_album`, `move_to_album`), Search (`get_search_suggestions`, `search_assets`), Trash (`get_trash`, `trash_assets`, `restore_assets`, `delete_trash_now`, `empty_all_trash`), Imports (`import_from_paths`, `seed_sample_library`), and Sync/Settings (`sync_now`, `toggle_offline_mode`, `save_settings`, `clear_local_cache`, `run_check_library`, `run_rebuild_database`).
+   - `frames-shell/src/routes/+page.svelte`:
+     - System light/dark mode UI with translucent sidebar (Library, Albums, Imports, Trash, Settings), storage meter with 90% warning banner, and offline banner.
+     - Square-thumbnail Timeline grid with sticky month headers, zoom slider (3–15 columns), right-side year scrubber, and badges (`● LIVE`, `▶ duration`, `≈ Date`).
+     - Multi-selection (click, Shift-click, Cmd/Ctrl-click, month select, `Cmd/Ctrl+A`), drag-to-album, and bulk action bar.
+     - Full-screen Viewer (`Space` quick look / double-click / `Enter`, arrow navigation with neighbour prefetch, scroll/button zoom, `● LIVE` hover/hold motion trigger, video scrubber with seek & `"Can't play here"` + Export fallback, Info panel with Adjust Date & Export).
+     - Search box with grouped autocomplete suggestions (Albums, Dates, Cameras, Types, Filenames) and combinable filter chips.
+     - Trash view with days remaining and confirmation modal showing item count and GB.

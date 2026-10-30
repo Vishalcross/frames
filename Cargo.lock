@@ -1074,12 +1074,17 @@ dependencies = [
 name = "frames-shell"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "dirs",
+ "fastrand",
  "frames-core",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "uuid",
 ]
 
 [[package]]

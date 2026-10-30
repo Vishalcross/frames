@@ -1141,6 +1141,7 @@ fn probe_with_ffprobe(path: &Path, meta: &mut MediaMetadata) {
             "-show_streams",
         ])
         .arg(path)
+        .stdin(std::process::Stdio::null())
         .output()
     else {
         return;
@@ -1556,19 +1557,26 @@ pub fn generate_thumbnails(
     meta: &MediaMetadata,
 ) -> ThumbnailPair {
     let path = path.as_ref();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    // 1. Try pure-Rust PNG path first (fast & works inside sandbox)
-    if let Ok(bytes) = std::fs::read(path) {
-        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            if let Some(raw_img) = decode_png_rgb(&bytes) {
-                let oriented = apply_exif_orientation(&raw_img, meta.orientation);
-                let small_img = resize_short_edge(&oriented, SMALL_THUMB_SHORT_EDGE);
-                let preview_img = resize_long_edge(&oriented, PREVIEW_THUMB_LONG_EDGE);
-                return ThumbnailPair {
-                    small_webp: encode_webp_lossless(&small_img),
-                    preview_webp: encode_webp_lossless(&preview_img),
-                    thumb_failed: false,
-                };
+    // 1. Try pure-Rust PNG path first only for PNG photos (never read multi-GB videos into RAM!)
+    if kind == AssetKind::Photo && ext == "png" {
+        if let Ok(bytes) = std::fs::read(path) {
+            if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                if let Some(raw_img) = decode_png_rgb(&bytes) {
+                    let oriented = apply_exif_orientation(&raw_img, meta.orientation);
+                    let small_img = resize_short_edge(&oriented, SMALL_THUMB_SHORT_EDGE);
+                    let preview_img = resize_long_edge(&oriented, PREVIEW_THUMB_LONG_EDGE);
+                    return ThumbnailPair {
+                        small_webp: encode_webp_lossless(&small_img),
+                        preview_webp: encode_webp_lossless(&preview_img),
+                        thumb_failed: false,
+                    };
+                }
             }
         }
     }
@@ -1633,7 +1641,7 @@ fn generate_thumbnails_via_ffmpeg(
 
 fn run_ffmpeg_webp(path: &Path, seek: Option<&str>, vf: &str) -> Option<Vec<u8>> {
     let mut cmd = spawn_hidden_command("ffmpeg");
-    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
+    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
     if let Some(ss) = seek {
         cmd.arg("-ss").arg(ss);
     }
@@ -1649,7 +1657,8 @@ fn run_ffmpeg_webp(path: &Path, seek: Option<&str>, vf: &str) -> Option<Vec<u8>>
         .arg("4")
         .arg("-f")
         .arg("webp")
-        .arg("pipe:1");
+        .arg("pipe:1")
+        .stdin(std::process::Stdio::null());
 
     let out = cmd.output().ok()?;
     if out.status.success() && out.stdout.len() >= 12 && &out.stdout[0..4] == b"RIFF" {
@@ -1743,7 +1752,7 @@ pub fn prepare_photo_bytes_for_webview(path: impl AsRef<Path>) -> Option<(Vec<u8
 
 fn run_ffmpeg_jpeg(path: &Path) -> Option<Vec<u8>> {
     let out = spawn_hidden_command("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
         .arg(path)
         .args([
             "-frames:v",
@@ -1756,6 +1765,7 @@ fn run_ffmpeg_jpeg(path: &Path) -> Option<Vec<u8>> {
             "mjpeg",
             "pipe:1",
         ])
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
     if out.status.success() && out.stdout.starts_with(&[0xFF, 0xD8]) {

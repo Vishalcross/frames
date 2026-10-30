@@ -1084,13 +1084,12 @@ fn cancel_import(state: State<'_, AppState>) -> Result<ImportStatusView, String>
 fn get_import_status(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let progress = store.import_progress().map_err(|e| e.to_string())?;
-    let queue = store.list_import_queue().map_err(|e| e.to_string())?;
     Ok(ImportStatusView {
         running: state.import_control.is_running(),
         paused: state.import_control.is_paused(),
         cancelled: state.import_control.is_cancelled(),
         progress,
-        queue,
+        queue: Vec::new(),
     })
 }
 

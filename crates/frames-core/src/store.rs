@@ -252,6 +252,10 @@ pub struct ImportProgress {
     pub completed_bytes: u64,
     pub skipped_duplicates: usize,
     pub failed_files: usize,
+    #[serde(default)]
+    pub hashed_files: usize,
+    #[serde(default)]
+    pub uploading_files: usize,
 }
 
 /// Full-state snapshot payload written to `index/snapshot-<ts>-<device>.json.gz`.
@@ -1516,6 +1520,28 @@ impl Store {
         Ok(fresh)
     }
 
+    /// Reconcile a batch of `(path, size, mtime)` candidates in a single SQLite
+    /// transaction so scanning 850+ files takes milliseconds instead of 850 disk fsyncs.
+    pub fn reconcile_import_candidates_batch(
+        &mut self,
+        candidates: &[(String, u64, i64)],
+        album_id: Option<&str>,
+    ) -> Result<Vec<ImportQueueRow>> {
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let mut out = Vec::with_capacity(candidates.len());
+        for (path, size, mtime) in candidates {
+            match self.reconcile_import_candidate(path, *size, *mtime, album_id) {
+                Ok(row) => out.push(row),
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    return Err(e);
+                }
+            }
+        }
+        self.conn.execute_batch("COMMIT;")?;
+        Ok(out)
+    }
+
     pub fn list_import_queue(&self) -> Result<Vec<ImportQueueRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, size, mtime, state, asset_id, upload_id, parts_done, album_id, error
@@ -1539,25 +1565,50 @@ impl Store {
     }
 
     pub fn import_progress(&self) -> Result<ImportProgress> {
-        let rows = self.list_import_queue()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT size, state, parts_done FROM import_queue")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                ImportState::from_str(&r.get::<_, String>(1)?),
+                r.get::<_, i64>(2)? as u32,
+            ))
+        })?;
         let mut prog = ImportProgress::default();
-        for r in rows {
+        for row_res in rows {
+            let (size, state, parts_done) = row_res?;
             prog.total_files += 1;
-            prog.total_bytes += r.size;
-            match r.state {
+            prog.total_bytes += size;
+            match state {
+                ImportState::Hashed => {
+                    prog.hashed_files += 1;
+                }
+                ImportState::Uploading => {
+                    prog.hashed_files += 1;
+                    prog.uploading_files += 1;
+                    let partial = (u64::from(parts_done) * 16 * 1024 * 1024).min(size);
+                    prog.completed_bytes += partial;
+                }
+                ImportState::Uploaded => {
+                    prog.hashed_files += 1;
+                    prog.completed_bytes += size;
+                }
                 ImportState::Logged => {
+                    prog.hashed_files += 1;
                     prog.completed_files += 1;
-                    prog.completed_bytes += r.size;
+                    prog.completed_bytes += size;
                 }
                 ImportState::Skipped => {
+                    prog.hashed_files += 1;
                     prog.completed_files += 1;
-                    prog.completed_bytes += r.size;
+                    prog.completed_bytes += size;
                     prog.skipped_duplicates += 1;
                 }
                 ImportState::Failed => {
                     prog.failed_files += 1;
                 }
-                _ => {}
+                ImportState::Pending => {}
             }
         }
         Ok(prog)

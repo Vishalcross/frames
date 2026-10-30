@@ -186,3 +186,17 @@ cargo test -p frames-core
    - **Blocker 7 — Windows drag-and-drop & Local S3/MinIO + Live S4 tests (`tauri.conf.json`, `crates/frames-core/src/s4.rs`)**:
      - Set `"dragDropEnabled": false` in `frames-shell/src-tauri/tauri.conf.json` so HTML5 drag-and-drop of thumbnails onto sidebar albums works on Windows WebView2 alongside external folder drag-and-drop.
      - Added `s4_client_end_to_end_against_local_s3_minio_http_server` and `live_s4_bucket_smoke_test_if_configured` (`FRAMES_TEST_S4_*` env vars) in `crates/frames-core/src/s4.rs`.
+
+9. **Slice 9 — Large Import Pipelining & UI Responsiveness Fixes (`crates/frames-core`, `frames-shell`)**:
+   - **Root Causes of App Appearing Stuck During 10 GB / 850+ File Import**:
+     1. *Monolithic Upfront Folder Hashing*: In folders with 850+ items (10 GB), `prepare_folder_assets_concurrent` was hashing every single file sequentially before the first file ever began uploading or updating `completed_files`.
+     2. *High-Resolution Progress Metrics*: UI previously displayed only `completed_files / total_files` (which stays at 0 until the first file finishes S4 upload), hiding active hashing and active uploads.
+     3. *850 Individual SQLite Fsyncs*: `scan.candidates` were reconciled one-by-one with individual transactions.
+     4. *Unnecessary Full File Reads on Multi-GB Videos*: `generate_thumbnails` attempted pure-Rust PNG decode on every file regardless of extension, reading multi-GB videos into memory before passing to `ffmpeg`.
+     5. *Spawned Child Stdin Contention*: `ffmpeg` and `ffprobe` inherited stdin without `-nostdin` / `Stdio::null()`, triggering OS text/spellcheck timeouts (`NSSpellServer dataFromGeneratingCandidatesForSelectedRange timed out`).
+   - **Applied Fixes**:
+     - Added `split_folder_into_stem_batches` to stream large folders in stem-aligned chunks of ~16 files so uploading starts within ~1s of launching an import while preserving Live Photo pairs.
+     - Multithreaded folder hashing across up to 4 parallel workers, emitting live progress events on each hashed file.
+     - Added `Store::reconcile_import_candidates_batch` to reconcile all 850+ files in a single SQLite transaction in a few milliseconds.
+     - Guarded `decode_png_rgb` to only run on `.png` files, and added `-nostdin` + `stdin(Stdio::null())` on all `ffmpeg` and `ffprobe` commands.
+     - Upgraded `ImportProgress` in `Store` and `+page.svelte` to report both `hashed_files` and `uploading_files` in real time, and added `spellcheck="false"` on the path input.

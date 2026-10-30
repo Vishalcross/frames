@@ -702,11 +702,58 @@ where
     Ok(report)
 }
 
-/// Prepare one folder's scanned candidates WITHOUT holding `store.lock()` across
-/// `sha256_file` or `read_metadata` (`ffprobe`), acquiring the SQLite mutex only
-/// for brief microseconds to check duplicate hashes or update `import_queue`.
+/// Split a folder's scanned candidates into stem-aligned batches of ~16 files so
+/// large folders (e.g. 850+ files / 10 GB) begin uploading within ~1 second instead
+/// of waiting for all 850 files to be hashed upfront, while keeping same-stem
+/// Live Photo pairs (`IMG_1234.HEIC` + `IMG_1234.MOV`) in the same batch.
+fn split_folder_into_stem_batches(mut candidates: Vec<ScannedCandidate>) -> Vec<Vec<ScannedCandidate>> {
+    if candidates.len() <= 24 {
+        return vec![candidates];
+    }
+    candidates.sort_by(|a, b| {
+        let sa = a
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let sb = b
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        sa.cmp(&sb).then_with(|| a.path.cmp(&b.path))
+    });
+
+    let mut batches: Vec<Vec<ScannedCandidate>> = Vec::new();
+    let mut current: Vec<ScannedCandidate> = Vec::with_capacity(18);
+    let mut last_stem = String::new();
+
+    for cand in candidates {
+        let stem = cand
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if current.len() >= 16 && stem != last_stem {
+            batches.push(std::mem::take(&mut current));
+        }
+        last_stem = stem;
+        current.push(cand);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Prepare a batch of scanned candidates in parallel across up to 4 worker threads
+/// WITHOUT holding `store.lock()` across `sha256_file` or `read_metadata` (`ffprobe`),
+/// firing `on_progress` as each file is hashed.
 #[allow(clippy::too_many_arguments)]
-fn prepare_folder_assets_concurrent(
+fn prepare_folder_assets_concurrent<F>(
     folder_candidates: Vec<ScannedCandidate>,
     album_id: Option<&str>,
     store: &Arc<Mutex<Store>>,
@@ -715,110 +762,155 @@ fn prepare_folder_assets_concurrent(
     resume_map: &HashMap<PathBuf, (Option<String>, u32)>,
     report: &mut ImportRunReport,
     now: DateTime<Utc>,
-) -> Result<Vec<PreparedImportAsset>> {
-    let mut inspected_files: Vec<InspectedFile> = Vec::new();
+    on_progress: &F,
+) -> Result<Vec<PreparedImportAsset>>
+where
+    F: Fn(&ImportRunReport) + Send + Sync,
+{
+    let worker_count = folder_candidates.len().clamp(1, 4);
+    let cand_queue = Mutex::new(VecDeque::from(folder_candidates));
+    let outcomes: Mutex<Vec<std::result::Result<InspectedFile, (PathBuf, String)>>> =
+        Mutex::new(Vec::new());
+    let report_snapshot = report.clone();
 
-    for cand in folder_candidates {
-        if control.is_cancelled() {
-            return Ok(Vec::new());
-        }
-        while control.is_paused() && !control.is_cancelled() {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if control.is_cancelled() {
-            return Ok(Vec::new());
-        }
-
-        let path_str = cand.path.to_string_lossy().to_string();
-        // Hash outside the DB lock so timeline & search never stall
-        let hash = match sha256_file(&cand.path) {
-            Ok(h) => h,
-            Err(err) => {
-                let msg = format!("unreadable: {err}");
-                if let Ok(mut st) = store.lock() {
-                    let _ = st.update_import_state(
-                        &path_str,
-                        ImportState::Failed,
-                        None,
-                        None,
-                        0,
-                        Some(&msg),
-                    );
+    std::thread::scope(|s| {
+        for _ in 0..worker_count {
+            let q_ref = &cand_queue;
+            let out_ref = &outcomes;
+            let store_ref = Arc::clone(store);
+            let snap_ref = &report_snapshot;
+            s.spawn(move || loop {
+                if control.is_cancelled() {
+                    break;
                 }
-                report.failed_files.push(SkippedFile {
-                    path: cand.path,
-                    reason: msg,
-                });
-                continue;
-            }
-        };
+                while control.is_paused() && !control.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if control.is_cancelled() {
+                    break;
+                }
+                let next_cand = {
+                    let mut q = q_ref.lock().unwrap();
+                    q.pop_front()
+                };
+                let Some(cand) = next_cand else {
+                    break;
+                };
+                let path_str = cand.path.to_string_lossy().to_string();
+                let hash = match sha256_file(&cand.path) {
+                    Ok(h) => h,
+                    Err(err) => {
+                        let msg = format!("unreadable: {err}");
+                        if let Ok(mut st) = store_ref.lock() {
+                            let _ = st.update_import_state(
+                                &path_str,
+                                ImportState::Failed,
+                                None,
+                                None,
+                                0,
+                                Some(&msg),
+                            );
+                        }
+                        on_progress(snap_ref);
+                        out_ref.lock().unwrap().push(Err((cand.path, msg)));
+                        continue;
+                    }
+                };
 
-        let is_dup = if seen_hashes.contains(&hash) {
-            true
-        } else {
-            let st = store.lock().unwrap();
-            st.has_active_or_trashed_asset(&hash)?
-        };
-        if is_dup {
-            if let Ok(mut st) = store.lock() {
-                let _ = st.update_import_state(
-                    &path_str,
-                    ImportState::Skipped,
-                    Some(&hash),
-                    None,
-                    0,
-                    None,
-                );
-            }
-            report.duplicates_skipped += 1;
-            continue;
-        }
-        seen_hashes.insert(hash.clone());
+                let metadata = match read_metadata(&cand.path) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        let msg = format!("unreadable: {err}");
+                        if let Ok(mut st) = store_ref.lock() {
+                            let _ = st.update_import_state(
+                                &path_str,
+                                ImportState::Failed,
+                                Some(&hash),
+                                None,
+                                0,
+                                Some(&msg),
+                            );
+                        }
+                        on_progress(snap_ref);
+                        out_ref.lock().unwrap().push(Err((cand.path, msg)));
+                        continue;
+                    }
+                };
 
-        // Extract EXIF / ffprobe metadata outside the DB lock
-        let metadata = match read_metadata(&cand.path) {
-            Ok(m) => m,
-            Err(err) => {
-                let msg = format!("unreadable: {err}");
-                if let Ok(mut st) = store.lock() {
+                if let Ok(mut st) = store_ref.lock() {
                     let _ = st.update_import_state(
                         &path_str,
-                        ImportState::Failed,
+                        ImportState::Hashed,
                         Some(&hash),
                         None,
                         0,
-                        Some(&msg),
+                        None,
                     );
                 }
-                report.failed_files.push(SkippedFile {
-                    path: cand.path,
-                    reason: msg,
-                });
-                continue;
+                on_progress(snap_ref);
+
+                out_ref.lock().unwrap().push(Ok(InspectedFile {
+                    candidate: cand,
+                    sha256: hash,
+                    metadata,
+                }));
+            });
+        }
+    });
+
+    if control.is_cancelled() {
+        return Ok(Vec::new());
+    }
+
+    let mut inspected_files: Vec<InspectedFile> = Vec::new();
+    for outcome in outcomes.into_inner().unwrap() {
+        match outcome {
+            Err((path, reason)) => {
+                report.failed_files.push(SkippedFile { path, reason });
             }
-        };
-        inspected_files.push(InspectedFile {
-            candidate: cand,
-            sha256: hash,
-            metadata,
-        });
+            Ok(insp) => {
+                let path_str = insp.candidate.path.to_string_lossy().to_string();
+                let is_dup = if seen_hashes.contains(&insp.sha256) {
+                    true
+                } else {
+                    let st = store.lock().unwrap();
+                    st.has_active_or_trashed_asset(&insp.sha256)?
+                };
+                if is_dup {
+                    if let Ok(mut st) = store.lock() {
+                        let _ = st.update_import_state(
+                            &path_str,
+                            ImportState::Skipped,
+                            Some(&insp.sha256),
+                            None,
+                            0,
+                            None,
+                        );
+                    }
+                    report.duplicates_skipped += 1;
+                    continue;
+                }
+                seen_hashes.insert(insp.sha256.clone());
+                inspected_files.push(insp);
+            }
+        }
     }
 
     let paired_items = pair_live_photos(inspected_files, now);
     let mut prepared = Vec::with_capacity(paired_items.len());
-    for mut item in paired_items {
-        if let Some((existing_uid, parts_done)) = resume_map.get(&item.primary_path) {
-            item.existing_upload_id = existing_uid.clone();
-            item.parts_already_done = *parts_done;
-        }
-        let path_str = item.primary_path.to_string_lossy().to_string();
-        let state = if item.existing_upload_id.is_some() {
-            ImportState::Uploading
-        } else {
-            ImportState::Hashed
-        };
-        {
-            let mut st = store.lock().unwrap();
+    {
+        let mut st = store.lock().unwrap();
+        for mut item in paired_items {
+            if let Some((existing_uid, parts_done)) = resume_map.get(&item.primary_path) {
+                item.existing_upload_id = existing_uid.clone();
+                item.parts_already_done = *parts_done;
+            }
+            let path_str = item.primary_path.to_string_lossy().to_string();
+            let state = if item.existing_upload_id.is_some() {
+                ImportState::Uploading
+            } else {
+                ImportState::Hashed
+            };
             if let Some(ref mov_path) = item.motion_path {
                 let mov_str = mov_path.to_string_lossy().to_string();
                 let _ = st.update_import_state(
@@ -841,14 +933,15 @@ fn prepare_folder_assets_concurrent(
                 album_id: album_id.map(str::to_string),
                 error: None,
             })?;
+            prepared.push(item);
         }
-        prepared.push(item);
     }
+    on_progress(report);
 
     Ok(prepared)
 }
 
-/// Concurrent background import runner (work-stealing 4-worker pool per folder)
+/// Concurrent background import runner (work-stealing 4-worker pool per stem batch)
 /// with fine-grained `Mutex` locking on `Store` and `LocalCache` so UI timeline reads
 /// never stall during hashing or uploading, plus single-run enforcement and immediate
 /// pause/resume/cancel via `ImportControl`.
@@ -883,15 +976,21 @@ where
     let mut by_folder: BTreeMap<PathBuf, Vec<ScannedCandidate>> = BTreeMap::new();
     let mut resume_map: HashMap<PathBuf, (Option<String>, u32)> = HashMap::new();
 
-    for cand in scan.candidates {
+    // Batch-reconcile all scanned candidates in a single SQLite transaction
+    let batch_tuples: Vec<(String, u64, i64)> = scan
+        .candidates
+        .iter()
+        .map(|c| (c.path.to_string_lossy().to_string(), c.size, c.mtime_ms))
+        .collect();
+    let reconciled_rows = {
+        let mut st = store.lock().unwrap();
+        st.reconcile_import_candidates_batch(&batch_tuples, album_id)?
+    };
+
+    for (cand, row) in scan.candidates.into_iter().zip(reconciled_rows) {
         if control.is_cancelled() {
             break;
         }
-        let path_str = cand.path.to_string_lossy().to_string();
-        let row = {
-            let mut st = store.lock().unwrap();
-            st.reconcile_import_candidate(&path_str, cand.size, cand.mtime_ms, album_id)?
-        };
         match row.state {
             ImportState::Logged => continue,
             ImportState::Skipped => {
@@ -916,154 +1015,162 @@ where
     let mut seen_hashes: HashSet<String> = HashSet::new();
 
     'folders: for (_folder, folder_candidates) in by_folder {
-        if control.is_cancelled() {
-            break;
-        }
-        while control.is_paused() && !control.is_cancelled() {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if control.is_cancelled() {
-            break;
-        }
-
-        let assets = prepare_folder_assets_concurrent(
-            folder_candidates,
-            album_id,
-            &store,
-            &control,
-            &mut seen_hashes,
-            &resume_map,
-            &mut report,
-            now,
-        )?;
-        on_progress(&report);
-
-        if assets.is_empty() || control.is_cancelled() {
+        let batches = split_folder_into_stem_batches(folder_candidates);
+        for batch_candidates in batches {
             if control.is_cancelled() {
                 break 'folders;
             }
-            continue;
-        }
+            while control.is_paused() && !control.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if control.is_cancelled() {
+                break 'folders;
+            }
 
-        // Work-stealing pool of up to 4 concurrent upload workers so fast photo
-        // uploads never stall waiting for a slow video upload in the same folder.
-        let worker_count = assets.len().min(4);
-        let work_queue = Mutex::new(VecDeque::from(assets));
-        let shared_report = Mutex::new(report);
-        let stop_folder_loop = AtomicBool::new(false);
+            let assets = prepare_folder_assets_concurrent(
+                batch_candidates,
+                album_id,
+                &store,
+                &control,
+                &mut seen_hashes,
+                &resume_map,
+                &mut report,
+                now,
+                &on_progress,
+            )?;
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for _ in 0..worker_count {
-                let queue_ref = &work_queue;
-                let report_ref = &shared_report;
-                let stop_ref = &stop_folder_loop;
-                let store_ref = Arc::clone(&store);
-                let s4_ref = Arc::clone(&s4);
-                let cache_ref = Arc::clone(&cache);
-                let control_ref = Arc::clone(&control);
-                let alb = album_id.map(str::to_string);
-                let progress_cb = &on_progress;
+            if assets.is_empty() || control.is_cancelled() {
+                if control.is_cancelled() {
+                    break 'folders;
+                }
+                continue;
+            }
 
-                handles.push(s.spawn(move || loop {
-                    if control_ref.is_cancelled() || stop_ref.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    while control_ref.is_paused() && !control_ref.is_cancelled() {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    if control_ref.is_cancelled() || stop_ref.load(Ordering::SeqCst) {
-                        break;
-                    }
+            // Work-stealing pool of up to 4 concurrent upload workers so fast photo
+            // uploads never stall waiting for a slow video upload in the same batch.
+            let worker_count = assets.len().min(4);
+            let work_queue = Mutex::new(VecDeque::from(assets));
+            let shared_report = Mutex::new(report);
+            let stop_folder_loop = AtomicBool::new(false);
 
-                    let next_item = {
-                        let mut q = queue_ref.lock().unwrap();
-                        q.pop_front()
-                    };
-                    let Some(mut item) = next_item else {
-                        break;
-                    };
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(worker_count);
+                for _ in 0..worker_count {
+                    let queue_ref = &work_queue;
+                    let report_ref = &shared_report;
+                    let stop_ref = &stop_folder_loop;
+                    let store_ref = Arc::clone(&store);
+                    let s4_ref = Arc::clone(&s4);
+                    let cache_ref = Arc::clone(&cache);
+                    let control_ref = Arc::clone(&control);
+                    let alb = album_id.map(str::to_string);
+                    let progress_cb = &on_progress;
 
-                    let res = upload_and_log_concurrent(
-                        &mut item,
-                        alb.as_deref(),
-                        &store_ref,
-                        s4_ref.as_ref(),
-                        &cache_ref,
-                        &control_ref,
-                        now,
-                    );
-
-                    match res {
-                        Ok(()) => {
-                            if let Ok(mut rep) = report_ref.lock() {
-                                rep.imported_count += 1;
-                                progress_cb(&rep);
-                            }
-                        }
-                        Err(SyncError::S4(S4Error::Cancelled)) => {
-                            stop_ref.store(true, Ordering::SeqCst);
+                    handles.push(s.spawn(move || loop {
+                        if control_ref.is_cancelled() || stop_ref.load(Ordering::SeqCst) {
                             break;
                         }
-                        Err(SyncError::S4(S4Error::Offline(_))) => {
-                            if let Ok(mut rep) = report_ref.lock() {
-                                rep.paused_offline = true;
-                                progress_cb(&rep);
-                            }
-                            stop_ref.store(true, Ordering::SeqCst);
+                        while control_ref.is_paused() && !control_ref.is_cancelled() {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        if control_ref.is_cancelled() || stop_ref.load(Ordering::SeqCst) {
                             break;
                         }
-                        Err(SyncError::S4(S4Error::SpaceFull {
-                            used_bytes,
-                            limit_bytes,
-                        })) => {
-                            if let Ok(mut rep) = report_ref.lock() {
-                                rep.stopped_space_full = true;
-                                rep.space_usage =
-                                    Some(SpaceUsage::compute(used_bytes, limit_bytes));
-                                progress_cb(&rep);
-                            }
-                            stop_ref.store(true, Ordering::SeqCst);
+
+                        let next_item = {
+                            let mut q = queue_ref.lock().unwrap();
+                            q.pop_front()
+                        };
+                        let Some(mut item) = next_item else {
                             break;
-                        }
-                        Err(err) => {
-                            let msg = err.to_string();
-                            let path_str = item.primary_path.to_string_lossy().to_string();
-                            if let Ok(mut st) = store_ref.lock() {
-                                let _ = st.update_import_state(
-                                    &path_str,
-                                    ImportState::Failed,
-                                    Some(&item.record.id),
-                                    None,
-                                    0,
-                                    Some(&msg),
-                                );
-                            }
-                            if let Ok(mut rep) = report_ref.lock() {
-                                rep.failed_files.push(SkippedFile {
-                                    path: item.primary_path,
-                                    reason: msg,
-                                });
-                                progress_cb(&rep);
-                            }
-                        }
-                    }
-                }));
-            }
-            for h in handles {
-                let _ = h.join();
-            }
-        });
+                        };
 
-        report = shared_report.into_inner().unwrap();
+                        let res = upload_and_log_concurrent(
+                            &mut item,
+                            alb.as_deref(),
+                            &store_ref,
+                            s4_ref.as_ref(),
+                            &cache_ref,
+                            &control_ref,
+                            now,
+                            || {
+                                if let Ok(rep) = report_ref.lock() {
+                                    progress_cb(&rep);
+                                }
+                            },
+                        );
 
-        if !report.paused_offline && !control.is_cancelled() {
-            if let Ok(mut st) = store.lock() {
-                let _ = flush_outbox(&mut st, s4.as_ref(), now);
+                        match res {
+                            Ok(()) => {
+                                if let Ok(mut rep) = report_ref.lock() {
+                                    rep.imported_count += 1;
+                                    progress_cb(&rep);
+                                }
+                            }
+                            Err(SyncError::S4(S4Error::Cancelled)) => {
+                                stop_ref.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            Err(SyncError::S4(S4Error::Offline(_))) => {
+                                if let Ok(mut rep) = report_ref.lock() {
+                                    rep.paused_offline = true;
+                                    progress_cb(&rep);
+                                }
+                                stop_ref.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            Err(SyncError::S4(S4Error::SpaceFull {
+                                used_bytes,
+                                limit_bytes,
+                            })) => {
+                                if let Ok(mut rep) = report_ref.lock() {
+                                    rep.stopped_space_full = true;
+                                    rep.space_usage =
+                                        Some(SpaceUsage::compute(used_bytes, limit_bytes));
+                                    progress_cb(&rep);
+                                }
+                                stop_ref.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            Err(err) => {
+                                let msg = err.to_string();
+                                let path_str = item.primary_path.to_string_lossy().to_string();
+                                if let Ok(mut st) = store_ref.lock() {
+                                    let _ = st.update_import_state(
+                                        &path_str,
+                                        ImportState::Failed,
+                                        Some(&item.record.id),
+                                        None,
+                                        0,
+                                        Some(&msg),
+                                    );
+                                }
+                                if let Ok(mut rep) = report_ref.lock() {
+                                    rep.failed_files.push(SkippedFile {
+                                        path: item.primary_path,
+                                        reason: msg,
+                                    });
+                                    progress_cb(&rep);
+                                }
+                            }
+                        }
+                    }));
+                }
+                for h in handles {
+                    let _ = h.join();
+                }
+            });
+
+            report = shared_report.into_inner().unwrap();
+
+            if !report.paused_offline && !control.is_cancelled() {
+                if let Ok(mut st) = store.lock() {
+                    let _ = flush_outbox(&mut st, s4.as_ref(), now);
+                }
             }
-        }
-        if stop_folder_loop.load(Ordering::SeqCst) || control.is_cancelled() {
-            break 'folders;
+            if stop_folder_loop.load(Ordering::SeqCst) || control.is_cancelled() {
+                break 'folders;
+            }
         }
     }
 
@@ -1181,7 +1288,8 @@ fn upload_and_log_one_asset(
     Ok(())
 }
 
-fn upload_and_log_concurrent(
+#[allow(clippy::too_many_arguments)]
+fn upload_and_log_concurrent<G>(
     item: &mut PreparedImportAsset,
     album_id: Option<&str>,
     store: &Arc<Mutex<Store>>,
@@ -1189,7 +1297,11 @@ fn upload_and_log_concurrent(
     cache: &Arc<Mutex<LocalCache>>,
     control: &ImportControl,
     now: DateTime<Utc>,
-) -> Result<()> {
+    on_state_change: G,
+) -> Result<()>
+where
+    G: Fn(),
+{
     let path_str = item.primary_path.to_string_lossy().to_string();
     let base_delay = s4.config().retry_base_delay_ms;
 
@@ -1231,6 +1343,7 @@ fn upload_and_log_concurrent(
             None,
         )?;
     }
+    on_state_change();
 
     // Step 6: Upload original without holding the DB lock across network I/O
     upload_file_with_resume_cancel(
@@ -1252,6 +1365,7 @@ fn upload_and_log_concurrent(
                     None,
                 );
             }
+            on_state_change();
         },
         should_cancel,
     )?;

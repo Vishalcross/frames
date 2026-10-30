@@ -120,6 +120,8 @@
     completed_bytes: number;
     skipped_duplicates: number;
     failed_files: number;
+    hashed_files?: number;
+    uploading_files?: number;
   }
 
   // Navigation & Primary State
@@ -143,7 +145,9 @@
     completed_files: 0,
     completed_bytes: 0,
     skipped_duplicates: 0,
-    failed_files: 0
+    failed_files: 0,
+    hashed_files: 0,
+    uploading_files: 0
   });
   let importRunning = $state(false);
   let importPaused = $state(false);
@@ -1419,6 +1423,9 @@
               <input
                 id="import-path"
                 type="text"
+                spellcheck="false"
+                autocomplete="off"
+                autocorrect="off"
                 placeholder="/Volumes/PhotosDisk/DCIM or C:\Photos"
                 bind:value={importFolderPath}
               />
@@ -1462,20 +1469,20 @@
 
         <div class="stats-grid">
           <div class="stat-card">
-            <span class="stat-label">Files Processed</span>
-            <strong>{importProgress.completed_files} / {importProgress.total_files}</strong>
+            <span class="stat-label">Files Hashed / Inspected</span>
+            <strong>{importProgress.hashed_files ?? 0} / {importProgress.total_files}</strong>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Files Uploaded & Logged</span>
+            <strong>{importProgress.completed_files} / {importProgress.total_files}{#if (importProgress.uploading_files ?? 0) > 0} ({importProgress.uploading_files} active){/if}</strong>
           </div>
           <div class="stat-card">
             <span class="stat-label">Data Transferred</span>
             <strong>{formatBytes(importProgress.completed_bytes)} / {formatBytes(importProgress.total_bytes)}</strong>
           </div>
           <div class="stat-card">
-            <span class="stat-label">Duplicates Skipped</span>
-            <strong>{importProgress.skipped_duplicates}</strong>
-          </div>
-          <div class="stat-card">
-            <span class="stat-label">Errors</span>
-            <strong>{importProgress.failed_files}</strong>
+            <span class="stat-label">Skipped / Errors</span>
+            <strong>{importProgress.skipped_duplicates} dup · {importProgress.failed_files} err</strong>
           </div>
         </div>
 

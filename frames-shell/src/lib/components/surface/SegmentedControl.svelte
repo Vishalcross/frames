@@ -1,105 +1,123 @@
 <script lang="ts">
+  import { tick, onMount } from 'svelte';
   import { theme } from '$lib/theme/engine.svelte';
 
   let {
     options,
+    items,
     value = $bindable(),
+    selected = $bindable(),
     onchange,
     class: klass = ''
   }: {
-    options: { value: string; label: string }[];
-    value: string;
+    options?: { value?: string; id?: string; label: string }[];
+    items?: { value?: string; id?: string; label: string }[];
+    value?: string;
+    selected?: string;
     onchange?: (val: string) => void;
     class?: string;
   } = $props();
 
-  const selectedIndex = $derived(
-    Math.max(0, options.findIndex((opt) => opt.value === value))
+  const controlItems = $derived(
+    (items || options || []).map((it) => ({
+      id: it.id ?? it.value ?? '',
+      label: it.label
+    }))
   );
 
-  function select(val: string) {
-    value = val;
-    onchange?.(val);
+  const activeId = $derived(selected !== undefined ? selected : (value ?? ''));
+
+  let buttons: HTMLButtonElement[] = $state([]);
+  let left = $state(0);
+  let width = $state(0);
+  let ready = $state(false);
+
+  async function measure() {
+    await tick();
+    const i = controlItems.findIndex((it) => it.id === activeId);
+    const el = buttons[i];
+    if (!el) return;
+    left = el.offsetLeft;
+    width = el.offsetWidth;
   }
 
-  function handleKeydown(e: KeyboardEvent, index: number) {
-    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-      e.preventDefault();
-      const next = (index + 1) % options.length;
-      select(options[next].value);
-    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-      e.preventDefault();
-      const prev = (index - 1 + options.length) % options.length;
-      select(options[prev].value);
-    }
+  function select(id: string) {
+    if (selected !== undefined) selected = id;
+    if (value !== undefined) value = id;
+    onchange?.(id);
   }
+
+  onMount(() => {
+    if (typeof document !== 'undefined' && document.fonts) {
+      document.fonts.ready.then(async () => {
+        await measure();
+        ready = true;
+      });
+    } else {
+      measure().then(() => {
+        ready = true;
+      });
+    }
+    const ro = new ResizeObserver(measure);
+    buttons.forEach((b) => b && ro.observe(b));
+    return () => ro.disconnect();
+  });
+
+  $effect(() => {
+    activeId;
+    measure();
+  });
 </script>
 
-<div
-  class="segmented-control appearance-{theme.appearance} {klass}"
-  role="radiogroup"
-  aria-label="View mode selector"
->
-  <!-- Raised sliding thumb (§6) -->
-  <div
-    class="segmented-thumb"
-    style="
-      width: calc((100% - 6px) / {options.length});
-      transform: translateX(calc({selectedIndex} * 100%));
-    "
-  ></div>
-
-  {#each options as opt, i}
-    {@const isSelected = opt.value === value}
+<div class="seg segmented-control appearance-{theme.appearance} {klass}">
+  <div class="pill segmented-thumb" class:ready style="transform: translateX({left}px); width: {width}px"></div>
+  {#each controlItems as it, i}
     <button
+      bind:this={buttons[i]}
       type="button"
-      role="radio"
-      aria-checked={isSelected}
-      tabindex={isSelected ? 0 : -1}
-      class="segmented-btn {isSelected ? 'selected' : ''}"
-      onclick={() => select(opt.value)}
-      onkeydown={(e) => handleKeydown(e, i)}
+      class="segmented-btn"
+      class:active={it.id === activeId}
+      class:selected={it.id === activeId}
+      onclick={() => select(it.id)}
     >
-      {opt.label}
+      {it.label}
     </button>
   {/each}
 </div>
 
 <style>
-  .segmented-control {
+  .seg {
     position: relative;
     display: inline-flex;
-    align-items: center;
-    background: var(--fill-1);
-    border-radius: 9px;
     padding: 3px;
-    height: 28px;
+    background: var(--fill-1);
+    border-radius: 999px;
     box-sizing: border-box;
     user-select: none;
+    align-items: center;
   }
 
-  .segmented-thumb {
+  .pill {
     position: absolute;
     top: 3px;
     bottom: 3px;
-    left: 3px;
-    border-radius: 7px;
+    left: 0;
+    border-radius: 999px;
     background: var(--surface-raised);
     box-shadow: var(--shadow-1);
-    transition: transform var(--dur-base) var(--ease-standard);
     pointer-events: none;
-    z-index: 1;
+    z-index: 0;
   }
 
-  .segmented-btn {
+  .pill.ready {
+    transition: transform 260ms cubic-bezier(.3, .7, .2, 1), width 260ms cubic-bezier(.3, .7, .2, 1);
+  }
+
+  .seg button {
     position: relative;
-    z-index: 2;
-    flex: 1;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    height: 100%;
-    padding: 0 12px;
+    z-index: 1;
+    padding: 6px 16px;
+    white-space: nowrap;
     border: none;
     background: transparent;
     color: var(--text-2);
@@ -108,32 +126,34 @@
     font-weight: 500;
     line-height: var(--text-lh-body);
     cursor: pointer;
-    border-radius: 7px;
+    border-radius: 999px;
     outline: none;
-    white-space: nowrap;
     transition: color var(--dur-fast) var(--ease-standard);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
 
-  .segmented-btn:focus-visible {
+  .seg button:focus-visible {
     box-shadow: 0 0 0 2px var(--focus-ring);
   }
 
-  .segmented-btn.selected {
+  .seg button.active,
+  .seg button.selected {
     color: var(--text-1);
     font-weight: 600;
   }
 
-  /* Glass mode capsules (§8.1 #2) */
-  .appearance-glass.segmented-control {
-    border-radius: var(--r-pill);
+  /* Glass look */
+  .appearance-glass.seg {
     background: rgba(0, 0, 0, 0.08);
   }
-  .appearance-glass .segmented-thumb {
-    border-radius: var(--r-pill);
+  .appearance-glass .pill {
     background: rgba(255, 255, 255, 0.28);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
   }
-  .appearance-glass .segmented-btn.selected {
+  .appearance-glass.seg button.active,
+  .appearance-glass.seg button.selected {
     color: var(--glass-fg, #ffffff);
   }
 </style>

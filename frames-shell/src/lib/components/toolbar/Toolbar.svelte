@@ -116,6 +116,55 @@
           options={libraryViewOptions}
           bind:value={librarySubView}
         />
+
+        {#if librarySubView === 'all'}
+          <div class="sub-divider"></div>
+
+          <!-- Zoom Slider -->
+          <div class="zoom-slider-wrap" title="Zoom">
+            <Icon name="zoom-out" size={12} />
+            <Slider
+              min={0}
+              max={5}
+              step={1}
+              bind:value={zoomLevelIndex}
+              width="68px"
+            />
+            <Icon name="zoom-in" size={12} />
+          </div>
+
+          <div class="sub-divider"></div>
+
+          <!-- Fill / Fit toggle -->
+          <Button
+            variant="icon"
+            title={isFill ? 'Fill (Square crops)' : 'Fit (Aspect ratio)'}
+            active={!isFill}
+            onclick={() => (isFill = !isFill)}
+          >
+            <Icon name={isFill ? 'fill' : 'fit'} size={14} />
+          </Button>
+
+          <div class="sub-divider"></div>
+
+          <!-- Filter menu -->
+          <div class="relative-wrap">
+            <Button
+              variant="icon"
+              title="Filter Library"
+              active={filter !== 'all'}
+              onclick={() => (filterMenuOpen = !filterMenuOpen)}
+            >
+              <Icon name="filter" size={14} />
+            </Button>
+            <Menu
+              items={filterOptions}
+              bind:open={filterMenuOpen}
+              onselect={handleFilterSelect}
+              style="top: 36px; right: 0;"
+            />
+          </div>
+        {/if}
       {:else}
         <h1 class="cluster-page-title">{pageTitle}</h1>
       {/if}
@@ -123,48 +172,6 @@
 
     <!-- Right Cluster -->
     <Surface kind="cluster" class="toolbar-cluster right-cluster">
-      {#if currentRoute === 'library' && librarySubView === 'all'}
-        <!-- 96px Zoom Slider (§4.2) -->
-        <div class="zoom-slider-wrap">
-          <Icon name="zoom-out" size={13} />
-          <Slider
-            min={0}
-            max={5}
-            step={1}
-            bind:value={zoomLevelIndex}
-            width="80px"
-          />
-          <Icon name="zoom-in" size={13} />
-        </div>
-
-        <!-- Fill / Fit toggle -->
-        <Button
-          variant="icon"
-          title={isFill ? 'Fill (Square crops)' : 'Fit (Aspect ratio)'}
-          active={!isFill}
-          onclick={() => (isFill = !isFill)}
-        >
-          <Icon name={isFill ? 'fill' : 'fit'} size={15} />
-        </Button>
-
-        <!-- Filter menu -->
-        <div class="relative-wrap">
-          <Button
-            variant="icon"
-            title="Filter Library"
-            active={filter !== 'all'}
-            onclick={() => (filterMenuOpen = !filterMenuOpen)}
-          >
-            <Icon name="filter" size={15} />
-          </Button>
-          <Menu
-            items={filterOptions}
-            bind:open={filterMenuOpen}
-            onselect={handleFilterSelect}
-            style="top: 36px; right: 0;"
-          />
-        </div>
-      {/if}
 
       <!-- Selection / Open photo actions (§4.2) -->
       <Button
@@ -280,56 +287,69 @@
 
     <div class="toolbar-section toolbar-center">
       {#if currentRoute === 'library'}
-        <SegmentedControl
-          options={libraryViewOptions}
-          bind:value={librarySubView}
-        />
+        <div class="view-controls-wrapper">
+          <SegmentedControl
+            options={libraryViewOptions}
+            bind:value={librarySubView}
+          />
+
+          {#if librarySubView === 'all'}
+            <div class="grid-controls-group">
+              <!-- Zoom Slider -->
+              <div class="zoom-slider-wrap" title="Zoom">
+                <Icon name="zoom-out" size={12} />
+                <Slider
+                  min={0}
+                  max={5}
+                  step={1}
+                  bind:value={zoomLevelIndex}
+                  width="68px"
+                />
+                <Icon name="zoom-in" size={12} />
+              </div>
+
+              <div class="sub-divider"></div>
+
+              <!-- Fill / Fit toggle -->
+              <Button
+                variant="icon"
+                title={isFill ? 'Fill (Square crops)' : 'Fit (Aspect ratio)'}
+                active={!isFill}
+                onclick={() => (isFill = !isFill)}
+                class="grid-control-btn"
+              >
+                <Icon name={isFill ? 'fill' : 'fit'} size={14} />
+              </Button>
+
+              <div class="sub-divider"></div>
+
+              <!-- Filter menu -->
+              <div class="relative-wrap">
+                <Button
+                  variant="icon"
+                  title="Filter Library"
+                  active={filter !== 'all'}
+                  onclick={() => (filterMenuOpen = !filterMenuOpen)}
+                  class="grid-control-btn"
+                >
+                  <Icon name="filter" size={14} />
+                </Button>
+                <Menu
+                  items={filterOptions}
+                  bind:open={filterMenuOpen}
+                  onselect={handleFilterSelect}
+                  style="top: 36px; right: 0;"
+                />
+              </div>
+            </div>
+          {/if}
+        </div>
       {:else}
         <h1 class="standard-page-title">{pageTitle}</h1>
       {/if}
     </div>
 
     <div class="toolbar-section toolbar-right">
-      {#if currentRoute === 'library' && librarySubView === 'all'}
-        <!-- 96px Zoom Slider (§4.2) -->
-        <div class="zoom-slider-wrap">
-          <Icon name="zoom-out" size={13} />
-          <Slider
-            min={0}
-            max={5}
-            step={1}
-            bind:value={zoomLevelIndex}
-            width="80px"
-          />
-          <Icon name="zoom-in" size={13} />
-        </div>
-
-        <Button
-          variant="icon"
-          title={isFill ? 'Fill (Square crops)' : 'Fit (Aspect ratio)'}
-          active={!isFill}
-          onclick={() => (isFill = !isFill)}
-        >
-          <Icon name={isFill ? 'fill' : 'fit'} size={15} />
-        </Button>
-
-        <div class="relative-wrap">
-          <Button
-            variant="icon"
-            title="Filter Library"
-            active={filter !== 'all'}
-            onclick={() => (filterMenuOpen = !filterMenuOpen)}
-          >
-            <Icon name="filter" size={15} />
-          </Button>
-          <Menu
-            items={filterOptions}
-            bind:open={filterMenuOpen}
-            onselect={handleFilterSelect}
-            style="top: 36px; right: 0;"
-          />
-        </div>
-      {/if}
 
       <!-- Selection / Open photo actions (§4.2) -->
       <Button
@@ -417,11 +437,23 @@
     left: 8px;
     right: 8px;
     height: var(--toolbar-h);
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
     align-items: center;
-    justify-content: space-between;
     pointer-events: none;
     z-index: 100;
+  }
+
+  :global(.left-cluster) {
+    justify-self: start;
+  }
+
+  :global(.center-cluster) {
+    justify-self: center;
+  }
+
+  :global(.right-cluster) {
+    justify-self: end;
   }
 
   :global(.toolbar-cluster) {
@@ -451,29 +483,71 @@
     left: 0;
     right: 0;
     height: var(--toolbar-h);
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
     align-items: center;
-    justify-content: space-between;
     padding: 0 16px;
     z-index: 100;
     border-bottom: 1px solid transparent;
     transition: border-color var(--dur-base) var(--ease-standard);
+    box-sizing: border-box;
   }
 
   :global(.standard-toolbar.has-scrolled) {
     border-bottom-color: var(--separator);
   }
 
-  .toolbar-section {
+  .toolbar-left {
+    justify-self: start;
     display: flex;
     align-items: center;
     gap: 8px;
   }
 
   .toolbar-center {
-    position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
+    justify-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .toolbar-right {
+    justify-self: end;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .view-controls-wrapper {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .grid-controls-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    background: var(--fill-1, rgba(255, 255, 255, 0.08));
+    border-radius: var(--r-pill, 999px);
+    box-sizing: border-box;
+    height: 32px;
+    border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  }
+
+  .sub-divider {
+    width: 1px;
+    height: 16px;
+    background: var(--separator, rgba(255, 255, 255, 0.15));
+    margin: 0 4px;
+    flex-shrink: 0;
+  }
+
+  :global(.grid-control-btn) {
+    width: 26px !important;
+    height: 26px !important;
+    padding: 0 !important;
   }
 
   .standard-page-title {
@@ -498,6 +572,8 @@
 
   .relative-wrap {
     position: relative;
+    display: inline-flex;
+    align-items: center;
   }
 
   :global(.text-favorite) {

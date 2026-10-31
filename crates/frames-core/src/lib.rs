@@ -16,6 +16,7 @@ pub mod store;
 pub mod sync;
 pub mod trash;
 pub mod scan_local;
+pub mod thumbs;
 
 pub use store::MatchedAlbumFolder;
 

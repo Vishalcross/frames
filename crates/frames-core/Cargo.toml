@@ -8,6 +8,7 @@ description = "Frames core logic: bucket keys, dates, change-log types, local sc
 [dependencies]
 byteorder = "1"
 chrono = { version = "0.4", features = ["serde"] }
+dirs = "7"
 fastrand = "2"
 flate2 = "1"
 png = "0.18"

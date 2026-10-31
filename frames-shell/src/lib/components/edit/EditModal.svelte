@@ -4,6 +4,7 @@
   import Slider from '$lib/components/surface/Slider.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import { getThumbnailDataUrl } from '$lib/mock/mockRepo';
+  import { isTauriAvailable, getAssetUrl } from '$lib/services/tauriRepo';
   import type { Asset } from '$lib/types';
   import { theme } from '$lib/theme/engine.svelte';
 
@@ -89,7 +90,9 @@
     open = false;
   }
 
-  const previewUrl = $derived(getThumbnailDataUrl(asset, 'preview'));
+  const previewUrl = $derived(
+    isTauriAvailable() ? getAssetUrl('preview', asset.id) : getThumbnailDataUrl(asset, 'preview')
+  );
 </script>
 
 {#if open}

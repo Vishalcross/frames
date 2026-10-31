@@ -23,16 +23,14 @@
     infoPanelOpen = $bindable(false),
     isSidebarCollapsed = $bindable(false),
     isScrolled = false,
-    useRealBackend = false,
-    isTauri = false,
     onback,
     onforward,
     onshare,
     onfavorite,
     onrotate,
     onopenSettings,
-    ontogglebackend,
-    onimport
+    onimport,
+    onsync
   }: {
     currentRoute: string;
     librarySubView?: 'years' | 'months' | 'all';
@@ -48,16 +46,14 @@
     infoPanelOpen?: boolean;
     isSidebarCollapsed?: boolean;
     isScrolled?: boolean;
-    useRealBackend?: boolean;
-    isTauri?: boolean;
     onback?: () => void;
     onforward?: () => void;
     onshare?: () => void;
     onfavorite?: () => void;
     onrotate?: () => void;
     onopenSettings?: () => void;
-    ontogglebackend?: () => void;
     onimport?: () => void;
+    onsync?: () => void;
   } = $props();
 
   let filterMenuOpen = $state(false);
@@ -236,16 +232,14 @@
         </Button>
       {/if}
 
-      {#if ontogglebackend}
-        <button
-          type="button"
-          class="backend-mode-pill {useRealBackend ? 'is-sqlite' : 'is-benchmark'}"
-          title="Click to toggle between SQLite Core and 100k Benchmark fixture"
-          onclick={ontogglebackend}
+      {#if onsync}
+        <Button
+          variant="icon"
+          title="Sync with MEGA S4"
+          onclick={onsync}
         >
-          <span class="mode-dot"></span>
-          <span class="mode-label">{useRealBackend ? 'SQLite' : '100k'}</span>
-        </button>
+          <Icon name="cloud" size={15} />
+        </Button>
       {/if}
     </Surface>
   </header>
@@ -402,16 +396,14 @@
         </Button>
       {/if}
 
-      {#if ontogglebackend}
-        <button
-          type="button"
-          class="backend-mode-pill {useRealBackend ? 'is-sqlite' : 'is-benchmark'}"
-          title="Click to toggle between SQLite Core and 100k Benchmark fixture"
-          onclick={ontogglebackend}
+      {#if onsync}
+        <Button
+          variant="icon"
+          title="Sync with MEGA S4"
+          onclick={onsync}
         >
-          <span class="mode-dot"></span>
-          <span class="mode-label">{useRealBackend ? 'SQLite Core' : '100k Benchmark'}</span>
-        </button>
+          <Icon name="cloud" size={15} />
+        </Button>
       {/if}
     </div>
   </Surface>
@@ -510,45 +502,5 @@
 
   :global(.text-favorite) {
     color: var(--favorite) !important;
-  }
-
-  .backend-mode-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    height: 26px;
-    padding: 0 10px;
-    border-radius: var(--r-full);
-    border: 1px solid var(--separator);
-    background: var(--fill-1);
-    color: var(--text-2);
-    font-size: var(--text-size-caption);
-    font-weight: 500;
-    cursor: pointer;
-    user-select: none;
-    -webkit-user-select: none;
-    transition: all var(--dur-short) var(--ease-standard);
-  }
-
-  .backend-mode-pill:hover {
-    background: var(--fill-2);
-    color: var(--text-1);
-    border-color: var(--separator-strong);
-  }
-
-  .mode-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    transition: background var(--dur-short) var(--ease-standard);
-  }
-
-  .backend-mode-pill.is-sqlite .mode-dot {
-    background: var(--accent);
-    box-shadow: 0 0 6px var(--accent);
-  }
-
-  .backend-mode-pill.is-benchmark .mode-dot {
-    background: var(--text-3);
   }
 </style>

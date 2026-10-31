@@ -4,8 +4,8 @@
   import Surface from '$lib/components/surface/Surface.svelte';
   import Button from '$lib/components/surface/Button.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
-  import { getThumbnailDataUrl, getAssetByIndex } from '$lib/mock/mockRepo';
-  import { isTauriAvailable } from '$lib/services/tauriRepo';
+  import { getThumbnailDataUrl } from '$lib/mock/mockRepo';
+  import { isTauriAvailable, tauriRepo, getAssetUrl } from '$lib/services/tauriRepo';
   import { theme, focusAsset } from '$lib/theme/engine.svelte';
 
   let {
@@ -45,18 +45,17 @@
   // Rotation
   let rotationDeg = $state(0);
 
-  // Preload ±3 neighbours (§4.6)
-  const currentAssetIndex = $derived(parseInt(asset.id.replace('asset_', ''), 10) || 0);
+  const allAssets = $derived(tauriRepo.getAssets());
+  const currentAssetIndex = $derived.by(() => {
+    return allAssets.findIndex((a) => a.id === asset.id);
+  });
 
   const neighbours = $derived.by(() => {
-    const list: Asset[] = [];
-    for (let offset = -10; offset <= 10; offset++) {
-      const idx = currentAssetIndex + offset;
-      if (idx >= 0 && idx < 100_000) {
-        list.push(getAssetByIndex(idx));
-      }
-    }
-    return list;
+    if (allAssets.length === 0) return [asset];
+    if (currentAssetIndex < 0) return [asset];
+    const start = Math.max(0, currentAssetIndex - 10);
+    const end = Math.min(allAssets.length, currentAssetIndex + 11);
+    return allAssets.slice(start, end);
   });
 
   $effect(() => {
@@ -83,9 +82,10 @@
   }
 
   function navigate(direction: -1 | 1) {
+    if (currentAssetIndex < 0) return;
     const nextIdx = currentAssetIndex + direction;
-    if (nextIdx >= 0 && nextIdx < 100_000) {
-      asset = getAssetByIndex(nextIdx);
+    if (nextIdx >= 0 && nextIdx < allAssets.length) {
+      asset = allAssets[nextIdx];
     }
   }
 
@@ -165,14 +165,27 @@
   );
 
   let previewError = $state(false);
+  let fallbackPreviewUrl = $state<string | null>(null);
 
   const previewUrl = $derived.by(() => {
+    if (fallbackPreviewUrl) return fallbackPreviewUrl;
     if (previewError) return getThumbnailDataUrl(asset, 'preview');
     if (isTauriAvailable()) {
-      return `frames://preview/${asset.id}`;
+      return getAssetUrl('preview', asset.id);
     }
     return getThumbnailDataUrl(asset, 'preview');
   });
+
+  async function handlePreviewError() {
+    if (!fallbackPreviewUrl && isTauriAvailable()) {
+      const url = await tauriRepo.getThumbnailDataUrl(asset.id, true);
+      if (url) {
+        fallbackPreviewUrl = url;
+        return;
+      }
+    }
+    previewError = true;
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -370,7 +383,7 @@
               onclick={() => (asset = neighbour)}
             >
               <img
-                src={getThumbnailDataUrl(neighbour, 'thumb')}
+                src={isTauriAvailable() ? getAssetUrl('thumb', neighbour.id) : getThumbnailDataUrl(neighbour, 'thumb')}
                 alt=""
                 loading="lazy"
               />

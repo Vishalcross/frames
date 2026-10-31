@@ -2,7 +2,7 @@
   import Surface from '$lib/components/surface/Surface.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import SyncPopover from '$lib/components/dialogs/SyncPopover.svelte';
-  import { SAMPLE_ALBUMS, SAMPLE_PINNED_COLLECTIONS } from '$lib/mock/sampleData';
+  import type { AlbumItem } from '$lib/types';
   import { theme } from '$lib/theme/engine.svelte';
 
   let {
@@ -10,20 +10,30 @@
     currentAlbumId = $bindable(''),
     sidebarWidth = $bindable(240),
     isCollapsed = $bindable(false),
-    onnavigate
+    albums = [],
+    isSyncing = false,
+    outboxPending = 0,
+    onnavigate,
+    onsync
   }: {
     currentRoute: string;
     currentAlbumId?: string;
     sidebarWidth?: number;
     isCollapsed?: boolean;
+    albums?: AlbumItem[];
+    isSyncing?: boolean;
+    outboxPending?: number;
     onnavigate?: (route: string, extraId?: string) => void;
+    onsync?: () => void;
   } = $props();
 
   let syncPopoverOpen = $state(false);
   let syncPaused = $state(false);
-  let isUploading = $state(true);
-  let openFolders = $state<Record<string, boolean>>({ folder_vacations: true });
-  let pinned = $state([...SAMPLE_PINNED_COLLECTIONS]);
+  let openFolders = $state<Record<string, boolean>>({});
+  let pinned = $state([
+    { id: 'pin_recents', title: 'Recents', icon: 'clock', route: 'library' },
+    { id: 'pin_favs', title: 'Favorites', icon: 'heart', route: 'favorites' }
+  ]);
 
   // Resizing state
   let isResizing = $state(false);
@@ -194,50 +204,58 @@
       <!-- 4. My Albums Tree with Collapsible Folders (§4.1) -->
       <div class="sidebar-group">
         <div class="section-header">My albums</div>
-        {#each SAMPLE_ALBUMS as album}
-          {#if album.isFolder}
-            {@const isOpen = openFolders[album.id]}
-            <div class="album-folder">
+        {#if albums.length === 0}
+          <div class="empty-albums-notice">No albums in library</div>
+        {:else}
+          {#each albums as album}
+            {#if album.isFolder}
+              {@const isOpen = openFolders[album.id]}
+              <div class="album-folder">
+                <button
+                  type="button"
+                  class="sidebar-row folder-row"
+                  onclick={(e) => toggleFolder(album.id, e)}
+                >
+                  <span class="folder-chevron">
+                    <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={12} />
+                  </span>
+                  <span class="row-icon"><Icon name="folder" size={16} /></span>
+                  <span class="row-label">{album.title}</span>
+                </button>
+
+                {#if isOpen && album.children}
+                  <div class="folder-children">
+                    {#each album.children as child}
+                      <button
+                        type="button"
+                        class="sidebar-row {currentAlbumId === child.id ? 'selected' : ''}"
+                        onclick={() => navigate('album-detail', child.id)}
+                      >
+                        <span class="row-icon"><Icon name="album" size={16} /></span>
+                        <span class="row-label">{child.title}</span>
+                        {#if child.assetCount > 0}
+                          <span class="row-count">{child.assetCount}</span>
+                        {/if}
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {:else}
               <button
                 type="button"
-                class="sidebar-row folder-row"
-                onclick={(e) => toggleFolder(album.id, e)}
+                class="sidebar-row {currentAlbumId === album.id ? 'selected' : ''}"
+                onclick={() => navigate('album-detail', album.id)}
               >
-                <span class="folder-chevron">
-                  <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={12} />
-                </span>
-                <span class="row-icon"><Icon name="folder" size={16} /></span>
+                <span class="row-icon"><Icon name="album" size={16} /></span>
                 <span class="row-label">{album.title}</span>
+                {#if album.assetCount > 0}
+                  <span class="row-count">{album.assetCount}</span>
+                {/if}
               </button>
-
-              {#if isOpen && album.children}
-                <div class="folder-children">
-                  {#each album.children as child}
-                    <button
-                      type="button"
-                      class="sidebar-row {currentAlbumId === child.id ? 'selected' : ''}"
-                      onclick={() => navigate('album-detail', child.id)}
-                    >
-                      <span class="row-icon"><Icon name="album" size={16} /></span>
-                      <span class="row-label">{child.title}</span>
-                      <span class="row-count">{child.assetCount}</span>
-                    </button>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {:else}
-            <button
-              type="button"
-              class="sidebar-row {currentAlbumId === album.id ? 'selected' : ''}"
-              onclick={() => navigate('album-detail', album.id)}
-            >
-              <span class="row-icon"><Icon name="album" size={16} /></span>
-              <span class="row-label">{album.title}</span>
-              <span class="row-count">{album.assetCount}</span>
-            </button>
-          {/if}
-        {/each}
+            {/if}
+          {/each}
+        {/if}
       </div>
 
       <!-- 5. Utilities Section (§4.1) -->
@@ -296,16 +314,19 @@
       <button
         type="button"
         class="sync-pill-btn"
-        onclick={() => (syncPopoverOpen = !syncPopoverOpen)}
+        onclick={() => {
+          syncPopoverOpen = !syncPopoverOpen;
+          onsync?.();
+        }}
         aria-label="Cloud sync status"
       >
         <span class="sync-icon-wrap">
-          <Icon name={isUploading ? 'cloud-upload' : 'cloud'} size={15} />
+          <Icon name={isSyncing ? 'cloud-upload' : 'cloud'} size={15} />
         </span>
         <span class="sync-text">
-          {isUploading ? 'Uploading 128 of 4,201' : 'Up to date'}
+          {isSyncing ? 'Syncing with MEGA…' : outboxPending > 0 ? `Pending: ${outboxPending} items` : 'Up to date'}
         </span>
-        {#if isUploading}
+        {#if isSyncing}
           <div class="sync-progress-ring">
             <svg viewBox="0 0 16 16" width="14" height="14">
               <circle cx="8" cy="8" r="6" fill="none" stroke="var(--separator)" stroke-width="1.8" />
@@ -369,6 +390,13 @@
     display: flex;
     flex-direction: column;
     gap: 1px;
+  }
+
+  .empty-albums-notice {
+    font-size: var(--text-size-caption);
+    color: var(--text-3);
+    padding: 6px 12px;
+    font-style: italic;
   }
 
   .section-header {

@@ -463,6 +463,18 @@ fn fetch_original_unlocked(
 /// on a worker thread without holding `cache.lock()` across S4 downloads (Blocker 4).
 fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>>) -> Response<Vec<u8>> {
     let state = app.state::<AppState>();
+
+    // Support CORS preflight
+    if request.method() == tauri::http::Method::OPTIONS {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+            .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
+            .body(Vec::new())
+            .unwrap();
+    }
+
     let uri = request.uri();
     let raw_path = uri.path().trim_start_matches('/');
     let host = uri.host().unwrap_or("");
@@ -472,16 +484,17 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
         raw_path.to_string()
     };
 
-    let mut parts = combined.splitn(2, '/');
-    let kind = parts.next().unwrap_or("");
-    let id = parts.next().unwrap_or("").trim_end_matches('/');
-
-    if id.is_empty() {
+    let segments: Vec<&str> = combined.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
             .body(Vec::new())
             .unwrap();
     }
+
+    let kind = segments[0];
+    let id = segments[1];
 
     let s4_opt = state.require_s4().ok();
     let s4_ref = s4_opt.as_deref();
@@ -493,6 +506,8 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "image/webp")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
                         .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
                         .body(bytes)
                         .unwrap();
@@ -500,6 +515,7 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
             }
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .body(Vec::new())
                 .unwrap()
         }
@@ -509,6 +525,8 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "image/webp")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
                         .header(header::CACHE_CONTROL, "public, max-age=3600")
                         .body(bytes)
                         .unwrap();
@@ -516,6 +534,7 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
             }
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .body(Vec::new())
                 .unwrap()
         }
@@ -526,6 +545,7 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                     Err(_) => {
                         return Response::builder()
                             .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                             .body(Vec::new())
                             .unwrap()
                     }
@@ -535,6 +555,7 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
             let Some(detail) = detail_opt else {
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .body(Vec::new())
                     .unwrap();
             };
@@ -550,6 +571,8 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, mime)
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
                         .header(header::CACHE_CONTROL, "public, max-age=3600")
                         .body(bytes)
                         .unwrap();
@@ -562,17 +585,21 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "image/webp")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
                         .body(bytes)
                         .unwrap();
                 }
             }
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .body(Vec::new())
                 .unwrap()
         }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
             .body(Vec::new())
             .unwrap(),
     }
@@ -1523,6 +1550,27 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_uri_parsing_for_frames_protocol() {
+        let req1: tauri::http::Request<Vec<u8>> = tauri::http::Request::builder()
+            .uri("frames://thumb/317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d")
+            .body(Vec::new())
+            .unwrap();
+        let uri1 = req1.uri();
+        let raw_path1 = uri1.path().trim_start_matches('/');
+        let host1 = uri1.host().unwrap_or("");
+        println!("REQ1: host='{host1}', path='{}', raw_path='{raw_path1}'", uri1.path());
+
+        let req2: tauri::http::Request<Vec<u8>> = tauri::http::Request::builder()
+            .uri("frames://localhost/thumb/317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d")
+            .body(Vec::new())
+            .unwrap();
+        let uri2 = req2.uri();
+        let raw_path2 = uri2.path().trim_start_matches('/');
+        let host2 = uri2.host().unwrap_or("");
+        println!("REQ2: host='{host2}', path='{}', raw_path='{raw_path2}'", uri2.path());
+    }
 
     #[test]
     fn app_state_initialises_in_isolated_temp_dir_and_rejects_unconfigured_real_s4() {

@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from '$lib/components/icons/Icon.svelte';
+  import { isTauriAvailable } from '$lib/services/tauriRepo';
 
   let {
     isMac = true,
@@ -23,34 +24,39 @@
       platformIsMac = isMac !== undefined ? isMac : navigator.platform.toUpperCase().indexOf('MAC') >= 0;
     }
   });
+
+  async function handleWinClose() {
+    if (onclose) return onclose();
+    if (isTauriAvailable()) {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      getCurrentWindow().close();
+    }
+  }
+
+  async function handleWinMinimize() {
+    if (onminimize) return onminimize();
+    if (isTauriAvailable()) {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      getCurrentWindow().minimize();
+    }
+  }
+
+  async function handleWinMaximize() {
+    if (onmaximize) return onmaximize();
+    if (isTauriAvailable()) {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      getCurrentWindow().toggleMaximize();
+    }
+  }
 </script>
 
 <div class="window-titlebar {platformIsMac ? 'is-mac' : 'is-win'}" data-tauri-drag-region>
   {#if platformIsMac}
-    <!-- macOS Inset Traffic Lights (§2, §3) -->
-    <div class="mac-traffic-lights" aria-label="Window controls">
-      <button
-        type="button"
-        class="traffic-light close"
-        aria-label="Close"
-        onclick={onclose}
-        tabindex="-1"
-      ></button>
-      <button
-        type="button"
-        class="traffic-light minimize"
-        aria-label="Minimize"
-        onclick={onminimize}
-        tabindex="-1"
-      ></button>
-      <button
-        type="button"
-        class="traffic-light zoom"
-        aria-label="Zoom"
-        onclick={onmaximize}
-        tabindex="-1"
-      ></button>
-    </div>
+    <!-- macOS Inset Traffic Lights Spacer (§2, §3):
+         Native macOS traffic lights are positioned by the OS via titleBarStyle: Overlay.
+         We provide an empty 78px spacer with drag region so the window stays draggable
+         and no duplicate synthetic buttons are drawn over or under native buttons. -->
+    <div class="mac-traffic-spacer" data-tauri-drag-region></div>
   {:else}
     <!-- Windows Title & 32px Drag Region with Custom Caption Buttons (§2) -->
     <div class="win-drag-region" data-tauri-drag-region>
@@ -62,7 +68,7 @@
         type="button"
         class="win-caption-btn"
         aria-label="Minimize"
-        onclick={onminimize}
+        onclick={handleWinMinimize}
         tabindex="-1"
       >
         <Icon name="minus" size={10} stroke={2} />
@@ -71,7 +77,7 @@
         type="button"
         class="win-caption-btn"
         aria-label="Maximize"
-        onclick={onmaximize}
+        onclick={handleWinMaximize}
         tabindex="-1"
       >
         <Icon name="square" size={9} stroke={2} />
@@ -80,7 +86,7 @@
         type="button"
         class="win-caption-btn win-close"
         aria-label="Close"
-        onclick={onclose}
+        onclick={handleWinClose}
         tabindex="-1"
       >
         <Icon name="x" size={11} stroke={2} />
@@ -104,40 +110,12 @@
     -webkit-app-region: drag;
   }
 
-  /* macOS Traffic Lights */
-  .mac-traffic-lights {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding-left: 14px;
+  /* macOS Traffic Lights Spacer */
+  .mac-traffic-spacer {
+    width: 78px;
     height: 100%;
     pointer-events: auto;
-    -webkit-app-region: no-drag;
-  }
-
-  .traffic-light {
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    border: 0.5px solid rgba(0, 0, 0, 0.15);
-    padding: 0;
-    cursor: pointer;
-    outline: none;
-    transition: filter var(--dur-fast) var(--ease-standard);
-  }
-
-  .traffic-light.close {
-    background: #ff5f56;
-  }
-  .traffic-light.minimize {
-    background: #ffbd2e;
-  }
-  .traffic-light.zoom {
-    background: #27c93f;
-  }
-
-  .traffic-light:hover {
-    filter: brightness(0.9);
+    -webkit-app-region: drag;
   }
 
   /* Windows Caption Buttons */

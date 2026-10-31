@@ -2,14 +2,14 @@
   import { onMount, tick } from 'svelte';
   import Tile from './Tile.svelte';
   import type { Asset, AssetRepo, Query } from '$lib/types';
-  import { mockRepo } from '$lib/mock/mockRepo';
+  import { tauriRepo } from '$lib/services/tauriRepo';
   import { focusAsset } from '$lib/theme/engine.svelte';
 
   const ZOOM_TARGETS = [64, 96, 128, 176, 240, 320];
 
   let {
     query = {},
-    repo = mockRepo,
+    repo = tauriRepo,
     zoomLevelIndex = $bindable(2),
     isFill = $bindable(true),
     selectedIds = $bindable<Set<string>>(new Set()),

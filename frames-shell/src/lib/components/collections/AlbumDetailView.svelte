@@ -1,13 +1,12 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import VirtualGrid from '$lib/components/grid/VirtualGrid.svelte';
-  import type { AlbumItem, Asset, Query } from '$lib/types';
-  import { getAssetByIndex, getThumbnailDataUrl } from '$lib/mock/mockRepo';
+  import type { AlbumItem, Asset, Query, AssetRepo } from '$lib/types';
+  import { tauriRepo, getAssetUrl, isTauriAvailable } from '$lib/services/tauriRepo';
   import { focusAsset } from '$lib/theme/engine.svelte';
 
   let {
     album,
-    repo,
+    repo = tauriRepo,
     zoomLevelIndex = $bindable(2),
     isFill = $bindable(true),
     selectedIds = $bindable<Set<string>>(new Set()),
@@ -15,7 +14,7 @@
     onselectionchange
   }: {
     album: AlbumItem;
-    repo?: any;
+    repo?: AssetRepo;
     zoomLevelIndex?: number;
     isFill?: boolean;
     selectedIds?: Set<string>;
@@ -23,20 +22,24 @@
     onselectionchange?: (ids: Set<string>) => void;
   } = $props();
 
-  let scrollContainer: HTMLDivElement | null = $state(null);
-  let scrollY = $state(0);
+  let heroFallback = $state<string | null>(null);
 
-  const keyAssetIdx = $derived(parseInt(album.keyAssetId.replace('asset_', ''), 10) || 0);
-  const keyAsset = $derived(getAssetByIndex(keyAssetIdx));
-  const heroThumb = $derived(getThumbnailDataUrl(keyAsset, 'preview'));
+  const heroThumb = $derived(
+    heroFallback || (album.keyAssetId ? getAssetUrl('preview', album.keyAssetId) : '')
+  );
 
   $effect(() => {
-    if (keyAsset) {
-      // Key photo drives the palette on collection/album detail page (§7.6 #2)
-      focusAsset(keyAsset.id, {
-        source: 'collection',
-        swatches: keyAsset.palette || undefined,
-        lum: keyAsset.lum || undefined
+    if (album.keyAssetId && isTauriAvailable()) {
+      tauriRepo.getThumbnailDataUrl(album.keyAssetId, true).then((url) => {
+        if (url) heroFallback = url;
+      });
+    }
+  });
+
+  $effect(() => {
+    if (album.keyAssetId) {
+      focusAsset(album.keyAssetId, {
+        source: 'collection'
       });
     }
   });
@@ -45,32 +48,28 @@
     scope: 'album',
     albumId: album.id
   });
-
-  function handleScroll(e: Event) {
-    const target = e.target as HTMLDivElement;
-    scrollY = target.scrollTop;
-  }
 </script>
 
-<div class="album-detail-container" onscroll={handleScroll}>
-  <!-- Ambient Hero with parallax 0.4 (§4.9) -->
+<div class="album-detail-container">
+  <!-- Ambient Hero with parallax (§4.9) -->
   <div class="album-hero-wrap">
-    <div
-      class="hero-ambient-bg"
-      style="
-        background-image: url({heroThumb});
-        transform: translateY({scrollY * 0.4}px);
-      "
-      aria-hidden="true"
-    ></div>
+    {#if heroThumb}
+      <div
+        class="hero-ambient-bg"
+        style="background-image: url({heroThumb});"
+        aria-hidden="true"
+      ></div>
+    {/if}
 
     <div class="hero-scrim">
       <!-- Title in 34/40, date range, count (§4.9) -->
       <h1 class="hero-title">{album.title}</h1>
       <div class="hero-metadata">
-        <span>{album.dateRange}</span>
-        <span class="meta-dot">·</span>
-        <span>{album.assetCount.toLocaleString()} photos</span>
+        {#if album.dateRange}
+          <span>{album.dateRange}</span>
+          <span class="meta-dot">·</span>
+        {/if}
+        <span>{album.assetCount.toLocaleString()} {album.assetCount === 1 ? 'item' : 'items'}</span>
       </div>
     </div>
   </div>
@@ -93,68 +92,73 @@
   .album-detail-container {
     width: 100%;
     height: 100%;
-    overflow-y: auto;
-    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
     position: relative;
     box-sizing: border-box;
   }
 
   .album-hero-wrap {
     position: relative;
-    height: 320px;
     width: 100%;
+    height: 180px;
+    flex-shrink: 0;
     overflow: hidden;
     display: flex;
-    flex-direction: column;
-    justify-content: flex-end;
+    align-items: flex-end;
+    background: var(--fill-2);
   }
 
-  /* Parallax 0.4 ambient hero (§4.9) */
   .hero-ambient-bg {
     position: absolute;
     top: -40px;
     left: 0;
     right: 0;
-    height: 400px;
+    height: 320px;
     background-size: cover;
     background-position: center;
-    filter: brightness(0.75);
-    will-change: transform;
+    filter: brightness(0.65) blur(2px);
     pointer-events: none;
   }
 
   .hero-scrim {
     position: relative;
     z-index: 2;
-    padding: 24px 32px;
-    background: linear-gradient(to top, var(--bg-canvas) 0%, transparent 100%);
+    padding: 20px 32px;
+    background: linear-gradient(to top, var(--bg-canvas) 0%, rgba(0, 0, 0, 0.4) 60%, transparent 100%);
     color: var(--text-1);
+    width: 100%;
+    box-sizing: border-box;
   }
 
-  /* 34/40 bold title (§4.9) */
   .hero-title {
-    font-size: var(--text-size-hero-title);
-    line-height: var(--text-lh-hero-title);
+    font-size: 34px;
+    line-height: 40px;
     font-weight: 700;
-    margin: 0;
+    margin: 0 0 4px;
+    color: #ffffff;
     letter-spacing: -0.5px;
+    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
   }
 
   .hero-metadata {
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: var(--text-size-body);
-    color: var(--text-2);
-    margin-top: 4px;
-    font-weight: 500;
+    gap: 8px;
+    font-size: var(--text-size-caption);
+    color: rgba(255, 255, 255, 0.8);
   }
 
   .meta-dot {
-    opacity: 0.5;
+    opacity: 0.6;
   }
 
   .album-grid-wrap {
-    min-height: 800px;
+    position: relative;
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
   }
 </style>

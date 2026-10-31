@@ -3,17 +3,15 @@
   import Icon from '$lib/components/icons/Icon.svelte';
 
   let {
-    isTauri = false,
-    useRealBackend = true,
+    isTauri = true,
     onimport,
-    onseed,
-    ontogglebenchmark
+    onsync,
+    onseed
   }: {
     isTauri?: boolean;
-    useRealBackend?: boolean;
     onimport?: () => void;
+    onsync?: () => void;
     onseed?: () => void;
-    ontogglebenchmark?: () => void;
   } = $props();
 </script>
 
@@ -25,30 +23,26 @@
 
     <h2 class="empty-title">No Photos or Videos</h2>
     <p class="empty-desc">
-      {#if isTauri}
-        Connected to Rust SQLite Core. Import local photos or folders from your computer, or seed sample data with real EXIF & thumbnails.
-      {:else}
-        Your library is empty. Drag and drop image files or folders from your computer to begin.
-      {/if}
+      Connected to Rust SQLite Core. Sync your MEGA S4 cloud album, import local folders, or drop photos and videos directly into the app.
     </p>
 
     <div class="actions-row">
-      <Button variant="accent" onclick={onimport}>
-        <Icon name="arrow-down-to-line" size={15} />
-        <span>Import Photos…</span>
-      </Button>
-
-      {#if isTauri && onseed}
-        <Button variant="standard" onclick={onseed}>
-          <Icon name="sparkles" size={15} />
-          <span>Seed SQLite Library</span>
+      {#if onsync}
+        <Button variant="accent" onclick={onsync}>
+          <Icon name="cloud" size={15} />
+          <span>Sync MEGA S4 Album</span>
         </Button>
       {/if}
 
-      {#if ontogglebenchmark}
-        <Button variant="ghost" onclick={ontogglebenchmark}>
-          <Icon name="layers" size={15} />
-          <span>{useRealBackend ? 'View 100k Benchmark' : 'Back to SQLite Core'}</span>
+      <Button variant="standard" onclick={onimport}>
+        <Icon name="arrow-down-to-line" size={15} />
+        <span>Import Local Photos…</span>
+      </Button>
+
+      {#if onseed}
+        <Button variant="ghost" onclick={onseed}>
+          <Icon name="sparkles" size={15} />
+          <span>Seed Demo SQLite Data</span>
         </Button>
       {/if}
     </div>

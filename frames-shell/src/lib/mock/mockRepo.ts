@@ -212,9 +212,9 @@ export function getThumbnailDataUrl(asset: Asset, size: 'thumb' | 'preview' | 'o
   const s2 = p[1] || { l: 0.4, c: 0.12, h: 40, pop: 0.5 };
   const s3 = p[2] || { l: 0.7, c: 0.10, h: 140, pop: 0.3 };
 
-  const c1 = `oklch(${(s1.l * 100).toFixed(0)}% ${s1.c.toFixed(2)} ${s1.h.toFixed(0)})`;
-  const c2 = `oklch(${(s2.l * 100).toFixed(0)}% ${s2.c.toFixed(2)} ${s2.h.toFixed(0)})`;
-  const c3 = `oklch(${(s3.l * 100).toFixed(0)}% ${s3.c.toFixed(2)} ${s3.h.toFixed(0)})`;
+  const c1 = `hsl(${Math.round(s1.h)}, ${Math.min(100, Math.round(s1.c * 250))}%, ${Math.round(s1.l * 100)}%)`;
+  const c2 = `hsl(${Math.round(s2.h)}, ${Math.min(100, Math.round(s2.c * 250))}%, ${Math.round(s2.l * 100)}%)`;
+  const c3 = `hsl(${Math.round(s3.h)}, ${Math.min(100, Math.round(s3.c * 250))}%, ${Math.round(s3.l * 100)}%)`;
 
   const w = size === 'thumb' ? 256 : size === 'preview' ? 1024 : asset.w;
   const h = Math.round((w * asset.h) / asset.w);

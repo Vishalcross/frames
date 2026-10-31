@@ -4,7 +4,7 @@
   import Button from '$lib/components/surface/Button.svelte';
   import Badge from '$lib/components/surface/Badge.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
-  import { mockRepo } from '$lib/mock/mockRepo';
+  import { tauriRepo } from '$lib/services/tauriRepo';
   import type { Asset, AssetDetail } from '$lib/types';
   import { theme } from '$lib/theme/engine.svelte';
 
@@ -24,7 +24,7 @@
 
   $effect(() => {
     if (asset) {
-      mockRepo.detail(asset.id).then((d) => {
+      tauriRepo.detail(asset.id).then((d) => {
         detail = d;
         captionText = d.caption;
       });
@@ -35,7 +35,7 @@
     isEditingCaption = false;
     if (detail) {
       detail.caption = captionText;
-      mockRepo.updateCaption(asset.id, captionText);
+      tauriRepo.updateCaption(asset.id, captionText);
     }
   }
 

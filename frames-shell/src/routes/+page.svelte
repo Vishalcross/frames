@@ -35,17 +35,18 @@
 
   import { theme, initThemeEngine, cycleAppearance } from '$lib/theme/engine.svelte';
   import { startPerformanceGovernor } from '$lib/theme/glass';
-  import { mockRepo, getAssetByIndex } from '$lib/mock/mockRepo';
   import { tauriRepo, isTauriAvailable } from '$lib/services/tauriRepo';
   import { invoke } from '@tauri-apps/api/core';
-  import { SAMPLE_ALBUMS } from '$lib/mock/sampleData';
   import type { AlbumItem, Asset, Query } from '$lib/types';
 
-  // Backend state (Milestone M6 bridge)
+  // Real Backend State
   const isTauri = isTauriAvailable();
-  let useRealBackend = $state(isTauri);
   let gridKey = $state(0);
-  const activeRepo = $derived(useRealBackend ? tauriRepo : mockRepo);
+  let albums = $state<AlbumItem[]>([]);
+  let isSyncing = $state(false);
+  let outboxPending = $state(0);
+  let isOffline = $state(false);
+  const activeRepo = tauriRepo;
 
   // Navigation & View Routing State
   let currentRoute = $state('library');
@@ -80,20 +81,18 @@
 
   // Feedback State
   let toasts = $state<ToastMessage[]>([]);
-  let isOffline = $state(false);
 
   // Active Album lookup
   const activeAlbum = $derived.by<AlbumItem>(() => {
-    const found = SAMPLE_ALBUMS.find((a) => a.id === currentAlbumId);
+    const found = albums.find((a) => a.id === currentAlbumId);
     if (found) return found;
-    // Check children
-    for (const a of SAMPLE_ALBUMS) {
-      if (a.children) {
-        const c = a.children.find((ch) => ch.id === currentAlbumId);
-        if (c) return c;
-      }
-    }
-    return SAMPLE_ALBUMS[0];
+    return {
+      id: currentAlbumId,
+      title: 'Album',
+      assetCount: 0,
+      keyAssetId: '',
+      dateRange: ''
+    };
   });
 
   // Page title for Collections pages (§4.2)
@@ -146,25 +145,51 @@
     if (viewerOpen && activeViewerAsset) return activeViewerAsset.favorite;
     if (selectedIds.size === 1) {
       const firstId = Array.from(selectedIds)[0];
-      const idx = parseInt(firstId.replace('asset_', ''), 10) || 0;
-      return getAssetByIndex(idx).favorite;
+      const found = tauriRepo.getAssets().find((a) => a.id === firstId);
+      return found ? found.favorite : false;
     }
     return false;
   });
+
+  async function loadLibraryData() {
+    await tauriRepo.loadBootstrap();
+    albums = tauriRepo.getAlbums();
+    outboxPending = tauriRepo.outboxPending;
+    isOffline = tauriRepo.offline;
+    gridKey++;
+  }
+
+  async function handleSyncNow() {
+    isSyncing = true;
+    toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Syncing with MEGA S4 cloud…' }];
+    const rep = await tauriRepo.syncNow();
+    isSyncing = false;
+    await loadLibraryData();
+    if (rep?.error) {
+      toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Sync status: ${rep.error}` }];
+    } else if (rep) {
+      toasts = [
+        ...toasts,
+        {
+          id: Date.now().toString(),
+          type: 'info',
+          text: `Synced with MEGA S4 (${rep.batches_pulled ?? 0} pulled, ${rep.batches_pushed ?? 0} pushed)`
+        }
+      ];
+    }
+  }
 
   onMount(() => {
     const cleanupEngine = initThemeEngine();
     const cleanupGovernor = startPerformanceGovernor();
 
-    // Initialise Tauri SQLite bootstrap if running desktop
-    if (isTauri) {
-      tauriRepo.loadBootstrap().then(() => {
-        gridKey++;
-      });
-    }
-
     // Initial navigation entry
     navigationHistory.push({ route: 'library', albumId: '', subView: 'all' });
+
+    // Initialise real SQLite library and sync down any uploaded album from Mega S4
+    loadLibraryData().then(() => {
+      handleSyncNow();
+    });
 
     // Drag and drop listeners for OS files (§4.12)
     const handleDragEnter = (e: DragEvent) => {
@@ -292,8 +317,7 @@
     if (res.error) {
       toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: res.error }];
     } else {
-      useRealBackend = true;
-      gridKey++;
+      await loadLibraryData();
       toasts = [
         ...toasts,
         { id: Date.now().toString(), type: 'info', text: `Imported ${res.count} photos into SQLite database!` }
@@ -315,24 +339,10 @@
     }
     toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Writing sample records & WebP thumbnails to SQLite…' }];
     const count = await tauriRepo.seedDemoLibrary();
-    useRealBackend = true;
-    gridKey++;
+    await loadLibraryData();
     toasts = [
       ...toasts,
       { id: Date.now().toString(), type: 'info', text: `Seeded ${count} items with real EXIF & thumbnails into SQLite!` }
-    ];
-  }
-
-  function handleToggleBackend() {
-    useRealBackend = !useRealBackend;
-    gridKey++;
-    toasts = [
-      ...toasts,
-      {
-        id: Date.now().toString(),
-        type: 'info',
-        text: useRealBackend ? 'Switched data source: Rust SQLite Core' : 'Switched data source: 100,000 Item Benchmark Fixture'
-      }
     ];
   }
 
@@ -391,7 +401,11 @@
       bind:currentAlbumId
       bind:sidebarWidth
       bind:isCollapsed={isSidebarCollapsed}
+      {albums}
+      {isSyncing}
+      {outboxPending}
       onnavigate={navigate}
+      onsync={handleSyncNow}
     />
 
     <!-- Main Content Area -->
@@ -412,16 +426,14 @@
         bind:infoPanelOpen
         bind:isSidebarCollapsed
         {isScrolled}
-        {useRealBackend}
-        {isTauri}
         onback={goBack}
         onforward={goForward}
         onshare={handleShare}
         onfavorite={handleFavorite}
         onrotate={handleRotate}
         onopenSettings={() => (settingsOpen = true)}
-        ontogglebackend={handleToggleBackend}
         onimport={handlePickFolderAndImport}
+        onsync={handleSyncNow}
       />
 
       <!-- Scroll edge blur effect (§8.1 #3) -->
@@ -459,6 +471,7 @@
         {:else if currentRoute === 'collections'}
           <!-- Collections Landing Rails (§4.9) -->
           <CollectionsView
+            {albums}
             onnavigatealbum={(id) => navigate('album-detail', id)}
             onnavigateroute={(r) => navigate(r)}
           />
@@ -484,10 +497,9 @@
         {:else if currentRoute === 'imports'}
           <EmptyLibraryView
             {isTauri}
-            {useRealBackend}
             onimport={handlePickFolderAndImport}
+            onsync={handleSyncNow}
             onseed={handleSeedDemo}
-            ontogglebenchmark={handleToggleBackend}
           />
         {:else}
           <!-- Generic Filtered Grid for Favorites, Videos, Hidden, Captured by Me -->
@@ -517,12 +529,14 @@
 
     <!-- Info Panel (320px, pushes in Standard/Adaptive, floats in Glass, §4.7) -->
     {#if infoPanelOpen}
-      {@const sampleAsset = activeViewerAsset || getAssetByIndex(0)}
-      <InfoPanel
-        asset={sampleAsset}
-        bind:open={infoPanelOpen}
-        onclose={() => (infoPanelOpen = false)}
-      />
+      {@const sampleAsset = activeViewerAsset || tauriRepo.getAssets()[0]}
+      {#if sampleAsset}
+        <InfoPanel
+          asset={sampleAsset}
+          bind:open={infoPanelOpen}
+          onclose={() => (infoPanelOpen = false)}
+        />
+      {/if}
     {/if}
   </div>
 
@@ -583,8 +597,7 @@
         toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Importing ${paths.length} items into SQLite…` }];
         try {
           const res = await invoke<any>('import_from_paths', { paths, albumId: null });
-          await tauriRepo.loadBootstrap();
-          gridKey++;
+          await loadLibraryData();
           toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Successfully imported ${res.imported_count || paths.length} items!` }];
         } catch (e: any) {
           toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: `Import failed: ${e?.toString() || e}` }];

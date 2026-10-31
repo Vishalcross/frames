@@ -1,6 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Asset, AssetDetail, AssetRepo, Query } from '$lib/types';
-import { getThumbnailDataUrl, mockRepo } from '$lib/mock/mockRepo';
+import type { Asset, AssetDetail, AssetRepo, Query, AlbumItem } from '$lib/types';
 
 /**
  * Tauri 2 Native Backend Bridge (Milestone M6)
@@ -30,26 +29,30 @@ export interface BackendAlbumSummary {
   key_asset_id: string | null;
 }
 
+export interface BackendMonthGroup {
+  year: number;
+  month: number;
+  count: number;
+  key_asset_id: string;
+}
+
+export interface BackendTrashItem {
+  id: string;
+  filename: string;
+  trashed_at: string;
+  expires_at: string;
+  days_remaining: number;
+}
+
 export interface BackendBootstrap {
   device_id: string;
   timeline: {
     assets: BackendAssetSummary[];
-    month_groups: {
-      year: number;
-      month: number;
-      count: number;
-      key_asset_id: string;
-    }[];
+    month_groups: BackendMonthGroup[];
   };
   albums: BackendAlbumSummary[];
   trash: {
-    items: {
-      id: string;
-      filename: string;
-      trashed_at: string;
-      expires_at: string;
-      days_remaining: number;
-    }[];
+    items: BackendTrashItem[];
     summary: {
       total_items: number;
       total_bytes: number;
@@ -68,6 +71,17 @@ export function isTauriAvailable(): boolean {
   return Boolean(
     (window as any).__TAURI_INTERNALS__ || (window as any).__TAURI__
   );
+}
+
+/**
+ * Canonical custom protocol URL for an asset (§2: frames://localhost/{kind}/{id})
+ */
+export function getAssetUrl(
+  kind: 'thumb' | 'preview' | 'original',
+  id: string
+): string {
+  if (!id) return '';
+  return `frames://localhost/${kind}/${encodeURIComponent(id)}`;
 }
 
 export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
@@ -105,13 +119,50 @@ export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
 
 export class TauriAssetRepo implements AssetRepo {
   private cachedAssets: Asset[] = [];
+  private cachedAlbums: AlbumItem[] = [];
+  private monthGroups: BackendMonthGroup[] = [];
+  private trashItems: BackendTrashItem[] = [];
+  private thumbDataUrlCache = new Map<string, string>();
   private isLoaded = false;
+  public isSyncing = false;
+  public outboxPending = 0;
+  public offline = false;
+  public deviceId = '';
+
+  async getThumbnailDataUrl(id: string, preview = false): Promise<string | null> {
+    const cacheKey = `${preview ? 'p' : 's'}:${id}`;
+    if (this.thumbDataUrlCache.has(cacheKey)) {
+      return this.thumbDataUrlCache.get(cacheKey)!;
+    }
+    if (!isTauriAvailable()) return null;
+    try {
+      const url = await invoke<string | null>('get_thumbnail_data_url', { id, preview });
+      if (url) {
+        this.thumbDataUrlCache.set(cacheKey, url);
+      }
+      return url;
+    } catch {
+      return null;
+    }
+  }
 
   async loadBootstrap(): Promise<BackendBootstrap | null> {
     if (!isTauriAvailable()) return null;
     try {
       const data = await invoke<BackendBootstrap>('get_app_bootstrap');
+      this.deviceId = data.device_id;
       this.cachedAssets = (data.timeline.assets || []).map(backendSummaryToAsset);
+      this.cachedAlbums = (data.albums || []).map((a) => ({
+        id: a.id,
+        title: a.name,
+        assetCount: a.asset_count,
+        keyAssetId: a.key_asset_id || (this.cachedAssets[0]?.id ?? ''),
+        dateRange: ''
+      }));
+      this.monthGroups = data.timeline.month_groups || [];
+      this.trashItems = data.trash?.items || [];
+      this.outboxPending = data.outbox_pending || 0;
+      this.offline = data.offline || false;
       this.isLoaded = true;
       return data;
     } catch (e) {
@@ -120,29 +171,134 @@ export class TauriAssetRepo implements AssetRepo {
     }
   }
 
-  async count(q: Query): Promise<number> {
-    if (!isTauriAvailable()) {
-      return mockRepo.count(q);
+  getAssets(): Asset[] {
+    return this.cachedAssets;
+  }
+
+  getAlbums(): AlbumItem[] {
+    return this.cachedAlbums;
+  }
+
+  getMonthGroups(): BackendMonthGroup[] {
+    return this.monthGroups;
+  }
+
+  getTrashItems(): BackendTrashItem[] {
+    return this.trashItems;
+  }
+
+  getYears(): number[] {
+    const yearsSet = new Set<number>();
+    for (const mg of this.monthGroups) {
+      yearsSet.add(mg.year);
     }
+    for (const a of this.cachedAssets) {
+      if (a.year) yearsSet.add(a.year);
+    }
+    if (yearsSet.size === 0) return [new Date().getFullYear()];
+    return Array.from(yearsSet).sort((a, b) => b - a);
+  }
+
+  async getAlbumAssets(albumId: string): Promise<Asset[]> {
+    if (!isTauriAvailable()) return [];
+    try {
+      const list = await invoke<BackendAssetSummary[]>('get_album_assets', { albumId });
+      return list.map(backendSummaryToAsset);
+    } catch (e) {
+      console.warn('Failed to get album assets:', e);
+      return [];
+    }
+  }
+
+  async count(q: Query): Promise<number> {
     if (!this.isLoaded) {
       await this.loadBootstrap();
+    }
+    if (q.scope === 'album' && q.albumId) {
+      const alb = this.cachedAlbums.find((a) => a.id === q.albumId);
+      if (alb) return alb.assetCount;
+      const list = await this.getAlbumAssets(q.albumId);
+      return list.length;
+    }
+    if (q.search || q.filter || q.year) {
+      const items = await this.range(q, 0, 10000);
+      return items.length;
     }
     return this.cachedAssets.length;
   }
 
   async range(q: Query, from: number, n: number): Promise<Asset[]> {
-    if (!isTauriAvailable()) {
-      return mockRepo.range(q, from, n);
-    }
     if (!this.isLoaded) {
       await this.loadBootstrap();
     }
-    return this.cachedAssets.slice(from, from + n);
+
+    let list: Asset[] = this.cachedAssets;
+
+    if (q.scope === 'album' && q.albumId) {
+      list = await this.getAlbumAssets(q.albumId);
+    } else if (q.search && q.search.trim()) {
+      try {
+        const found = await invoke<BackendAssetSummary[]>('search_assets', {
+          filter: {
+            text: q.search.trim(),
+            album_id: null,
+            year: null,
+            month: null,
+            camera: null,
+            kind: null,
+            file_ext: null
+          }
+        });
+        list = found.map(backendSummaryToAsset);
+      } catch {
+        const needle = q.search.trim().toLowerCase();
+        list = this.cachedAssets.filter((a) =>
+          (a.title || '').toLowerCase().includes(needle)
+        );
+      }
+    } else if (q.filter === 'favorites') {
+      list = this.cachedAssets.filter((a) => a.favorite);
+    } else if (q.filter === 'videos') {
+      list = this.cachedAssets.filter((a) => a.kind === 'video');
+    } else if (q.filter === 'photos') {
+      list = this.cachedAssets.filter((a) => a.kind === 'photo');
+    } else if (q.year) {
+      list = this.cachedAssets.filter(
+        (a) => a.year === q.year && (!q.month || a.month === q.month)
+      );
+    }
+
+    return list.slice(from, from + n);
   }
 
   async detail(id: string): Promise<AssetDetail> {
     if (!isTauriAvailable()) {
-      return mockRepo.detail(id);
+      const a = this.cachedAssets.find((it) => it.id === id);
+      return {
+        record: a || {
+          id,
+          kind: 'photo',
+          takenAt: Date.now(),
+          w: 4032,
+          h: 3024,
+          thumbHash: id,
+          palette: null,
+          lum: 0.5,
+          favorite: false,
+          hidden: false,
+          originalLocal: true
+        },
+        caption: 'Local Photo',
+        camera: 'Camera',
+        lens: '24mm f/1.78',
+        exposure: 'f/1.8 · 1/120 · ISO 64',
+        dimensions: '4032 × 3024',
+        fileSize: '4.2 MB',
+        filename: a?.title || `${id}.jpg`,
+        locationName: 'Local Library',
+        albums: [],
+        keywords: ['photo']
+      };
     }
     try {
       const rawDetail = await invoke<any>('get_asset_detail', { id });
@@ -152,7 +308,7 @@ export class TauriAssetRepo implements AssetRepo {
         return {
           record: asset,
           caption: `Imported from ${r.key}`,
-          camera: `${r.camera_make || 'Apple'} ${r.camera_model || 'iPhone'}`,
+          camera: `${r.camera_make || 'Apple'} ${r.camera_model || 'Device'}`,
           lens: '24mm f/1.78',
           exposure: 'f/1.8 · 1/120 · ISO 64',
           dimensions: `${r.width || 4032} × ${r.height || 3024}`,
@@ -160,13 +316,37 @@ export class TauriAssetRepo implements AssetRepo {
           filename: r.filename,
           locationName: 'Local Storage',
           albums: (rawDetail.albums || []).map((a: any) => a.name),
-          keywords: [r.kind, r.container || 'heic']
+          keywords: [r.kind, r.container || 'jpg']
         };
       }
     } catch {
       // fallback
     }
-    return mockRepo.detail(id);
+    return {
+      record: this.cachedAssets.find((it) => it.id === id) || {
+        id,
+        kind: 'photo',
+        takenAt: Date.now(),
+        w: 4032,
+        h: 3024,
+        thumbHash: id,
+        palette: null,
+        lum: 0.5,
+        favorite: false,
+        hidden: false,
+        originalLocal: true
+      },
+      caption: '',
+      camera: 'Unknown',
+      lens: '',
+      exposure: '',
+      dimensions: '4032 × 3024',
+      fileSize: 'Unknown',
+      filename: `${id}.jpg`,
+      locationName: 'Local Library',
+      albums: [],
+      keywords: []
+    };
   }
 
   async updateFavorite(id: string, favorite: boolean): Promise<void> {
@@ -206,6 +386,62 @@ export class TauriAssetRepo implements AssetRepo {
     }
   }
 
+  // Cloud Sync with MEGA S4
+  async syncNow(): Promise<any> {
+    if (!isTauriAvailable()) return null;
+    try {
+      this.isSyncing = true;
+      const rep = await invoke<any>('sync_now');
+      await this.loadBootstrap();
+      this.isSyncing = false;
+      return rep;
+    } catch (e) {
+      this.isSyncing = false;
+      console.warn('Sync failed:', e);
+      return { error: String(e) };
+    }
+  }
+
+  // Album management
+  async createAlbum(name: string): Promise<AlbumItem[]> {
+    if (!isTauriAvailable()) return this.cachedAlbums;
+    try {
+      const raw = await invoke<BackendAlbumSummary[]>('create_album', { name });
+      this.cachedAlbums = raw.map((a) => ({
+        id: a.id,
+        title: a.name,
+        assetCount: a.asset_count,
+        keyAssetId: a.key_asset_id || '',
+        dateRange: ''
+      }));
+      return this.cachedAlbums;
+    } catch (e) {
+      console.error('Failed to create album:', e);
+      return this.cachedAlbums;
+    }
+  }
+
+  async renameAlbum(id: string, name: string): Promise<void> {
+    if (!isTauriAvailable()) return;
+    try {
+      await invoke('rename_album', { id, name });
+      const found = this.cachedAlbums.find((a) => a.id === id);
+      if (found) found.title = name;
+    } catch (e) {
+      console.error('Failed to rename album:', e);
+    }
+  }
+
+  async deleteAlbum(id: string): Promise<void> {
+    if (!isTauriAvailable()) return;
+    try {
+      await invoke('delete_album', { id });
+      this.cachedAlbums = this.cachedAlbums.filter((a) => a.id !== id);
+    } catch (e) {
+      console.error('Failed to delete album:', e);
+    }
+  }
+
   // Native File Dialog & Import (§4.1, §7)
   async pickFolderAndImport(): Promise<{ count: number; error?: string }> {
     if (!isTauriAvailable()) {
@@ -222,7 +458,6 @@ export class TauriAssetRepo implements AssetRepo {
         paths: [chosen],
         albumId: null
       });
-      // Reload bootstrap to reflect newly imported photos
       await this.loadBootstrap();
       return { count: report.imported_count || 0 };
     } catch (e: any) {

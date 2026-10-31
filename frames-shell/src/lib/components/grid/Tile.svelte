@@ -3,7 +3,7 @@
   import Badge from '$lib/components/surface/Badge.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import { getThumbnailDataUrl } from '$lib/mock/mockRepo';
-  import { isTauriAvailable } from '$lib/services/tauriRepo';
+  import { isTauriAvailable, tauriRepo, getAssetUrl } from '$lib/services/tauriRepo';
   import { theme } from '$lib/theme/engine.svelte';
 
   let {
@@ -30,14 +30,28 @@
 
   let isLoaded = $state(false);
   let imgError = $state(false);
+  let fallbackDataUrl = $state<string | null>(null);
 
   const thumbUrl = $derived.by(() => {
-    if (imgError) return getThumbnailDataUrl(asset, 'thumb');
-    if (isTauriAvailable()) {
-      return `frames://thumb/${asset.id}`;
+    if (fallbackDataUrl) return fallbackDataUrl;
+    if (isTauriAvailable() && !imgError) {
+      return getAssetUrl('thumb', asset.id);
     }
     return getThumbnailDataUrl(asset, 'thumb');
   });
+
+  async function handleImgError() {
+    if (!fallbackDataUrl && isTauriAvailable()) {
+      const dataUrl = await tauriRepo.getThumbnailDataUrl(asset.id, false);
+      if (dataUrl) {
+        fallbackDataUrl = dataUrl;
+        isLoaded = true;
+        return;
+      }
+    }
+    imgError = true;
+    isLoaded = true;
+  }
 
   const formattedDuration = $derived.by(() => {
     if (!asset.durationMs) return '';
@@ -79,10 +93,7 @@
       loading="lazy"
       class="tile-image {isLoaded ? 'loaded' : ''}"
       onload={() => (isLoaded = true)}
-      onerror={() => {
-        imgError = true;
-        isLoaded = true;
-      }}
+      onerror={handleImgError}
     />
   </div>
 

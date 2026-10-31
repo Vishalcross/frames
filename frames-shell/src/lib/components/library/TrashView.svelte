@@ -1,10 +1,9 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import Button from '$lib/components/surface/Button.svelte';
   import Badge from '$lib/components/surface/Badge.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
-  import { getAssetByIndex, getThumbnailDataUrl } from '$lib/mock/mockRepo';
-  import type { Asset } from '$lib/types';
+  import { tauriRepo, getAssetUrl } from '$lib/services/tauriRepo';
+  import { invoke } from '@tauri-apps/api/core';
 
   let {
     onrestore,
@@ -14,26 +13,49 @@
     ondeletepermanently?: (ids: string[]) => void;
   } = $props();
 
-  // Mock sample deleted items with days remaining (§4.12)
-  const trashItems = $derived(
-    [0, 1, 2, 3, 4, 5].map((i) => {
-      const asset = getAssetByIndex(1000 + i * 43);
-      const daysRemaining = 30 - (i * 5 + 2);
-      return {
-        asset,
-        daysRemaining: Math.max(1, daysRemaining),
-        thumb: getThumbnailDataUrl(asset, 'thumb')
-      };
-    })
-  );
-
   let selectedTrashIds = $state<Set<string>>(new Set());
+
+  const trashItems = $derived.by(() => {
+    const list = tauriRepo.getTrashItems();
+    return list.map((item) => ({
+      id: item.id,
+      filename: item.filename,
+      daysRemaining: item.days_remaining,
+      thumb: getAssetUrl('thumb', item.id)
+    }));
+  });
 
   function toggleSelect(id: string) {
     const s = new Set(selectedTrashIds);
     if (s.has(id)) s.delete(id);
     else s.add(id);
     selectedTrashIds = s;
+  }
+
+  async function handleRecover() {
+    const ids = Array.from(selectedTrashIds);
+    if (ids.length === 0) return;
+    try {
+      await invoke('restore_assets', { ids });
+      await tauriRepo.loadBootstrap();
+      selectedTrashIds = new Set();
+      onrestore?.(ids);
+    } catch (e) {
+      console.error('Failed to restore assets:', e);
+    }
+  }
+
+  async function handleDeletePermanently() {
+    const ids = Array.from(selectedTrashIds);
+    if (ids.length === 0) return;
+    try {
+      await invoke('delete_trash_now', { ids });
+      await tauriRepo.loadBootstrap();
+      selectedTrashIds = new Set();
+      ondeletepermanently?.(ids);
+    } catch (e) {
+      console.error('Failed to purge assets:', e);
+    }
   }
 </script>
 
@@ -48,41 +70,57 @@
 
     {#if selectedTrashIds.size > 0}
       <div class="trash-actions">
-        <Button variant="standard" onclick={() => onrestore?.(Array.from(selectedTrashIds))}>
+        <Button variant="standard" onclick={handleRecover}>
           Recover ({selectedTrashIds.size})
         </Button>
-        <Button variant="danger" onclick={() => ondeletepermanently?.(Array.from(selectedTrashIds))}>
+        <Button variant="danger" onclick={handleDeletePermanently}>
           Delete Permanently
         </Button>
       </div>
     {/if}
   </header>
 
-  <div class="trash-grid">
-    {#each trashItems as item}
-      {@const isSelected = selectedTrashIds.has(item.asset.id)}
-      <button
-        type="button"
-        class="trash-item-card {isSelected ? 'selected' : ''}"
-        onclick={() => toggleSelect(item.asset.id)}
-      >
-        <div class="trash-thumb-wrap">
-          <img src={item.thumb} alt="" loading="lazy" />
+  {#if trashItems.length === 0}
+    <div class="trash-empty-state">
+      <div class="empty-trash-icon">
+        <Icon name="trash" size={32} />
+      </div>
+      <p class="empty-trash-title">Trash is Empty</p>
+      <p class="empty-trash-sub">Photos and videos you delete will appear here for 30 days before being permanently removed.</p>
+    </div>
+  {:else}
+    <div class="trash-grid">
+      {#each trashItems as item}
+        {@const isSelected = selectedTrashIds.has(item.id)}
+        <div
+          class="trash-tile {isSelected ? 'selected' : ''}"
+          onclick={() => toggleSelect(item.id)}
+          role="button"
+          tabindex="0"
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              toggleSelect(item.id);
+            }
+          }}
+          aria-label="{item.filename}, {item.daysRemaining} days remaining"
+        >
+          <img src={item.thumb} alt={item.filename} class="trash-img" loading="lazy" />
+
+          <!-- Days remaining label (§4.12) -->
+          <div class="trash-badge-wrap">
+            <Badge variant="pill">{item.daysRemaining}d left</Badge>
+          </div>
 
           {#if isSelected}
-            <div class="trash-check">
-              <Icon name="check" size={13} stroke={2.4} />
+            <div class="trash-check-badge">
+              <Icon name="check" size={14} stroke={2.5} />
             </div>
           {/if}
         </div>
-
-        <!-- Days remaining label (§4.12) -->
-        <div class="days-remaining-pill">
-          {item.daysRemaining} days left
-        </div>
-      </button>
-    {/each}
-  </div>
+      {/each}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -90,20 +128,20 @@
     width: 100%;
     height: 100%;
     overflow-y: auto;
-    padding: calc(var(--toolbar-h) + 20px) 24px 32px;
+    padding: calc(var(--toolbar-h) + 20px) 24px 60px;
     box-sizing: border-box;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 24px;
   }
 
   .trash-header {
     display: flex;
-    align-items: flex-start;
+    align-items: flex-end;
     justify-content: space-between;
     gap: 16px;
-    border-bottom: 1px solid var(--separator);
     padding-bottom: 16px;
+    border-bottom: 1px solid var(--separator);
   }
 
   .trash-title {
@@ -114,75 +152,100 @@
   }
 
   .trash-sub {
-    font-size: var(--text-size-body);
-    line-height: var(--text-lh-body);
+    font-size: var(--text-size-caption);
     color: var(--text-2);
     margin: 0;
-    max-width: 540px;
+    max-width: 500px;
   }
 
   .trash-actions {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
+  }
+
+  .trash-empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 80px 20px;
+    text-align: center;
+    gap: 12px;
+  }
+
+  .empty-trash-icon {
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: var(--fill-2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-3);
+  }
+
+  .empty-trash-title {
+    font-size: var(--text-size-title);
+    font-weight: 600;
+    color: var(--text-1);
+    margin: 0;
+  }
+
+  .empty-trash-sub {
+    font-size: var(--text-size-body);
+    color: var(--text-2);
+    margin: 0;
+    max-width: 400px;
   }
 
   .trash-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-    gap: 16px;
-  }
-
-  .trash-item-card {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
     gap: 8px;
-    border: none;
-    background: transparent;
-    cursor: pointer;
-    padding: 0;
   }
 
-  .trash-thumb-wrap {
+  .trash-tile {
     position: relative;
-    width: 100%;
     aspect-ratio: 1;
     border-radius: var(--r-md);
     overflow: hidden;
     background: var(--fill-2);
-    box-shadow: var(--shadow-1);
+    cursor: pointer;
+    box-sizing: border-box;
   }
 
-  .trash-thumb-wrap img {
+  .trash-tile.selected {
+    outline: 3px solid var(--accent);
+    outline-offset: -3px;
+  }
+
+  .trash-img {
     width: 100%;
     height: 100%;
     object-fit: cover;
     display: block;
   }
 
-  .trash-item-card.selected .trash-thumb-wrap {
-    box-shadow: inset 0 0 0 3px var(--accent);
+  .trash-badge-wrap {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    z-index: 5;
   }
 
-  .trash-check {
+  .trash-check-badge {
     position: absolute;
-    top: 6px;
-    left: 6px;
-    width: 20px;
-    height: 20px;
-    border-radius: var(--r-pill);
+    top: 8px;
+    left: 8px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
     background: var(--accent);
-    color: var(--accent-fg);
+    color: #ffffff;
     display: flex;
     align-items: center;
     justify-content: center;
-  }
-
-  /* Days remaining label (§4.12) */
-  .days-remaining-pill {
-    font-size: var(--text-size-caption);
-    font-weight: 600;
-    color: var(--text-2);
+    z-index: 10;
   }
 </style>

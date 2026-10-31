@@ -1,9 +1,9 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import type { Asset } from '$lib/types';
   import Badge from '$lib/components/surface/Badge.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
-  import { getThumbnailDataUrl } from '$lib/mock/mockRepo';
-  import { isTauriAvailable, tauriRepo, getAssetUrl } from '$lib/services/tauriRepo';
+  import { thumbUrl, onThumbReady, observeAssetVisibility } from '$lib/media';
   import { theme } from '$lib/theme/engine.svelte';
 
   let {
@@ -29,29 +29,25 @@
   } = $props();
 
   let isLoaded = $state(false);
-  let imgError = $state(false);
-  let fallbackDataUrl = $state<string | null>(null);
+  let reloadCounter = $state(0);
 
-  const thumbUrl = $derived.by(() => {
-    if (fallbackDataUrl) return fallbackDataUrl;
-    if (isTauriAvailable() && !imgError) {
-      return getAssetUrl('thumb', asset.id);
-    }
-    return getThumbnailDataUrl(asset, 'thumb');
+  $effect(() => {
+    const _ = asset.id;
+    isLoaded = false;
+    reloadCounter = 0;
   });
 
-  async function handleImgError() {
-    if (!fallbackDataUrl && isTauriAvailable()) {
-      const dataUrl = await tauriRepo.getThumbnailDataUrl(asset.id, false);
-      if (dataUrl) {
-        fallbackDataUrl = dataUrl;
-        isLoaded = true;
-        return;
+  const currentThumbUrl = $derived(
+    reloadCounter > 0 ? `${thumbUrl(asset.id)}?v=${reloadCounter}` : thumbUrl(asset.id)
+  );
+
+  onMount(() => {
+    return onThumbReady((assetId) => {
+      if (assetId === asset.id) {
+        reloadCounter++;
       }
-    }
-    imgError = true;
-    isLoaded = true;
-  }
+    });
+  });
 
   const formattedDuration = $derived.by(() => {
     if (!asset.durationMs) return '';
@@ -79,6 +75,7 @@
   {tabindex}
   class="photo-tile {isSelected ? 'is-selected' : ''} {isFill ? 'is-fill' : 'is-fit'} appearance-{theme.appearance}"
   style="--tile-size: {size}px;"
+  use:observeAssetVisibility={asset.id}
   {onclick}
   {ondblclick}
   onkeydown={handleKeyDown}
@@ -88,12 +85,12 @@
   <!-- Background ThumbHash blur placeholder crossfading to real image (§4.4) -->
   <div class="thumb-container">
     <img
-      src={thumbUrl}
+      src={currentThumbUrl}
       alt=""
       loading="lazy"
+      decoding="async"
       class="tile-image {isLoaded ? 'loaded' : ''}"
       onload={() => (isLoaded = true)}
-      onerror={handleImgError}
     />
   </div>
 
@@ -147,6 +144,7 @@
   .photo-tile.is-fill {
     width: var(--tile-size);
     height: var(--tile-size);
+    aspect-ratio: 1 / 1;
   }
 
   .photo-tile.is-fit {
@@ -175,6 +173,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    background: var(--fill-1);
   }
 
   .tile-image {

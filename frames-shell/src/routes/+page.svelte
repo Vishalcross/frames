@@ -30,7 +30,6 @@
   import Toast, { type ToastMessage } from '$lib/components/dialogs/Toast.svelte';
 
   import LensFilterSvg from '$lib/components/effects/LensFilterSvg.svelte';
-  import Backplate from '$lib/components/effects/Backplate.svelte';
   import AmbientBackdrop from '$lib/components/effects/AmbientBackdrop.svelte';
 
   import { theme, initThemeEngine, cycleAppearance } from '$lib/theme/engine.svelte';
@@ -404,9 +403,6 @@
 <div class="frames-application appearance-{theme.appearance}" data-appearance={theme.appearance}>
   <!-- TitleBar (macOS Traffic Lights or Windows Caption buttons, §2, §3) -->
   <TitleBar />
-
-  <!-- Liquid Glass Mosaic Backplate behind sidebar (§8.1 #4) -->
-  <Backplate />
 
   <div class="frames-window-layout">
     <!-- Sidebar (240px, docked or floating glass panel, §3, §4.1) -->

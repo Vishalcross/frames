@@ -90,10 +90,25 @@ export async function resolvePalette(
   assetId: string | null,
   albumId?: string | null
 ): Promise<AdaptivePalette | null> {
+  let targetAlbumId = albumId;
+
+  // A photo always belongs to one album, so opening a photo from All Photos,
+  // Years or Months uses that album's setting.
+  if (!targetAlbumId && assetId) {
+    try {
+      const foundId = await currentInvoker('get_asset_album_id', { assetId });
+      if (foundId) {
+        targetAlbumId = foundId;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   let theme: BackendAlbumTheme | null = null;
 
-  if (albumId) {
-    theme = await currentInvoker('get_album_theme', { albumId });
+  if (targetAlbumId) {
+    theme = await currentInvoker('get_album_theme', { albumId: targetAlbumId });
     if (theme) {
       activeAlbumTheme = theme;
     }
@@ -127,7 +142,7 @@ export async function resolvePalette(
         };
       }
       // If empty, call regenerate_album_palette once and keep showing previous palette
-      currentInvoker('regenerate_album_palette', { albumId }).catch(() => {});
+      currentInvoker('regenerate_album_palette', { albumId: targetAlbumId }).catch(() => {});
       return null;
     }
   }
@@ -227,9 +242,12 @@ export function handleViewedPhotoChange(
       // Ignore any result that is not from the newest request
       if (reqId !== requestCounter) return;
 
-      // If the result is null, do nothing (previous colours stay)
+      // If the result is null and viewing a photo, do nothing (the previous colours stay).
+      // If closing the viewer with no active album palette, restore expected grid colours.
       if (palette) {
         applyPalette(palette);
+      } else if (!assetId) {
+        clearAdaptivePalette();
       }
     } catch {
       // ignore

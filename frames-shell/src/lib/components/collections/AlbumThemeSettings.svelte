@@ -176,13 +176,13 @@
 
 <div class="album-theme-settings">
   <div class="settings-header">
-    <h3 class="section-title">Appearance</h3>
+    <h3 class="section-title">Colour theme</h3>
     {#if close}
       <button type="button" class="close-btn" onclick={close} aria-label="Close">✕</button>
     {/if}
   </div>
 
-  <!-- Segmented control: "Dynamic (follows photo)" vs "Album palette" -->
+  <!-- Segmented control: "Dynamic per photo" vs "One theme for this album" (Task 4-i #1) -->
   <div class="segmented-control" role="tablist">
     <button
       type="button"
@@ -192,7 +192,7 @@
       class:active={mode === 'dynamic'}
       onclick={() => save('dynamic', source)}
     >
-      Dynamic (follows photo)
+      Dynamic per photo
     </button>
     <button
       type="button"
@@ -202,13 +202,13 @@
       class:active={mode === 'album'}
       onclick={() => save('album', source)}
     >
-      Album palette
+      One theme for this album
     </button>
   </div>
 
-  <!-- If "Album palette" -->
+  <!-- If "One theme for this album" (Task 4-i #2) -->
   {#if mode === 'album'}
-    <!-- Radio: "Auto" vs "Manual" -->
+    <!-- Radio: "Generate from this album's photos" vs "Choose 3 colours" -->
     <div class="radio-group" role="radiogroup" aria-label="Album palette source">
       <label class="radio-label">
         <input
@@ -218,7 +218,7 @@
           checked={source === 'auto'}
           onchange={() => save('album', 'auto')}
         />
-        <span>Auto</span>
+        <span>Generate from this album's photos</span>
       </label>
       <label class="radio-label">
         <input
@@ -228,7 +228,7 @@
           checked={source === 'manual'}
           onchange={() => save('album', 'manual')}
         />
-        <span>Manual</span>
+        <span>Choose 3 colours</span>
       </label>
     </div>
 
@@ -284,7 +284,7 @@
                 id="color-bg"
                 type="color"
                 class="color-picker-input"
-                value={validateHex(manualBg) ? manualBg : '#000000'}
+                value={validateHex(manualBg) ? manualBg.toLowerCase() : '#000000'}
                 oninput={(e) => handleManualColorInput('bg', (e.target as HTMLInputElement).value)}
               />
               <input
@@ -306,7 +306,7 @@
                 id="color-sidebar"
                 type="color"
                 class="color-picker-input"
-                value={validateHex(manualSidebar) ? manualSidebar : '#000000'}
+                value={validateHex(manualSidebar) ? manualSidebar.toLowerCase() : '#000000'}
                 oninput={(e) => handleManualColorInput('sidebar', (e.target as HTMLInputElement).value)}
               />
               <input
@@ -328,7 +328,7 @@
                 id="color-accent"
                 type="color"
                 class="color-picker-input"
-                value={validateHex(manualAccent) ? manualAccent : '#000000'}
+                value={validateHex(manualAccent) ? manualAccent.toLowerCase() : '#000000'}
                 oninput={(e) => handleManualColorInput('accent', (e.target as HTMLInputElement).value)}
               />
               <input
@@ -355,8 +355,8 @@
     {/if}
   {/if}
 
-  <!-- Hint -->
-  <p class="theme-hint">Album themes apply when viewing this album under the Adaptive theme.</p>
+  <!-- Hint (Task 4-i #6) -->
+  <p class="theme-hint">Applies when the Adaptive theme is on.</p>
 </div>
 
 <style>

@@ -44,6 +44,7 @@
 }
 
 /* Add smooth 400ms transitions to window background, sidebar and accent elements (Task 4-h #3) */
+[data-appearance="adaptive"] body,
 [data-appearance="adaptive"] .app-shell,
 [data-appearance="adaptive"] .frames-sidebar,
 [data-appearance="adaptive"] .surface-sidebar,

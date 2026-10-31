@@ -41,6 +41,27 @@ pub fn get_album_theme(
 }
 
 #[tauri::command]
+pub fn get_asset_album_id(
+    state: State<'_, AppState>,
+    asset_id: String,
+) -> Result<Option<String>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let conn = store.connection();
+    let mut stmt = conn.prepare(
+        "SELECT album_id FROM album_items WHERE asset_id = ?1 AND in_album = 1
+         UNION
+         SELECT album_id FROM assets WHERE id = ?1 AND album_id IS NOT NULL AND album_id != ''
+         LIMIT 1"
+    ).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([&asset_id]).map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        Ok(Some(row.get(0).map_err(|e| e.to_string())?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
 pub fn set_album_theme(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -62,8 +83,8 @@ pub fn set_album_theme(
         accent,
     )?;
 
-    // If source is auto and mode is album, run regenerate_album_palette if auto_* are empty
-    if mode == "album" && source == "auto" && theme.auto_bg.is_none() {
+    // If source is auto and mode is album, run regenerate_album_palette (Task 4-f #7)
+    if mode == "album" && source == "auto" {
         let app_handle = app.clone();
         let alb_id = album_id.clone();
         let store_arc = Arc::clone(&state.store);

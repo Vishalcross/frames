@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use serde::{Deserialize, Serialize};
-use crate::color::{contrast_ratio, from_hex, hsl_to_rgb, relative_luminance, rgb_to_hsl, to_hex};
+use crate::color::{contrast_ratio, from_hex, hsl_to_rgb, rgb_to_hsl, to_hex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -143,18 +143,42 @@ pub fn normalise_roles(bg: &str, sidebar: &str, accent: &str, tone: Tone) -> Pal
     // 2. Accent against background must have contrast at least 3.0.
     // If not, change the accent lightness by 0.05 per step, up to 10 steps.
     let mut acc_hsl = rgb_to_hsl(acc_rgb);
-    let acc_dir = if relative_luminance(bg_rgb) < 0.5 {
-        1.0
-    } else {
-        -1.0
-    };
-
-    for _ in 0..10 {
-        if contrast_ratio(acc_rgb, bg_rgb) < 3.0 {
-            acc_hsl[2] = (acc_hsl[2] + acc_dir * 0.05).clamp(0.0, 1.0);
+    if contrast_ratio(acc_rgb, bg_rgb) < 3.0 {
+        let cr_up = {
+            let mut h = acc_hsl;
+            h[2] = (h[2] + 0.05).clamp(0.0, 1.0);
+            contrast_ratio(hsl_to_rgb(h), bg_rgb)
+        };
+        let cr_down = {
+            let mut h = acc_hsl;
+            h[2] = (h[2] - 0.05).clamp(0.0, 1.0);
+            contrast_ratio(hsl_to_rgb(h), bg_rgb)
+        };
+        let dir = if cr_up >= cr_down { 1.0 } else { -1.0 };
+        for _ in 0..10 {
+            if contrast_ratio(acc_rgb, bg_rgb) >= 3.0 {
+                break;
+            }
+            let next_l = (acc_hsl[2] + dir * 0.05).clamp(0.0, 1.0);
+            if (next_l - acc_hsl[2]).abs() < 1e-4 {
+                break;
+            }
+            acc_hsl[2] = next_l;
             acc_rgb = hsl_to_rgb(acc_hsl);
-        } else {
-            break;
+        }
+        if contrast_ratio(acc_rgb, bg_rgb) < 3.0 {
+            let other_dir = -dir;
+            for _ in 0..10 {
+                if contrast_ratio(acc_rgb, bg_rgb) >= 3.0 {
+                    break;
+                }
+                let next_l = (acc_hsl[2] + other_dir * 0.05).clamp(0.0, 1.0);
+                if (next_l - acc_hsl[2]).abs() < 1e-4 {
+                    break;
+                }
+                acc_hsl[2] = next_l;
+                acc_rgb = hsl_to_rgb(acc_hsl);
+            }
         }
     }
 
@@ -263,21 +287,27 @@ pub fn extract_palette(thumb: &Path, tone: Tone) -> Palette {
     // 6. Sidebar: the next bucket whose hue differs from the background by at least 20 degrees,
     // with lightness set to the tone's sidebar rule. If none, use the background with the sidebar lightness rule applied.
     let bg_hue = dom_hsl[0];
+    let bg_has_hue = dom_hsl[1] >= 0.05;
     let mut sidebar_hex = None;
 
-    for b in sorted_buckets.iter().skip(1) {
-        let b_hsl = rgb_to_hsl(b.avg_rgb);
-        let diff = (b_hsl[0] - bg_hue).abs();
-        let hue_dist = diff.min(360.0 - diff);
-        if hue_dist >= 20.0 {
-            let mut sb_hsl = b_hsl;
-            sb_hsl[1] = sb_hsl[1].min(0.35);
-            sb_hsl[2] = match tone {
-                Tone::Dark => (dom_hsl[2] + 0.04).clamp(0.0, 1.0),
-                Tone::Light => (dom_hsl[2] - 0.04).clamp(0.0, 1.0),
-            };
-            sidebar_hex = Some(to_hex(hsl_to_rgb(sb_hsl)));
-            break;
+    if bg_has_hue {
+        for b in sorted_buckets.iter().skip(1) {
+            let b_hsl = rgb_to_hsl(b.avg_rgb);
+            if b_hsl[1] < 0.05 {
+                continue;
+            }
+            let diff = (b_hsl[0] - bg_hue).abs();
+            let hue_dist = diff.min(360.0 - diff);
+            if hue_dist >= 20.0 {
+                let mut sb_hsl = b_hsl;
+                sb_hsl[1] = sb_hsl[1].min(0.35);
+                sb_hsl[2] = match tone {
+                    Tone::Dark => (dom_hsl[2] + 0.04).clamp(0.0, 1.0),
+                    Tone::Light => (dom_hsl[2] - 0.04).clamp(0.0, 1.0),
+                };
+                sidebar_hex = Some(to_hex(hsl_to_rgb(sb_hsl)));
+                break;
+            }
         }
     }
 
@@ -617,4 +647,21 @@ mod tests {
         println!("palette derivation on 256x256 took: {:?}", elapsed);
         assert!(elapsed.as_millis() < 100, "derivation took {}ms, must be < 100ms", elapsed.as_millis());
     }
+
+    #[test]
+    fn normalise_roles_increases_contrast_when_accent_is_close_to_bg() {
+        // bg is midtone grey, accent is slightly darker grey with contrast < 3.0
+        let bg = "#333333";
+        let sidebar = "#444444";
+        let accent = "#282828";
+        let pal = normalise_roles(bg, sidebar, accent, Tone::Dark);
+        let cr = contrast_ratio(from_hex(&pal.accent).unwrap(), from_hex(&pal.bg).unwrap());
+        assert!(
+            cr >= 3.0,
+            "expected contrast ratio >= 3.0, got {cr} (accent: {}, bg: {})",
+            pal.accent,
+            pal.bg
+        );
+    }
 }
+

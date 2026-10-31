@@ -113,9 +113,10 @@ pub fn derive_album_palette(palettes: &[Palette], tone: Tone) -> Palette {
 pub fn generate_and_save_album_palette(conn: &Connection, album_id: &str) -> rusqlite::Result<Palette> {
     // 1. Take the album's assets sorted by date.
     let mut stmt = conn.prepare(
-        "SELECT a.id FROM album_items ai
-         JOIN assets a ON a.id = ai.asset_id
-         WHERE ai.album_id = ?1 AND ai.in_album = 1 AND a.trashed_at IS NULL AND a.purged_at IS NULL
+        "SELECT a.id FROM assets a
+         WHERE (a.album_id = ?1
+            OR a.id IN (SELECT ai.asset_id FROM album_items ai WHERE ai.album_id = ?1 AND ai.in_album = 1))
+           AND a.trashed_at IS NULL AND a.purged_at IS NULL
          ORDER BY a.taken_at ASC",
     )?;
     let asset_ids: Vec<String> = stmt

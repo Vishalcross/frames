@@ -1652,9 +1652,37 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
 // =============================================================================
 
 #[tauri::command]
-async fn sync_now(state: State<'_, AppState>) -> Result<SyncReport, String> {
+async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncReport, String> {
     let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
+
+    // Record album asset counts for albums with mode = 'album' AND source = 'auto' before sync
+    let pre_sync_counts: Vec<(String, usize)> = {
+        if let Ok(store) = store_arc.lock() {
+            let conn = store.connection();
+            let mut stmt = match conn.prepare(
+                "SELECT album_id FROM album_theme WHERE mode = 'album' AND source = 'auto'"
+            ) {
+                Ok(s) => s,
+                Err(_) => return Err("failed to prepare album_theme query".into()),
+            };
+            let alb_ids: Vec<String> = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            alb_ids
+                .into_iter()
+                .map(|id| {
+                    let cnt = store.album_asset_count(&id).unwrap_or(0);
+                    (id, cnt)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+
     let rep = tauri::async_runtime::spawn_blocking(move || {
         let mut store = store_arc.lock().map_err(|e| e.to_string())?;
         sync_once(&mut store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
@@ -1665,6 +1693,30 @@ async fn sync_now(state: State<'_, AppState>) -> Result<SyncReport, String> {
     *state.offline_mode.lock().unwrap() = rep.offline;
     if !rep.offline {
         state.spawn_background_small_thumb_sync();
+
+        // Check if any album's file count changed by > 10% after sync (Task 4-f #7)
+        if let Ok(store) = state.store.lock() {
+            for (alb_id, old_cnt) in pre_sync_counts {
+                let new_cnt = store.album_asset_count(&alb_id).unwrap_or(0);
+                let changed = if old_cnt == 0 {
+                    new_cnt > 0
+                } else {
+                    (new_cnt as f64 - old_cnt as f64).abs() / (old_cnt as f64) > 0.10
+                };
+                if changed {
+                    let app_handle = app.clone();
+                    let store_arc_clone = Arc::clone(&state.store);
+                    let alb_id_clone = alb_id.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        if let Ok(store) = store_arc_clone.lock() {
+                            if frames_core::album_palette::generate_and_save_album_palette(store.connection(), &alb_id_clone).is_ok() {
+                                let _ = app_handle.emit("album-palette-ready", serde_json::json!({ "album_id": alb_id_clone }));
+                            }
+                        }
+                    });
+                }
+            }
+        }
     }
     Ok(rep)
 }
@@ -1970,6 +2022,7 @@ pub fn run() {
             get_album_theme,
             set_album_theme,
             regenerate_album_palette,
+            get_asset_album_id,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

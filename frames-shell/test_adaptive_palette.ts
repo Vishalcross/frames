@@ -68,6 +68,11 @@ setCommandInvoker(async (cmd: string, args?: Record<string, unknown>) => {
     regenerateCalled = true;
     return null;
   }
+  if (cmd === 'get_asset_album_id') {
+    const id = args?.assetId;
+    if (id === 'photo-in-album') return 'album-manual';
+    return null;
+  }
   return null;
 });
 
@@ -108,7 +113,14 @@ async function runTests() {
     throw new Error('Case 4b failed: expected null for null assetId');
   }
 
-  console.log('\nAll 4 resolvePalette cases passed successfully!');
+  // Case 5: opening photo from All Photos without albumId uses its album's setting
+  const p5 = await resolvePalette('photo-in-album', null);
+  console.log('Case 5 (photo opened from All Photos using album setting):', p5);
+  if (!p5 || p5.bg !== '#112233' || p5.accent !== '#FF0055') {
+    throw new Error('Case 5 failed: expected album theme applied to photo opened without albumId');
+  }
+
+  console.log('\nAll 5 resolvePalette cases passed successfully!');
 }
 
 runTests().catch((err) => {

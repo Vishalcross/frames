@@ -1206,6 +1206,15 @@ fn get_album_assets(
 }
 
 #[tauri::command]
+fn debug_album(
+    album_id: String,
+    state: State<'_, AppState>,
+) -> Result<frames_core::AlbumDebugInfo, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.debug_album(&album_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn create_album(name: String, state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -1915,6 +1924,7 @@ pub fn run() {
             pick_folder_dialog,
             list_albums,
             album_asset_count,
+            debug_album,
             get_album_assets,
             create_album,
             rename_album,

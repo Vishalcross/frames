@@ -65,9 +65,13 @@
 
   // Visible window range calculation with 2 viewports overscan (§11)
   const overscanRows = 8;
-  const startRow = $derived(Math.max(0, Math.floor(scrollTop / rowHeight) - overscanRows));
+  const startRow = $derived(
+    totalRows <= 0 ? 0 : Math.max(0, Math.min(Math.max(0, totalRows - 1), Math.floor(scrollTop / rowHeight) - overscanRows))
+  );
   const visibleRowCount = $derived(Math.ceil(containerHeight / rowHeight) + overscanRows * 2);
-  const endRow = $derived(Math.min(totalRows, startRow + visibleRowCount));
+  const endRow = $derived(
+    totalRows <= 0 ? 0 : Math.max(startRow, Math.min(totalRows, startRow + visibleRowCount))
+  );
 
   const startIndex = $derived(startRow * cols);
   const endIndex = $derived(Math.min(totalAssets, endRow * cols));
@@ -77,11 +81,17 @@
     const qKey = JSON.stringify(query);
     if (qKey !== activeQueryKey) {
       activeQueryKey = qKey;
+      const currentKey = qKey;
       loadedPages.clear();
       inFlightPages.clear();
       assetsMap = new Map();
+      totalAssets = 0;
+      scrollTop = 0;
+      if (containerRef) containerRef.scrollTop = 0;
       repo.count(query).then((cnt) => {
-        totalAssets = cnt;
+        if (activeQueryKey === currentKey) {
+          totalAssets = cnt;
+        }
       });
     }
   });
@@ -95,6 +105,7 @@
 
     const startPage = Math.floor(s / PAGE_SIZE);
     const endPage = Math.floor(Math.max(0, e - 1) / PAGE_SIZE);
+    const reqKey = activeQueryKey;
 
     for (let p = startPage; p <= endPage; p++) {
       if (p * PAGE_SIZE >= totalAssets) continue;
@@ -103,6 +114,7 @@
         const offset = p * PAGE_SIZE;
         const pageIdx = p;
         repo.range(query, offset, PAGE_SIZE).then((assets) => {
+          if (activeQueryKey !== reqKey) return;
           loadedPages.add(pageIdx);
           inFlightPages.delete(pageIdx);
           const newMap = new Map(assetsMap);
@@ -111,7 +123,9 @@
           });
           assetsMap = newMap;
         }).catch(() => {
-          inFlightPages.delete(pageIdx);
+          if (activeQueryKey === reqKey) {
+            inFlightPages.delete(pageIdx);
+          }
         });
       }
     }
@@ -310,7 +324,7 @@
     class="virtual-grid-content"
     style="height: {totalGridHeight}px; width: {containerWidth}px;"
   >
-    {#each Array(endRow - startRow) as _, r}
+    {#each Array(Math.max(0, endRow - startRow)) as _, r}
       {@const rowIndex = startRow + r}
       {@const rowTop = rowIndex * rowHeight}
       <div

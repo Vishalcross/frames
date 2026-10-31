@@ -81,12 +81,10 @@
 
       listen('album-synced', () => {
         refreshCounts();
-        onsync?.();
       }).then((un) => unlistens.push(un));
 
       listen('scan-finished', () => {
         refreshCounts();
-        onsync?.();
       }).then((un) => unlistens.push(un));
     });
 

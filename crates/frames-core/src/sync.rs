@@ -1568,8 +1568,9 @@ where
         };
 
         for obj in objs {
+            let key_trimmed = obj.key.trim_start_matches('/');
             let prefix = format!("albums/{folder}/");
-            let rel = obj.key.strip_prefix(&prefix).unwrap_or(&obj.key);
+            let rel = key_trimmed.strip_prefix(&prefix).unwrap_or(key_trimmed);
             let normalized_rel = crate::scan_local::normalize_relpath(rel);
 
             if crate::scan_local::is_hidden_or_system_file(&normalized_rel) {
@@ -1599,6 +1600,7 @@ where
                 )
                 ON CONFLICT(album_id, relative_path) DO UPDATE SET
                     remote_key = excluded.remote_key,
+                    key = CASE WHEN assets.key = '' THEN excluded.key ELSE assets.key END,
                     size = CASE WHEN assets.size = 0 THEN excluded.size ELSE assets.size END",
                 rusqlite::params![
                     new_id,
@@ -1926,6 +1928,7 @@ mod tests {
 
         s4.put_object("albums/Vacation/beach.jpg", b"fake-jpg", "image/jpeg").unwrap();
         s4.put_object("albums/Vacation/sunset.jpg", b"fake-jpg-2", "image/jpeg").unwrap();
+        s4.put_object("albums/Vacation/island.jpg", b"fake-jpg-slash", "image/jpeg").unwrap();
         s4.put_object("albums/Remote Only/pyramids.jpg", b"fake-jpg-3", "image/jpeg").unwrap();
 
         let mut synced_albums = Vec::new();
@@ -1933,17 +1936,18 @@ mod tests {
             synced_albums.push(alb_id.to_string());
         }).unwrap();
 
-        assert_eq!(upserted, 3);
+        assert_eq!(upserted, 4);
         assert!(synced_albums.contains(&local_album_id.to_string()));
 
-        let beach_row: (String, Option<String>, Option<String>) = store.connection().query_row(
-            "SELECT id, local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'beach.jpg'",
+        let beach_row: (String, Option<String>, Option<String>, String) = store.connection().query_row(
+            "SELECT id, local_path, remote_key, key FROM assets WHERE album_id = ?1 AND relative_path = 'beach.jpg'",
             rusqlite::params![local_album_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         ).unwrap();
         assert_eq!(beach_row.0, asset_id);
         assert_eq!(beach_row.1.as_deref(), Some("/local/disk/Vacation/beach.jpg"));
         assert_eq!(beach_row.2.as_deref(), Some("albums/Vacation/beach.jpg"));
+        assert_eq!(beach_row.3, "albums/Vacation/beach.jpg");
 
         let sunset_row: (Option<String>, Option<String>) = store.connection().query_row(
             "SELECT local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'sunset.jpg'",
@@ -1952,6 +1956,13 @@ mod tests {
         ).unwrap();
         assert!(sunset_row.0.is_none());
         assert_eq!(sunset_row.1.as_deref(), Some("albums/Vacation/sunset.jpg"));
+
+        let island_row: (Option<String>, Option<String>) = store.connection().query_row(
+            "SELECT local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'island.jpg'",
+            rusqlite::params![local_album_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(island_row.1.as_deref(), Some("albums/Vacation/island.jpg"));
 
         let remote_album: (String, String) = store.connection().query_row(
             "SELECT id, name FROM albums WHERE name = 'Remote Only'",
@@ -1967,5 +1978,13 @@ mod tests {
         ).unwrap();
         assert!(pyramid_row.0.is_none());
         assert_eq!(pyramid_row.1.as_deref(), Some("albums/Remote Only/pyramids.jpg"));
+
+        // Verify debug_album reflects metrics with with_both > 0
+        let dbg = store.debug_album(local_album_id).unwrap();
+        assert_eq!(dbg.total, 3);
+        assert_eq!(dbg.with_local, 1);
+        assert_eq!(dbg.with_remote, 3);
+        assert_eq!(dbg.with_both, 1);
+        assert!(dbg.with_both > 0, "with_both must be > 0 for album existing in both places");
     }
 }

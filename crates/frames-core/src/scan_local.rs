@@ -260,13 +260,14 @@ mod tests {
             [album_id],
         ).unwrap();
 
-        // 1. Local scan arrives first
+        // 1. Local scan arrives first (using decomposed NFD filename like macOS APFS)
+        let nfd_name = "caf\u{0065}\u{0301}.jpg";
         let id1 = upsert_local_asset(
             conn,
             album_id,
-            "beach.jpg",
-            "/photos/beach.jpg",
-            "beach.jpg",
+            nfd_name,
+            "/photos/café.jpg",
+            "café.jpg",
             1024,
             Utc::now(),
             "mac-1",
@@ -279,19 +280,23 @@ mod tests {
         ).unwrap();
         assert_eq!(count, 1);
 
-        // 2. Remote listing arrives for the same relative path
-        let norm_rel = normalize_relpath("beach.jpg");
+        // 2. Remote listing arrives for the NFC composed path
+        let nfc_name = "caf\u{00e9}.jpg";
+        let norm_rel = normalize_relpath(nfc_name);
+        assert_eq!(norm_rel, normalize_relpath(nfd_name), "NFD and NFC must normalize to identical path");
+
         let new_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO assets (
                 id, kind, key, filename, size, taken_at, date_at, state_at,
                 album_id, relative_path, remote_key, thumb_state
             ) VALUES (
-                ?1, 'photo', 'albums/album-dup-test/beach.jpg', 'beach.jpg', 1024, 'now', 'now', 'now',
-                ?2, ?3, 'albums/album-dup-test/beach.jpg', 'none'
+                ?1, 'photo', 'albums/album-dup-test/café.jpg', 'café.jpg', 1024, 'now', 'now', 'now',
+                ?2, ?3, 'albums/album-dup-test/café.jpg', 'none'
             )
             ON CONFLICT(album_id, relative_path) DO UPDATE SET
                 remote_key = excluded.remote_key,
+                key = CASE WHEN assets.key = '' THEN excluded.key ELSE assets.key END,
                 size = CASE WHEN assets.size = 0 THEN excluded.size ELSE assets.size END",
             rusqlite::params![new_id, album_id, norm_rel],
         ).unwrap();
@@ -304,19 +309,21 @@ mod tests {
         ).unwrap();
         assert_eq!(total_count, 1, "Must not duplicate row when same file arrives from remote");
 
-        let (id2, local_p, remote_k): (String, Option<String>, Option<String>) = conn.query_row(
-            "SELECT id, local_path, remote_key FROM assets WHERE album_id = ?1",
+        let (id2, local_p, remote_k, key_val): (String, Option<String>, Option<String>, String) = conn.query_row(
+            "SELECT id, local_path, remote_key, key FROM assets WHERE album_id = ?1",
             [album_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         ).unwrap();
         assert_eq!(id1, id2, "Original ID must be preserved");
-        assert_eq!(local_p.as_deref(), Some("/photos/beach.jpg"));
-        assert_eq!(remote_k.as_deref(), Some("albums/album-dup-test/beach.jpg"));
+        assert_eq!(local_p.as_deref(), Some("/photos/café.jpg"));
+        assert_eq!(remote_k.as_deref(), Some("albums/album-dup-test/café.jpg"));
+        assert_eq!(key_val, "albums/album-dup-test/café.jpg");
 
         // Verify hidden files are skipped
         assert!(is_hidden_or_system_file(".DS_Store"));
         assert!(is_hidden_or_system_file("Thumbs.db"));
         assert!(is_hidden_or_system_file("sub/._hidden.jpg"));
+        assert!(is_hidden_or_system_file(".hidden_dir/photo.jpg"));
         assert!(!is_hidden_or_system_file("sub/normal.jpg"));
     }
 }

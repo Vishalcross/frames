@@ -28,6 +28,23 @@
   let countOverride = $state<number | null>(null);
   const assetCount = $derived(countOverride ?? album.assetCount);
 
+  function logDebugIfEnabled(albumId: string) {
+    if (typeof window !== 'undefined' && albumId && isTauriAvailable()) {
+      const urlParams = new URLSearchParams(window.location.search);
+      if (urlParams.get('debug') === '1' || window.location.hash.includes('debug=1')) {
+        import('@tauri-apps/api/core').then(({ invoke }) => {
+          invoke('debug_album', { albumId })
+            .then((dbg) => {
+              console.log(`[debug_album ${albumId}]`, dbg);
+            })
+            .catch((err) => {
+              console.warn(`[debug_album ${albumId} error]`, err);
+            });
+        });
+      }
+    }
+  }
+
   $effect(() => {
     // Reset override when album id changes
     const _id = album.id;
@@ -36,6 +53,7 @@
       tauriRepo.getAlbumAssetCount(_id).then((cnt) => {
         countOverride = cnt;
       });
+      logDebugIfEnabled(_id);
     }
   });
 
@@ -49,6 +67,7 @@
           tauriRepo.getAlbumAssetCount(album.id).then((cnt) => {
             countOverride = cnt;
           });
+          logDebugIfEnabled(album.id);
         }
       }).then((un) => unlistens.push(un));
 
@@ -56,6 +75,7 @@
         tauriRepo.getAlbumAssetCount(album.id).then((cnt) => {
           countOverride = cnt;
         });
+        logDebugIfEnabled(album.id);
       }).then((un) => unlistens.push(un));
     });
 

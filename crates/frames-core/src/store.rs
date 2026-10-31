@@ -150,6 +150,15 @@ pub struct AlbumSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumDebugInfo {
+    pub total: usize,
+    pub with_local: usize,
+    pub with_remote: usize,
+    pub with_both: usize,
+    pub thumbs_ready: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchedAlbumFolder {
     pub album_id: String,
     pub album_name: String,
@@ -1259,6 +1268,31 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// Return debug metrics for an album: total, with_local, with_remote, with_both, thumbs_ready.
+    /// All computed directly in SQL.
+    pub fn debug_album(&self, album_id: &str) -> Result<AlbumDebugInfo> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                COUNT(*) AS total,
+                COUNT(CASE WHEN local_path IS NOT NULL AND local_path != '' THEN 1 END) AS with_local,
+                COUNT(CASE WHEN (remote_key IS NOT NULL AND remote_key != '') OR (key IS NOT NULL AND key != '') THEN 1 END) AS with_remote,
+                COUNT(CASE WHEN (local_path IS NOT NULL AND local_path != '') AND ((remote_key IS NOT NULL AND remote_key != '') OR (key IS NOT NULL AND key != '')) THEN 1 END) AS with_both,
+                COUNT(CASE WHEN thumb_state = 'ready' THEN 1 END) AS thumbs_ready
+             FROM assets
+             WHERE album_id = ?1",
+        )?;
+        let info = stmt.query_row([album_id], |r| {
+            Ok(AlbumDebugInfo {
+                total: r.get::<_, i64>(0)? as usize,
+                with_local: r.get::<_, i64>(1)? as usize,
+                with_remote: r.get::<_, i64>(2)? as usize,
+                with_both: r.get::<_, i64>(3)? as usize,
+                thumbs_ready: r.get::<_, i64>(4)? as usize,
+            })
+        })?;
+        Ok(info)
     }
 
     /// List all non-deleted albums with item counts and newest cover photo id
@@ -2620,6 +2654,47 @@ mod tests {
         assert_eq!(page3[0].id, "id-2");
         assert_eq!(page3[1].id, "id-1");
     }
+
+    #[test]
+    fn debug_album_returns_metrics_with_both_greater_than_zero() {
+        let store = Store::open_in_memory("mac-1").unwrap();
+        let conn = store.connection();
+        let album_id = "album-dbg-test";
+        conn.execute(
+            "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, 'Debug Album', 'now', 'now')",
+            [album_id],
+        ).unwrap();
+
+        // 1. Asset with local only
+        conn.execute(
+            "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, album_id, local_path, thumb_state)
+             VALUES ('a1', 'photo', 'local.jpg', 100, 'now', 'now', 'now', ?1, '/path/local.jpg', 'none')",
+            [album_id],
+        ).unwrap();
+
+        // 2. Asset with remote only
+        conn.execute(
+            "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, album_id, remote_key, thumb_state)
+             VALUES ('a2', 'photo', 'remote.jpg', 100, 'now', 'now', 'now', ?1, 'albums/remote.jpg', 'none')",
+            [album_id],
+        ).unwrap();
+
+        // 3. Asset with BOTH local and remote, and thumb ready
+        conn.execute(
+            "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, album_id, local_path, remote_key, thumb_state)
+             VALUES ('a3', 'photo', 'both.jpg', 100, 'now', 'now', 'now', ?1, '/path/both.jpg', 'albums/both.jpg', 'ready')",
+            [album_id],
+        ).unwrap();
+
+        let dbg = store.debug_album(album_id).unwrap();
+        assert_eq!(dbg.total, 3);
+        assert_eq!(dbg.with_local, 2);
+        assert_eq!(dbg.with_remote, 2);
+        assert_eq!(dbg.with_both, 1);
+        assert!(dbg.with_both > 0, "with_both must be greater than 0 for an album existing in both places");
+        assert_eq!(dbg.thumbs_ready, 1);
+    }
 }
+
 
 

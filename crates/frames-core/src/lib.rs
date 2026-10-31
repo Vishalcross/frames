@@ -20,7 +20,7 @@ pub mod thumbs;
 pub mod thumb_worker;
 pub mod upload_worker;
 
-pub use store::MatchedAlbumFolder;
+pub use store::{AlbumDebugInfo, MatchedAlbumFolder};
 pub use s4::{RemoteAsset, RemoteFetcher};
 pub use upload_worker::UploadWorker;
 

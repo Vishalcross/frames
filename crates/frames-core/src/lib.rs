@@ -11,6 +11,7 @@ pub mod importer;
 pub mod keys;
 pub mod media;
 pub mod ops;
+pub mod palette;
 pub mod player;
 pub mod s4;
 pub mod store;
@@ -24,6 +25,7 @@ pub mod upload_worker;
 pub use store::{AlbumDebugInfo, MatchedAlbumFolder};
 pub use s4::{RemoteAsset, RemoteFetcher};
 pub use upload_worker::UploadWorker;
+pub use palette::{extract_palette, normalise_roles, Palette, Tone};
 
 /// The local SQLite schema (spec section 5), applied when a database is created.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");

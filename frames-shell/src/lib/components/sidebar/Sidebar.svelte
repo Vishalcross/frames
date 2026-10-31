@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Surface from '$lib/components/surface/Surface.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import SyncPopover from '$lib/components/dialogs/SyncPopover.svelte';
   import type { AlbumItem } from '$lib/types';
   import { theme } from '$lib/theme/engine.svelte';
+  import { isTauriAvailable } from '$lib/services/tauriRepo';
 
   let {
     currentRoute = $bindable('library'),
@@ -34,6 +36,60 @@
     { id: 'pin_recents', title: 'Recents', icon: 'clock', route: 'library' },
     { id: 'pin_favs', title: 'Favorites', icon: 'heart', route: 'favorites' }
   ]);
+
+  let uploadCount = $state(0);
+  let thumbCount = $state(0);
+
+  const statusText = $derived.by(() => {
+    if (uploadCount > 0) return `Uploading ${uploadCount}`;
+    if (thumbCount > 0) return `Generating thumbnails ${thumbCount}`;
+    return 'Up to date';
+  });
+
+  onMount(() => {
+    if (!isTauriAvailable()) return;
+
+    let unlistens: Array<() => void> = [];
+
+    const refreshCounts = async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const st = await invoke<{ uploading_count: number; thumb_generating_count: number }>(
+          'get_worker_status'
+        );
+        uploadCount = st.uploading_count;
+        thumbCount = st.thumb_generating_count;
+      } catch (e) {
+        // Ignore if unavailable
+      }
+    };
+
+    refreshCounts();
+
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      listen<{ job_id: string; state: string }>('upload-progress', () => {
+        refreshCounts();
+      }).then((un) => unlistens.push(un));
+
+      listen<{ asset_id: string }>('thumb-ready', () => {
+        if (thumbCount > 0) {
+          thumbCount--;
+        } else {
+          refreshCounts();
+        }
+      }).then((un) => unlistens.push(un));
+
+      listen('album-synced', () => {
+        refreshCounts();
+      }).then((un) => unlistens.push(un));
+    });
+
+    return () => {
+      for (const un of unlistens) {
+        un();
+      }
+    };
+  });
 
   // Resizing state
   let isResizing = $state(false);
@@ -321,12 +377,12 @@
         aria-label="Cloud sync status"
       >
         <span class="sync-icon-wrap">
-          <Icon name={isSyncing ? 'cloud-upload' : 'cloud'} size={15} />
+          <Icon name={uploadCount > 0 ? 'cloud-upload' : isSyncing ? 'cloud-upload' : 'cloud'} size={15} />
         </span>
         <span class="sync-text">
-          {isSyncing ? 'Syncing with MEGA…' : outboxPending > 0 ? `Pending: ${outboxPending} items` : 'Up to date'}
+          {statusText}
         </span>
-        {#if isSyncing}
+        {#if uploadCount > 0 || isSyncing}
           <div class="sync-progress-ring">
             <svg viewBox="0 0 16 16" width="14" height="14">
               <circle cx="8" cy="8" r="6" fill="none" stroke="var(--separator)" stroke-width="1.8" />

@@ -23,10 +23,19 @@
   } = $props();
 
   import { onMount } from 'svelte';
+  import AlbumThemeSettings from './AlbumThemeSettings.svelte';
+  import { handleViewedPhotoChange } from '$lib/adaptive';
 
   let heroFallback = $state<string | null>(null);
   let countOverride = $state<number | null>(null);
+  let settingsOpen = $state(false);
   const assetCount = $derived(countOverride ?? album.assetCount);
+
+  $effect(() => {
+    if (album.id) {
+      handleViewedPhotoChange(null, album.id);
+    }
+  });
 
   function logDebugIfEnabled(albumId: string) {
     if (typeof window !== 'undefined' && albumId && isTauriAvailable()) {
@@ -124,14 +133,29 @@
     {/if}
 
     <div class="hero-scrim">
-      <!-- Title in 34/40, date range, count (§4.9) -->
-      <h1 class="hero-title">{album.title}</h1>
-      <div class="hero-metadata">
-        {#if album.dateRange}
-          <span>{album.dateRange}</span>
-          <span class="meta-dot">·</span>
-        {/if}
-        <span>{assetCount.toLocaleString()} {assetCount === 1 ? 'item' : 'items'}</span>
+      <div class="hero-header-row">
+        <div>
+          <!-- Title in 34/40, date range, count (§4.9) -->
+          <h1 class="hero-title">{album.title}</h1>
+          <div class="hero-metadata">
+            {#if album.dateRange}
+              <span>{album.dateRange}</span>
+              <span class="meta-dot">·</span>
+            {/if}
+            <span>{assetCount.toLocaleString()} {assetCount === 1 ? 'item' : 'items'}</span>
+          </div>
+        </div>
+
+        <div class="hero-actions">
+          <button
+            type="button"
+            class="album-settings-btn"
+            aria-label="Album theme settings"
+            onclick={() => (settingsOpen = !settingsOpen)}
+          >
+            🎨 Theme
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -148,6 +172,26 @@
       {onselectionchange}
     />
   </div>
+
+  <!-- Album Settings Popover Modal -->
+  {#if settingsOpen}
+    <div
+      class="settings-popover-backdrop"
+      role="presentation"
+      onclick={() => (settingsOpen = false)}
+    >
+      <div
+        class="settings-popover-content"
+        role="dialog"
+        aria-modal="true"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => { if (e.key === 'Escape') settingsOpen = false; }}
+      >
+        <AlbumThemeSettings albumId={album.id} close={() => (settingsOpen = false)} />
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -222,5 +266,50 @@
     flex: 1;
     min-height: 0;
     overflow: hidden;
+  }
+
+  .hero-header-row {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .album-settings-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    background: rgba(255, 255, 255, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 8px;
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    transition: background 150ms ease, transform 100ms ease;
+  }
+
+  .album-settings-btn:hover {
+    background: rgba(255, 255, 255, 0.3);
+  }
+
+  .settings-popover-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+
+  .settings-popover-content {
+    position: relative;
+    z-index: 1001;
   }
 </style>

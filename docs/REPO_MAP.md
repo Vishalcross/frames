@@ -200,6 +200,26 @@ The highlight in the top selector component (`frames-shell/src/lib/components/su
   - `drop-shadow`: Used only as static filter on `Badge.svelte` (line 67).
   - `glow`: Used for ambient photo backplate in `PhotoViewer.svelte` (`.viewer-ambient-glow`) and palette derivation comments; no cursor glow.
 
+## Adaptive audit
 
+### 1. Where are colours taken from the photo today (Rust, TypeScript, canvas)?
+Colours are not extracted from image pixels at all today. In TypeScript, `frames-shell/src/lib/services/tauriRepo.ts` (lines 92–108) deterministically generates a synthetic hue and swatches from the asset ID string (`idNum = s.id.split('').reduce(...)`, `hue = (idNum * 37) % 360`), and `frames-shell/src/lib/mock/mockRepo.ts` (lines 16–33, 169–185) selects from hardcoded mock palette themes. No Rust, TypeScript, or Canvas pixel analysis exists.
 
+### 2. How many colours are taken, and which parts of the UI use them?
+Two swatches (`seed` and `secondary`) are derived from the synthetic palette (`frames-shell/src/lib/services/tauriRepo.ts` lines 104–107). From these, `computeTonalRoles` in `frames-shell/src/lib/theme/palette.ts` (lines 184–251) computes CSS variables applied in `frames-shell/src/lib/theme/engine.svelte.ts` (lines 254–271):
+- Main window background: `--bg-canvas` / `--bg-viewer` (used in `frames-shell/src/routes/+page.svelte` and `frames-shell/src/lib/components/viewer/PhotoViewer.svelte`)
+- Sidebar: `--bg-sidebar`, `--sidebar-bg`, `--sidebar-border` (used in `frames-shell/src/lib/components/sidebar/Sidebar.svelte` and `frames-shell/src/lib/components/surface/Surface.svelte`)
+- Accent: `--accent`, `--accent-fg` (used for selection rings, pill segmented control in `SegmentedControl.svelte`, buttons, links)
+- Ambient backdrop glow: `--ad-ambient-1`, `--ad-ambient-2` (used in `+page.svelte` lines 400–405 and `adaptive.css` lines 8–18)
 
+### 3. Which image is analysed (the thumbnail or the full photo)?
+Neither image is analysed. Palette colours are generated synthetically from the asset ID hash in `frames-shell/src/lib/services/tauriRepo.ts` lines 92–108, without reading pixel data from either the thumbnail or the full photo.
+
+### 4. Is there a transition when the colours change?
+Yes. CSS transitions are defined for registered `@property` custom properties in `frames-shell/src/lib/styles/tokens.css` (lines 44–50) with `0.9s var(--ease-soft)`. However, `--bg-canvas`, `--bg-sidebar`, and `--accent` directly assigned inline on `document.documentElement` do not have smooth transitions on every element.
+
+### 5. What happens when the photo has not loaded yet?
+In `frames-shell/src/lib/theme/engine.svelte.ts` lines 147–164 (`applyFocusedAsset`), if an asset ID is null or has not been cached in `assetPaletteCache`, it falls back to a static hardcoded neutral palette of four OKLCH swatches (`l: 0.65, c: 0.12, h: 220`, etc.) with luminance `lum = 0.5`.
+
+### 6. Where are the adaptive values cleared when the user switches to Light, Dark or Glass?
+In `frames-shell/src/lib/theme/engine.svelte.ts` lines 272–292 within `syncDOMTokens()`. When `theme.appearance !== 'adaptive'`, inline CSS properties (`--bg-canvas`, `--bg-sidebar`, `--sidebar-bg`, `--sidebar-border`, `--bg-viewer`, `--surface-raised`, `--surface-overlay`, `--fill-1`, `--fill-2`, `--fill-3`, `--text-1`, `--text-2`, `--text-3`, `--separator`, `--accent`, `--accent-fg`, `--ad-ambient-1`, `--ad-ambient-2`) are explicitly removed from `document.documentElement` via `root.style.removeProperty(...)`.

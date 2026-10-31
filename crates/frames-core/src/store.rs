@@ -31,6 +31,7 @@ const META_DEVICE_ID: &str = "device_id";
 const META_NEXT_SEQ: &str = "next_seq";
 const META_BATCHES_SINCE_SNAPSHOT: &str = "batches_since_snapshot";
 const META_LAST_SNAPSHOT_AT: &str = "last_snapshot_at";
+const META_LOCAL_ROOTS: &str = "local_roots";
 
 pub const SNAPSHOT_BATCH_THRESHOLD: u64 = 500;
 pub const SNAPSHOT_MAX_AGE_DAYS: i64 = 7;
@@ -146,6 +147,13 @@ pub struct AlbumSummary {
     pub created_at: DateTime<Utc>,
     pub asset_count: usize,
     pub cover_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchedAlbumFolder {
+    pub album_id: String,
+    pub album_name: String,
+    pub folder_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +426,67 @@ impl Store {
         )?;
 
         Ok(())
+    }
+
+    pub fn set_local_roots(&self, paths: Vec<String>) -> Result<()> {
+        let json = serde_json::to_string(&paths)?;
+        self.conn.execute(
+            "INSERT INTO local_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_LOCAL_ROOTS, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_local_roots(&self) -> Result<Vec<String>> {
+        let res: Option<String> = self.conn
+            .query_row(
+                "SELECT value FROM local_meta WHERE key = ?1",
+                [META_LOCAL_ROOTS],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match res {
+            Some(s) => Ok(serde_json::from_str(&s)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn match_local_albums(&self) -> Result<Vec<MatchedAlbumFolder>> {
+        let roots = self.get_local_roots()?;
+        self.match_local_albums_for_roots(&roots)
+    }
+
+    pub fn match_local_albums_for_roots(&self, roots: &[String]) -> Result<Vec<MatchedAlbumFolder>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM albums WHERE deleted_at IS NULL")?;
+        let albums: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut matches = Vec::new();
+        for root in roots {
+            let root_path = std::path::Path::new(root);
+            if let Ok(entries) = std::fs::read_dir(root_path) {
+                for entry in entries.flatten() {
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_dir() {
+                            let folder_name = entry.file_name().to_string_lossy().to_string();
+                            for (album_id, album_name) in &albums {
+                                if album_name.eq_ignore_ascii_case(&folder_name) {
+                                    matches.push(MatchedAlbumFolder {
+                                        album_id: album_id.clone(),
+                                        album_name: album_name.clone(),
+                                        folder_path: entry.path().to_string_lossy().to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(matches)
     }
 
     /// Own device id stored in `local_meta`.
@@ -2396,5 +2465,37 @@ mod tests {
         let due_at_31 = store.assets_due_for_purge(day31).unwrap();
         assert_eq!(due_at_31.len(), 1);
         assert_eq!(due_at_31[0].id, "old");
+    }
+
+    #[test]
+    fn local_roots_setting_and_album_matching() {
+        let mut store = Store::open_in_memory("mac-1").unwrap();
+        let now = t(1);
+        store.create_album("alb-1".into(), "Summer Vacation".into(), now).unwrap();
+        store.create_album("alb-2".into(), "Trip 2024".into(), now).unwrap();
+
+        let temp_dir = std::env::temp_dir().join(format!("frames_test_roots_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let sub1 = temp_dir.join("summer vacation");
+        let sub2 = temp_dir.join("TRIP 2024");
+        let sub3 = temp_dir.join("Unmatched Folder");
+        std::fs::create_dir_all(&sub1).unwrap();
+        std::fs::create_dir_all(&sub2).unwrap();
+        std::fs::create_dir_all(&sub3).unwrap();
+
+        let root_str = temp_dir.to_str().unwrap().to_string();
+        store.set_local_roots(vec![root_str.clone()]).unwrap();
+
+        let stored_roots = store.get_local_roots().unwrap();
+        assert_eq!(stored_roots, vec![root_str]);
+
+        let matches = store.match_local_albums().unwrap();
+        assert_eq!(matches.len(), 2);
+
+        let mut matched_names: Vec<String> = matches.into_iter().map(|m| m.album_name).collect();
+        matched_names.sort();
+        assert_eq!(matched_names, vec!["Summer Vacation", "Trip 2024"]);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

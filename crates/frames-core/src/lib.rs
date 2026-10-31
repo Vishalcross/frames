@@ -16,5 +16,7 @@ pub mod store;
 pub mod sync;
 pub mod trash;
 
+pub use store::MatchedAlbumFolder;
+
 /// The local SQLite schema (spec section 5), applied when a database is created.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");

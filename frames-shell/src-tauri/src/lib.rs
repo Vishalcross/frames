@@ -1414,6 +1414,18 @@ fn save_settings(
 }
 
 #[tauri::command]
+fn set_local_roots(paths: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.set_local_roots(paths).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_local_roots(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.get_local_roots().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn clear_local_cache(state: State<'_, AppState>) -> Result<(u64, CacheStats), String> {
     let mut cache = state.cache.lock().map_err(|e| e.to_string())?;
     let freed = cache.clear_lru_cache().map_err(|e| e.to_string())?;
@@ -1538,6 +1550,8 @@ pub fn run() {
             sync_now,
             toggle_offline_mode,
             save_settings,
+            set_local_roots,
+            get_local_roots,
             clear_local_cache,
             run_check_library,
             add_unknown_s4_files,

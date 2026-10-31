@@ -25,7 +25,8 @@
     }))
   );
 
-  const activeId = $derived(selected !== undefined ? selected : (value ?? ''));
+  const usesItems = $derived(items !== undefined || (selected !== undefined && value === undefined));
+  const activeId = $derived(usesItems ? (selected ?? '') : (value ?? selected ?? ''));
 
   let buttons: HTMLButtonElement[] = $state([]);
   let left = $state(0);
@@ -42,12 +43,17 @@
   }
 
   function select(id: string) {
-    if (selected !== undefined) selected = id;
-    if (value !== undefined) value = id;
+    if (usesItems || value === undefined) {
+      selected = id;
+    }
+    if (!usesItems || options !== undefined || value !== undefined) {
+      value = id;
+    }
     onchange?.(id);
   }
 
   function handleKeydown(e: KeyboardEvent, currentIndex: number) {
+    if (controlItems.length === 0) return;
     if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
       e.preventDefault();
       const nextIndex = (currentIndex + 1) % controlItems.length;
@@ -80,7 +86,18 @@
     }
     const ro = new ResizeObserver(measure);
     buttons.forEach((b) => b && ro.observe(b));
-    return () => ro.disconnect();
+
+    const onWindowResize = () => measure();
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', onWindowResize);
+    }
+
+    return () => {
+      ro.disconnect();
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('resize', onWindowResize);
+      }
+    };
   });
 
   $effect(() => {
@@ -102,7 +119,7 @@
       type="button"
       role="tab"
       aria-selected={isSelected}
-      tabindex={isSelected ? 0 : -1}
+      tabindex={isSelected || (i === 0 && !controlItems.some((x) => x.id === activeId)) ? 0 : -1}
       class="segmented-btn"
       class:active={isSelected}
       class:selected={isSelected}

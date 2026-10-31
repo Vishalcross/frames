@@ -604,4 +604,17 @@ mod tests {
         let loaded = get_album_theme(&conn, "alb1").expect("load saved");
         assert_eq!(loaded, saved);
     }
+
+    #[test]
+    fn palette_derivation_is_fast_under_100ms() {
+        let path = make_test_image(256, 256, |x, y| {
+            Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255])
+        });
+        let start = std::time::Instant::now();
+        let _pal = extract_palette(&path, Tone::Dark);
+        let elapsed = start.elapsed();
+        let _ = std::fs::remove_file(&path);
+        println!("palette derivation on 256x256 took: {:?}", elapsed);
+        assert!(elapsed.as_millis() < 100, "derivation took {}ms, must be < 100ms", elapsed.as_millis());
+    }
 }

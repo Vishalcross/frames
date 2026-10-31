@@ -35,6 +35,7 @@
   import { theme, initThemeEngine, cycleAppearance } from '$lib/theme/engine.svelte';
   import { startPerformanceGovernor } from '$lib/theme/glass';
   import { tauriRepo, isTauriAvailable } from '$lib/services/tauriRepo';
+  import { initAdaptiveListeners, handleViewedPhotoChange } from '$lib/adaptive';
   import { invoke } from '@tauri-apps/api/core';
   import type { AlbumItem, Asset, Query } from '$lib/types';
 
@@ -181,6 +182,7 @@
   onMount(() => {
     const cleanupEngine = initThemeEngine();
     const cleanupGovernor = startPerformanceGovernor();
+    initAdaptiveListeners();
 
     // Initial navigation entry
     navigationHistory.push({ route: 'library', albumId: '', subView: 'all' });
@@ -226,6 +228,7 @@
     currentRoute = route;
     currentAlbumId = extraId;
     selectedIds = new Set();
+    handleViewedPhotoChange(null, route === 'album-detail' ? extraId : null);
   }
 
   function goBack() {
@@ -235,6 +238,7 @@
       currentRoute = target.route;
       currentAlbumId = target.albumId;
       librarySubView = target.subView;
+      handleViewedPhotoChange(null, target.route === 'album-detail' ? target.albumId : null);
     }
   }
 
@@ -245,6 +249,7 @@
       currentRoute = target.route;
       currentAlbumId = target.albumId;
       librarySubView = target.subView;
+      handleViewedPhotoChange(null, target.route === 'album-detail' ? target.albumId : null);
     }
   }
 
@@ -267,6 +272,7 @@
 
   function closePhoto() {
     viewerOpen = false;
+    handleViewedPhotoChange(null, currentRoute === 'album-detail' ? currentAlbumId : null);
   }
 
   // Edit mode
@@ -555,6 +561,7 @@
     <PhotoViewer
       bind:asset={activeViewerAsset}
       bind:open={viewerOpen}
+      albumId={currentRoute === 'album-detail' ? currentAlbumId : null}
       onclose={closePhoto}
       onedit={(a) => openEdit(a)}
       oninfo={() => (infoPanelOpen = true)}

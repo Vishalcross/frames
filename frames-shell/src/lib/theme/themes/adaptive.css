@@ -4,6 +4,19 @@
    ============================================================================= */
 
 [data-appearance="adaptive"] {
+  /* Map existing theme tokens to adaptive variables (Task 4-h #2) */
+  --bg-canvas: var(--adaptive-bg, #101216);
+  --bg-viewer: var(--adaptive-bg, #101216);
+  --content: var(--adaptive-bg, #101216);
+  --window: var(--adaptive-bg, #101216);
+  --bg-sidebar: var(--adaptive-sidebar, #181a20);
+  --sidebar-bg: var(--adaptive-sidebar, #181a20);
+  --sidebar: var(--adaptive-sidebar, #181a20);
+  --accent: var(--adaptive-accent, #0a84ff);
+  --accent-fg: var(--adaptive-on-accent, #ffffff);
+  --text-1: var(--adaptive-on-bg, #ffffff);
+  --sidebar-fg: var(--adaptive-on-sidebar, #ffffff);
+
   /* Ambient canvas background with 2 large blurred radial gradients (§7.5) */
   --ambient-bg: radial-gradient(
       60% 50% at 10% 10%,
@@ -23,9 +36,25 @@
   --glass-rim-top: 0.25;
 
   /* Sidebar tokens (§1.1-d) */
-  --sidebar-bg: var(--bg-sidebar);
   --sidebar-border: var(--separator);
   --sidebar-blur: none;
+
+  /* Smooth 400ms ease transitions (Task 4-h #3) */
+  transition: background-color 400ms ease, color 400ms ease;
+}
+
+/* Add smooth 400ms transitions to window background, sidebar and accent elements (Task 4-h #3) */
+[data-appearance="adaptive"] .app-shell,
+[data-appearance="adaptive"] .frames-sidebar,
+[data-appearance="adaptive"] .surface-sidebar,
+[data-appearance="adaptive"] .viewer-backdrop,
+[data-appearance="adaptive"] .viewer-hero,
+[data-appearance="adaptive"] .segmented-control,
+[data-appearance="adaptive"] .segmented-btn.selected,
+[data-appearance="adaptive"] .segmented-btn.active,
+[data-appearance="adaptive"] button.accent,
+[data-appearance="adaptive"] a {
+  transition: background-color 400ms ease, color 400ms ease;
 }
 
 [data-appearance="adaptive"][data-scheme="light"] {
@@ -47,4 +76,3 @@
   --glass-tint-amt: 80%;
   --glass-fg: #f5f5f7;
 }
-

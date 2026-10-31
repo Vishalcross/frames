@@ -15,6 +15,7 @@ import {
   oklchToCss
 } from './palette';
 import { detectGlassTier, resolveGlassForeground, setForceGovernorLevel } from './glass';
+import { clearAdaptivePalette, restoreAdaptivePalette } from '$lib/adaptive';
 
 /**
  * Theme Engine (§5.4)
@@ -237,40 +238,47 @@ function syncDOMTokens(): void {
   if (typeof document === 'undefined') return;
   const root = document.documentElement;
 
-  if (theme.appearance === 'adaptive' && resolved.palette) {
-    const isBrowsingOnly = theme.colourSource === 'viewer' && !activeViewerAssetId;
-    const intensity = isBrowsingOnly ? 'subtle' : theme.intensity;
-    const highContrast = root.getAttribute('data-contrast') === 'more';
+  if (theme.appearance === 'adaptive') {
+    restoreAdaptivePalette();
+    const hasAdaptiveBg = root.style.getPropertyValue('--adaptive-bg');
+    if (!hasAdaptiveBg && resolved.palette) {
+      const isBrowsingOnly = theme.colourSource === 'viewer' && !activeViewerAssetId;
+      const intensity = isBrowsingOnly ? 'subtle' : theme.intensity;
+      const highContrast = root.getAttribute('data-contrast') === 'more';
 
-    const roles = computeTonalRoles(
-      resolved.palette.seed,
-      resolved.palette.secondary,
-      resolved.scheme,
-      intensity,
-      highContrast
-    );
+      const roles = computeTonalRoles(
+        resolved.palette.seed,
+        resolved.palette.secondary,
+        resolved.scheme,
+        intensity,
+        highContrast
+      );
 
-    // Apply variables to root for smooth CSS transition
-    root.style.setProperty('--bg-canvas', roles.bgCanvas);
-    root.style.setProperty('--bg-sidebar', roles.bgSidebar);
-    root.style.setProperty('--sidebar-bg', roles.bgSidebar);
-    root.style.setProperty('--sidebar-border', roles.separator);
-    root.style.setProperty('--bg-viewer', roles.bgViewer);
-    root.style.setProperty('--surface-raised', roles.surfaceRaised);
-    root.style.setProperty('--surface-overlay', roles.surfaceOverlay);
-    root.style.setProperty('--fill-1', roles.fill1);
-    root.style.setProperty('--fill-2', roles.fill2);
-    root.style.setProperty('--fill-3', roles.fill3);
-    root.style.setProperty('--text-1', roles.text1);
-    root.style.setProperty('--text-2', roles.text2);
-    root.style.setProperty('--text-3', roles.text3);
-    root.style.setProperty('--separator', roles.separator);
-    root.style.setProperty('--accent', roles.accent);
-    root.style.setProperty('--accent-fg', roles.accentFg);
-    root.style.setProperty('--ad-ambient-1', roles.ambient1);
-    root.style.setProperty('--ad-ambient-2', roles.ambient2);
+      // Apply variables to root for smooth CSS transition
+      root.style.setProperty('--bg-canvas', roles.bgCanvas);
+      root.style.setProperty('--bg-sidebar', roles.bgSidebar);
+      root.style.setProperty('--sidebar-bg', roles.bgSidebar);
+      root.style.setProperty('--sidebar-border', roles.separator);
+      root.style.setProperty('--bg-viewer', roles.bgViewer);
+      root.style.setProperty('--surface-raised', roles.surfaceRaised);
+      root.style.setProperty('--surface-overlay', roles.surfaceOverlay);
+      root.style.setProperty('--fill-1', roles.fill1);
+      root.style.setProperty('--fill-2', roles.fill2);
+      root.style.setProperty('--fill-3', roles.fill3);
+      root.style.setProperty('--text-1', roles.text1);
+      root.style.setProperty('--text-2', roles.text2);
+      root.style.setProperty('--text-3', roles.text3);
+      root.style.setProperty('--separator', roles.separator);
+      root.style.setProperty('--accent', roles.accent);
+      root.style.setProperty('--accent-fg', roles.accentFg);
+      root.style.setProperty('--ad-ambient-1', roles.ambient1);
+      root.style.setProperty('--ad-ambient-2', roles.ambient2);
+    }
   } else {
-    // When not in adaptive mode, reset inline overrides so stylesheet tokens apply cleanly
+    // When not in adaptive mode, remove all five adaptive variables (Task 4-h #6)
+    clearAdaptivePalette();
+
+    // Reset inline overrides so stylesheet tokens apply cleanly
     root.style.removeProperty('--bg-canvas');
     root.style.removeProperty('--bg-sidebar');
     root.style.removeProperty('--sidebar-bg');

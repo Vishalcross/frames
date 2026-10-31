@@ -8,16 +8,19 @@
   import { isTauriAvailable, tauriRepo, getAssetUrl } from '$lib/services/tauriRepo';
   import { photoUrl, thumbUrl } from '$lib/media';
   import { theme, focusAsset } from '$lib/theme/engine.svelte';
+  import { handleViewedPhotoChange } from '$lib/adaptive';
 
   let {
     asset = $bindable(),
     open = $bindable(false),
+    albumId = null,
     onclose,
     onedit,
     oninfo
   }: {
     asset: Asset;
     open: boolean;
+    albumId?: string | null;
     onclose?: () => void;
     onedit?: (asset: Asset) => void;
     oninfo?: (asset: Asset) => void;
@@ -67,6 +70,7 @@
     if (asset) {
       // Focus asset in viewer with top priority (§7.6 #1)
       focusAsset(asset.id, { source: 'viewer', swatches: asset.palette || undefined, lum: asset.lum || undefined });
+      handleViewedPhotoChange(asset.id, albumId);
       // Reset zoom
       zoomScale = 1.0;
       panOffset = { x: 0, y: 0 };

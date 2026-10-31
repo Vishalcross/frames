@@ -156,56 +156,51 @@ pub fn generate_video_thumb_with_conn(
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
-        let temp_dest = dest.with_extension(format!("tmp.{}", fastrand::u64(..)));
         let scale_vf = format!("scale={}:-2", size.pixels());
 
-        // Try -ss 1 first
-        let status1 = crate::media::spawn_hidden_command("ffmpeg")
-            .arg("-y")
-            .arg("-ss")
-            .arg("1")
-            .arg("-i")
-            .arg(src)
-            .arg("-frames:v")
-            .arg("1")
-            .arg("-vf")
-            .arg(&scale_vf)
-            .arg(&temp_dest)
-            .status();
-
-        let ok1 = match status1 {
-            Ok(s) if s.success() && temp_dest.exists() && fs::metadata(&temp_dest).map(|m| m.len() > 0).unwrap_or(false) => true,
-            _ => false,
-        };
-
-        if !ok1 {
-            let _ = fs::remove_file(&temp_dest);
-            // Retry with -ss 0
-            let status0 = crate::media::spawn_hidden_command("ffmpeg")
+        // Extract frame via ffmpeg to pipe as mjpeg.
+        // Try -ss 1 first; if clip is shorter than 1s or seek fails, retry with -ss 0.
+        let extract_frame = |ss: &str| -> Result<Vec<u8>, String> {
+            let out = crate::media::spawn_hidden_command("ffmpeg")
                 .arg("-y")
                 .arg("-ss")
-                .arg("0")
+                .arg(ss)
                 .arg("-i")
                 .arg(src)
                 .arg("-frames:v")
                 .arg("1")
                 .arg("-vf")
                 .arg(&scale_vf)
-                .arg(&temp_dest)
-                .status();
+                .arg("-f")
+                .arg("image2pipe")
+                .arg("-vcodec")
+                .arg("mjpeg")
+                .arg("-")
+                .output()
+                .map_err(|e| format!("failed to invoke ffmpeg: {e}"))?;
 
-            let ok0 = match status0 {
-                Ok(s) if s.success() && temp_dest.exists() && fs::metadata(&temp_dest).map(|m| m.len() > 0).unwrap_or(false) => true,
-                _ => false,
-            };
-
-            if !ok0 {
-                let _ = fs::remove_file(&temp_dest);
-                return Err("ffmpeg video thumbnail generation failed".into());
+            if out.status.success() && !out.stdout.is_empty() {
+                Ok(out.stdout)
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).to_string())
             }
-        }
+        };
 
+        let frame_bytes = extract_frame("1").or_else(|_| extract_frame("0"))?;
+        let img = image::load_from_memory(&frame_bytes)
+            .map_err(|e| format!("failed to decode video frame: {e}"))?;
+        let rgb = img.to_rgb8();
+        let media_img = crate::media::RgbImage {
+            width: rgb.width(),
+            height: rgb.height(),
+            data: rgb.into_raw(),
+        };
+        let webp_bytes = crate::media::encode_webp_lossless(&media_img);
+
+        let temp_dest = PathBuf::from(format!("{}.tmp.{}", dest.display(), fastrand::u64(..)));
+        fs::write(&temp_dest, &webp_bytes).map_err(|e| e.to_string())?;
         fs::rename(&temp_dest, &dest).map_err(|e| e.to_string())?;
+
         Ok(dest)
     })();
 
@@ -264,6 +259,45 @@ mod tests {
 
         let _ = fs::remove_file(&png_src);
         let _ = fs::remove_file(&out_path);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn generate_video_thumb_creates_valid_thumbnail() {
+        let temp_dir = std::env::temp_dir().join(format!("frames_vid_test_{}", fastrand::u64(..)));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let vid_src = temp_dir.join("test_sample.mp4");
+
+        // Synthesize a 1-second 320x240 MP4 with ffmpeg lavfi testsrc
+        let gen = crate::media::spawn_hidden_command("ffmpeg")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=duration=1:size=320x240:rate=1")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg(&vid_src)
+            .status();
+
+        if let Ok(st) = gen {
+            if st.success() && vid_src.exists() {
+                let asset_id = format!("test-vid-{}", fastrand::u64(..));
+                let out_path = generate_video_thumb(&vid_src, &asset_id, ThumbSize::Small).unwrap();
+
+                assert!(out_path.exists());
+                assert!(thumb_exists(&asset_id, ThumbSize::Small));
+
+                let decoded = image::open(&out_path).unwrap();
+                let longest_edge = decoded.width().max(decoded.height());
+                assert!(longest_edge <= 256);
+
+                let _ = fs::remove_file(&vid_src);
+                let _ = fs::remove_file(&out_path);
+            }
+        }
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

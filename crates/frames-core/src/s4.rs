@@ -431,8 +431,8 @@ pub struct RemoteAsset {
 pub struct RemoteFetcher {
     store: Arc<dyn ObjectStore>,
     semaphore: Arc<tokio::sync::Semaphore>,
-    in_flight_originals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<std::path::PathBuf>>>>>,
-    in_flight_thumbs: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, u32), tokio::sync::watch::Receiver<Option<std::path::PathBuf>>>>>,
+    in_flight_originals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<Option<std::path::PathBuf>>>>>,
+    in_flight_thumbs: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, u32), tokio::sync::watch::Sender<Option<std::path::PathBuf>>>>>,
 }
 
 impl RemoteFetcher {
@@ -456,22 +456,32 @@ impl RemoteFetcher {
             _ => return Err(format!("asset {} has no remote_key", asset.id)),
         };
 
-        let (mut rx, am_leader) = {
+        let (tx, mut rx, am_leader) = {
             let mut map = self.in_flight_originals.lock().await;
-            if let Some(rx) = map.get(&asset.id) {
-                (rx.clone(), false)
+            if let Some(sender) = map.get(&asset.id) {
+                (None, sender.subscribe(), false)
             } else {
-                let (_, rx) = tokio::sync::watch::channel(None);
-                map.insert(asset.id.clone(), rx.clone());
-                (rx, true)
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                map.insert(asset.id.clone(), tx.clone());
+                (Some(tx), rx, true)
             }
         };
 
         if !am_leader {
-            let _ = rx.changed().await;
+            while rx.borrow().is_none() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
             return match rx.borrow().clone() {
                 Some(p) => Ok(p),
-                None => Err("in-flight download failed".into()),
+                None => {
+                    if dest.exists() {
+                        Ok(dest)
+                    } else {
+                        Err("in-flight download failed".into())
+                    }
+                }
             };
         }
 
@@ -498,6 +508,10 @@ impl RemoteFetcher {
 
         drop(permit);
 
+        if let Some(sender) = tx {
+            let _ = sender.send(res.as_ref().ok().cloned());
+        }
+
         let mut map = self.in_flight_originals.lock().await;
         map.remove(&asset.id);
 
@@ -512,22 +526,32 @@ impl RemoteFetcher {
 
         let key_pair = (asset.id.clone(), size.pixels());
 
-        let (mut rx, am_leader) = {
+        let (tx, mut rx, am_leader) = {
             let mut map = self.in_flight_thumbs.lock().await;
-            if let Some(rx) = map.get(&key_pair) {
-                (rx.clone(), false)
+            if let Some(sender) = map.get(&key_pair) {
+                (None, sender.subscribe(), false)
             } else {
-                let (_, rx) = tokio::sync::watch::channel(None);
-                map.insert(key_pair.clone(), rx.clone());
-                (rx, true)
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                map.insert(key_pair.clone(), tx.clone());
+                (Some(tx), rx, true)
             }
         };
 
         if !am_leader {
-            let _ = rx.changed().await;
+            while rx.borrow().is_none() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
             return match rx.borrow().clone() {
                 Some(p) => Ok(p),
-                None => Err("in-flight thumbnail download failed".into()),
+                None => {
+                    if dest.exists() {
+                        Ok(dest)
+                    } else {
+                        Err("in-flight thumbnail download failed".into())
+                    }
+                }
             };
         }
 
@@ -575,6 +599,10 @@ impl RemoteFetcher {
                 }
             }).await.map_err(|e| e.to_string())?
         };
+
+        if let Some(sender) = tx {
+            let _ = sender.send(final_res.as_ref().ok().cloned());
+        }
 
         let mut map = self.in_flight_thumbs.lock().await;
         map.remove(&key_pair);

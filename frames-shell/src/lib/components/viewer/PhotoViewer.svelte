@@ -6,6 +6,7 @@
   import Icon from '$lib/components/icons/Icon.svelte';
   import { getThumbnailDataUrl } from '$lib/mock/mockRepo';
   import { isTauriAvailable, tauriRepo, getAssetUrl } from '$lib/services/tauriRepo';
+  import { photoUrl, thumbUrl } from '$lib/media';
   import { theme, focusAsset } from '$lib/theme/engine.svelte';
 
   let {
@@ -33,6 +34,10 @@
   let idleTimer: any = null;
 
   // Video controls state
+  let videoElement = $state<HTMLVideoElement | null>(null);
+  let currentTime = $state(0);
+  let videoDuration = $state(0);
+  let isPaused = $state(true);
   let isPlaying = $state(false);
   let videoProgress = $state(0); // 0..100
   let isMuted = $state(false);
@@ -176,6 +181,15 @@
     return getThumbnailDataUrl(asset, 'preview');
   });
 
+  const fullPhotoUrl = $derived.by(() => {
+    if (fallbackPreviewUrl) return fallbackPreviewUrl;
+    if (previewError) return getThumbnailDataUrl(asset, 'preview');
+    if (isTauriAvailable()) {
+      return photoUrl(asset.id);
+    }
+    return getThumbnailDataUrl(asset, 'preview');
+  });
+
   async function handlePreviewError() {
     if (!fallbackPreviewUrl && isTauriAvailable()) {
       const url = await tauriRepo.getThumbnailDataUrl(asset.id, true);
@@ -302,12 +316,36 @@
           cursor: {zoomScale > 1.0 ? (isPanning ? 'grabbing' : 'grab') : 'default'};
         "
       >
-        <img
-          src={previewUrl}
-          alt={asset.title || 'Photo'}
-          class="viewer-main-image"
-          onerror={() => (previewError = true)}
-        />
+        {#if asset.kind === 'video'}
+          <video
+            bind:this={videoElement}
+            src={photoUrl(asset.id)}
+            class="viewer-main-image"
+            playsinline
+            loop={isLooping}
+            bind:currentTime
+            bind:duration={videoDuration}
+            bind:paused={isPaused}
+            bind:muted={isMuted}
+            bind:playbackRate={playbackSpeed}
+            onplay={() => (isPlaying = true)}
+            onpause={() => (isPlaying = false)}
+            ontimeupdate={() => {
+              if (videoDuration > 0) {
+                videoProgress = (currentTime / videoDuration) * 100;
+              }
+            }}
+          >
+            <track kind="captions" />
+          </video>
+        {:else}
+          <img
+            src={fullPhotoUrl}
+            alt={asset.title || 'Photo'}
+            class="viewer-main-image"
+            onerror={handlePreviewError}
+          />
+        {/if}
       </div>
 
       <!-- Thin progress ring bottom-right for original loading (§4.6) -->
@@ -334,7 +372,17 @@
     {#if asset.kind === 'video'}
       <div class="video-controls-bar {isIdle ? 'is-hidden' : ''}">
         <Surface kind="floating" class="video-controls-surface">
-          <Button variant="icon" onclick={() => (isPlaying = !isPlaying)}>
+          <Button variant="icon" onclick={() => {
+            if (videoElement) {
+              if (videoElement.paused) {
+                videoElement.play();
+              } else {
+                videoElement.pause();
+              }
+            } else {
+              isPlaying = !isPlaying;
+            }
+          }}>
             <Icon name={isPlaying ? 'pause' : 'play'} size={15} />
           </Button>
 
@@ -343,7 +391,14 @@
               type="range"
               min="0"
               max="100"
-              bind:value={videoProgress}
+              step="0.1"
+              value={videoProgress}
+              oninput={(e) => {
+                videoProgress = parseFloat(e.currentTarget.value);
+                if (videoElement && videoDuration > 0) {
+                  videoElement.currentTime = (videoProgress / 100) * videoDuration;
+                }
+              }}
               class="video-scrubber-input"
             />
           </div>
@@ -383,7 +438,7 @@
               onclick={() => (asset = neighbour)}
             >
               <img
-                src={isTauriAvailable() ? getAssetUrl('thumb', neighbour.id) : getThumbnailDataUrl(neighbour, 'thumb')}
+                src={isTauriAvailable() ? thumbUrl(neighbour.id) : getThumbnailDataUrl(neighbour, 'thumb')}
                 alt=""
                 loading="lazy"
               />

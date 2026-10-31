@@ -154,6 +154,7 @@ pub struct AppState {
     pub thumb_sync_running: Arc<AtomicBool>,
     pub thumb_worker: Arc<frames_core::thumb_worker::ThumbWorker>,
     pub upload_worker: Arc<frames_core::UploadWorker>,
+    pub remote_fetcher: Arc<Mutex<Option<frames_core::RemoteFetcher>>>,
 }
 
 impl AppState {
@@ -235,6 +236,21 @@ impl AppState {
             thumb_sync_running: Arc::new(AtomicBool::new(false)),
             thumb_worker: Arc::new(frames_core::thumb_worker::ThumbWorker::new()),
             upload_worker: Arc::new(frames_core::UploadWorker::new()),
+            remote_fetcher: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn get_or_create_remote_fetcher(&self) -> Option<frames_core::RemoteFetcher> {
+        let mut guard = self.remote_fetcher.lock().ok()?;
+        if let Some(fetcher) = guard.as_ref() {
+            return Some(fetcher.clone());
+        }
+        if let Ok(s4) = self.require_s4() {
+            let fetcher = frames_core::RemoteFetcher::new(s4);
+            *guard = Some(fetcher.clone());
+            Some(fetcher)
+        } else {
+            None
         }
     }
 
@@ -466,6 +482,7 @@ fn fetch_original_unlocked(
 fn serve_file_with_range(
     file_path: &Path,
     request_headers: &tauri::http::HeaderMap,
+    method: &tauri::http::Method,
 ) -> Response<Vec<u8>> {
     let metadata = match fs::metadata(file_path) {
         Ok(m) => m,
@@ -497,44 +514,141 @@ fn serve_file_with_range(
         _ => "application/octet-stream",
     };
 
-    if let Some(range_hdr) = request_headers.get("range").and_then(|v| v.to_str().ok()) {
-        if let Some(spec) = range_hdr.strip_prefix("bytes=") {
-            let (s_str, e_str) = spec.split_once('-').unwrap_or((spec, ""));
-            let start: u64 = s_str.parse().unwrap_or(0);
-            let end: u64 = if e_str.is_empty() {
-                file_len.saturating_sub(1)
-            } else {
-                e_str.parse().unwrap_or(file_len.saturating_sub(1)).min(file_len.saturating_sub(1))
-            };
+    if file_len == 0 {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, "0")
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(Vec::new())
+            .unwrap();
+    }
 
-            if start <= end && start < file_len {
-                let chunk_len = (end - start + 1) as usize;
-                let mut f = match fs::File::open(file_path) {
-                    Ok(f) => f,
+    if let Some(range_hdr) = request_headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        if let Some(spec) = range_hdr.strip_prefix("bytes=") {
+            let spec = spec.trim();
+            let (s_str, e_str) = spec.split_once('-').unwrap_or((spec, ""));
+            let s_str = s_str.trim();
+            let e_str = e_str.trim();
+
+            let (start, end) = if s_str.is_empty() {
+                // Suffix byte range: bytes=-500 (last 500 bytes)
+                let suffix: u64 = match e_str.parse() {
+                    Ok(n) => n,
                     Err(_) => {
                         return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
                             .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                             .body(Vec::new())
                             .unwrap();
                     }
                 };
-                if f.seek(SeekFrom::Start(start)).is_ok() {
-                    let mut buf = vec![0u8; chunk_len];
-                    if f.read_exact(&mut buf).is_ok() {
+                let suffix = suffix.min(file_len);
+                (file_len - suffix, file_len - 1)
+            } else if e_str.is_empty() {
+                // Prefix / open-ended range: bytes=500- (cap chunk to max 8MB)
+                let start: u64 = match s_str.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
                         return Response::builder()
-                            .status(StatusCode::PARTIAL_CONTENT)
-                            .header(header::CONTENT_TYPE, content_type)
-                            .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_len}"))
-                            .header(header::CONTENT_LENGTH, chunk_len.to_string())
-                            .header(header::ACCEPT_RANGES, "bytes")
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
                             .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .body(buf)
+                            .body(Vec::new())
                             .unwrap();
                     }
+                };
+                let max_chunk: u64 = 8 * 1024 * 1024;
+                let end = (start + max_chunk - 1).min(file_len - 1);
+                (start, end)
+            } else {
+                let start: u64 = match s_str.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Response::builder()
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
+                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .body(Vec::new())
+                            .unwrap();
+                    }
+                };
+                let end: u64 = match e_str.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Response::builder()
+                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
+                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .body(Vec::new())
+                            .unwrap();
+                    }
+                };
+                (start, end.min(file_len - 1))
+            };
+
+            if start > end || start >= file_len {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+
+            let chunk_len = (end - start + 1) as usize;
+            if method == tauri::http::Method::HEAD {
+                return Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_len}"))
+                    .header(header::CONTENT_LENGTH, chunk_len.to_string())
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+
+            let mut f = match fs::File::open(file_path) {
+                Ok(f) => f,
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(Vec::new())
+                        .unwrap();
+                }
+            };
+
+            if f.seek(SeekFrom::Start(start)).is_ok() {
+                let mut buf = vec![0u8; chunk_len];
+                if f.read_exact(&mut buf).is_ok() {
+                    return Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_len}"))
+                        .header(header::CONTENT_LENGTH, chunk_len.to_string())
+                        .header(header::ACCEPT_RANGES, "bytes")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .body(buf)
+                        .unwrap();
                 }
             }
         }
+    }
+
+    if method == tauri::http::Method::HEAD {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, file_len.to_string())
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .body(Vec::new())
+            .unwrap();
     }
 
     match fs::read(file_path) {
@@ -653,8 +767,7 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                     }
                 }
 
-                if let Ok(s4) = state.require_s4() {
-                    let fetcher = frames_core::RemoteFetcher::new(s4);
+                if let Some(fetcher) = state.get_or_create_remote_fetcher() {
                     let remote_asset = frames_core::RemoteAsset {
                         id: id.to_string(),
                         kind: kind.clone(),
@@ -713,17 +826,16 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                 if let Some(lp) = local_path {
                     let src = Path::new(&lp);
                     if src.is_file() {
-                        return serve_file_with_range(src, request.headers());
+                        return serve_file_with_range(src, request.headers(), request.method());
                     }
                 }
 
                 let cached_orig = frames_core::thumbs::app_cache_dir().join("originals").join(id);
                 if cached_orig.is_file() {
-                    return serve_file_with_range(&cached_orig, request.headers());
+                    return serve_file_with_range(&cached_orig, request.headers(), request.method());
                 }
 
-                if let Ok(s4) = state.require_s4() {
-                    let fetcher = frames_core::RemoteFetcher::new(s4);
+                if let Some(fetcher) = state.get_or_create_remote_fetcher() {
                     let remote_asset = frames_core::RemoteAsset {
                         id: id.to_string(),
                         kind,
@@ -731,7 +843,7 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                     };
                     if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_original(&remote_asset)) {
                         if p.is_file() {
-                            return serve_file_with_range(&p, request.headers());
+                            return serve_file_with_range(&p, request.headers(), request.method());
                         }
                     }
                 }
@@ -1736,7 +1848,7 @@ pub fn run() {
                 .name("frames-local-scan".into())
                 .spawn(move || {
                     let state = handle_scan.state::<AppState>();
-                    let db_path = state.data_dir.join("library.sqlite");
+                    let db_path = state.data_dir.join("frames.sqlite3");
                     let worker = Arc::clone(&state.thumb_worker);
 
                     if let Ok(store) = state.store.lock() {
@@ -1834,22 +1946,71 @@ mod tests {
     #[test]
     fn test_uri_parsing_for_frames_protocol() {
         let req1: tauri::http::Request<Vec<u8>> = tauri::http::Request::builder()
-            .uri("frames://thumb/317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d")
+            .uri("frames://thumb/317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d/256")
             .body(Vec::new())
             .unwrap();
         let uri1 = req1.uri();
         let raw_path1 = uri1.path().trim_start_matches('/');
         let host1 = uri1.host().unwrap_or("");
-        println!("REQ1: host='{host1}', path='{}', raw_path='{raw_path1}'", uri1.path());
+        let combined1 = if !host1.is_empty() && host1 != "localhost" && host1 != "frames.localhost" {
+            format!("{host1}/{raw_path1}")
+        } else {
+            raw_path1.to_string()
+        };
+        let segs1: Vec<&str> = combined1.split('/').filter(|s| !s.is_empty()).collect();
+        assert_eq!(segs1[0], "thumb");
+        assert_eq!(segs1[1], "317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d");
+        assert_eq!(segs1[2], "256");
 
         let req2: tauri::http::Request<Vec<u8>> = tauri::http::Request::builder()
-            .uri("frames://localhost/thumb/317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d")
+            .uri("frames://localhost/photo/317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d")
             .body(Vec::new())
             .unwrap();
         let uri2 = req2.uri();
         let raw_path2 = uri2.path().trim_start_matches('/');
         let host2 = uri2.host().unwrap_or("");
-        println!("REQ2: host='{host2}', path='{}', raw_path='{raw_path2}'", uri2.path());
+        let combined2 = if !host2.is_empty() && host2 != "localhost" && host2 != "frames.localhost" {
+            format!("{host2}/{raw_path2}")
+        } else {
+            raw_path2.to_string()
+        };
+        let segs2: Vec<&str> = combined2.split('/').filter(|s| !s.is_empty()).collect();
+        assert_eq!(segs2[0], "photo");
+        assert_eq!(segs2[1], "317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d");
+    }
+
+    #[test]
+    fn test_serve_file_with_range_behaviors() {
+        let tmp = std::env::temp_dir().join(format!("range-test-{}", fastrand::u64(..)));
+        fs::write(&tmp, b"0123456789abcdefghij").unwrap(); // 20 bytes
+
+        // 1. Regular GET request
+        let mut headers = tauri::http::HeaderMap::new();
+        let resp = serve_file_with_range(&tmp, &headers, &tauri::http::Method::GET);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body().len(), 20);
+
+        // 2. Standard byte range
+        headers.insert(header::RANGE, "bytes=0-4".parse().unwrap());
+        let resp = serve_file_with_range(&tmp, &headers, &tauri::http::Method::GET);
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.body().as_slice(), b"01234");
+        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 0-4/20");
+
+        // 3. Suffix byte range: last 5 bytes
+        headers.insert(header::RANGE, "bytes=-5".parse().unwrap());
+        let resp = serve_file_with_range(&tmp, &headers, &tauri::http::Method::GET);
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.body().as_slice(), b"fghij");
+        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 15-19/20");
+
+        // 4. Unsatisfiable range -> 416
+        headers.insert(header::RANGE, "bytes=50-100".parse().unwrap());
+        let resp = serve_file_with_range(&tmp, &headers, &tauri::http::Method::GET);
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes */20");
+
+        let _ = fs::remove_file(&tmp);
     }
 
     #[test]

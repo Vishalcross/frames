@@ -130,9 +130,13 @@ impl ThumbWorker {
                     let in_flight = self.active_in_flight.lock().unwrap();
                     while let Some(pid) = pq.pop_front() {
                         if !in_flight.contains(&pid) {
+                            if crate::thumbs::thumb_exists(&pid, ThumbSize::Small) {
+                                crate::thumbs::update_thumb_state(&conn, &pid, "ready");
+                                continue;
+                            }
                             // Look up asset in db
                             let row = conn.query_row(
-                                "SELECT id, kind, local_path FROM assets WHERE id = ?1 AND local_path IS NOT NULL",
+                                "SELECT id, kind, local_path FROM assets WHERE id = ?1 AND local_path IS NOT NULL AND thumb_state IN ('none', 'failed')",
                                 [&pid],
                                 |r| {
                                     Ok(AssetThumbTask {

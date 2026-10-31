@@ -1453,9 +1453,9 @@ fn write_flat_byte_tree_green(bw: &mut BitWriter) {
     // num_code_lengths = 19 (4 + 15)
     bw.write_bits(15, 4);
     // Code length order: [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, ...]
-    // Give code length 1 to symbol `8` (at index 11) and `0` to everything else
+    // Index 2 is symbol 0 (code 0, len 1). Index 11 is symbol 8 (code 1, len 1).
     for i in 0..19 {
-        let len = if i == 11 { 1 } else { 0 };
+        let len = if i == 2 || i == 11 { 1 } else { 0 };
         bw.write_bits(len, 3);
     }
     // use_max_symbol = 1, length_nbits = 3 (for 8 bits -> max_symbol = 256)
@@ -1463,7 +1463,7 @@ fn write_flat_byte_tree_green(bw: &mut BitWriter) {
     bw.write_bits(3, 3); // nbits = 2 + 2*3 = 8
     bw.write_bits(254, 8); // max_symbol = 254 + 2 = 256
     for _ in 0..256 {
-        bw.write_bits(0, 1); // single symbol `8` has code `0`
+        bw.write_bits(1, 1); // symbol `8` has code `1`
     }
 }
 
@@ -1471,12 +1471,12 @@ fn write_flat_byte_tree_256(bw: &mut BitWriter) {
     bw.write_bits(0, 1); // is_simple = 0
     bw.write_bits(15, 4);
     for i in 0..19 {
-        let len = if i == 11 { 1 } else { 0 };
+        let len = if i == 2 || i == 11 { 1 } else { 0 };
         bw.write_bits(len, 3);
     }
     bw.write_bits(0, 1); // use_max_symbol = 0 (all 256 symbols)
     for _ in 0..256 {
-        bw.write_bits(0, 1);
+        bw.write_bits(1, 1); // symbol `8` has code `1`
     }
 }
 

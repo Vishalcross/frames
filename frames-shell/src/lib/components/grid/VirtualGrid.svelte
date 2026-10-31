@@ -30,8 +30,13 @@
   let containerHeight = $state(800);
   let scrollTop = $state(0);
 
-  let totalAssets = $state(100_000);
+  let totalAssets = $state(0);
   let assetsMap = $state<Map<number, Asset>>(new Map());
+
+  const PAGE_SIZE = 200;
+  let loadedPages = new Set<number>();
+  let inFlightPages = new Set<number>();
+  let activeQueryKey = '';
 
   // Date pill state (§4.3)
   let datePillText = $state('October 2026');
@@ -67,26 +72,49 @@
   const startIndex = $derived(startRow * cols);
   const endIndex = $derived(Math.min(totalAssets, endRow * cols));
 
-  // Load visible batch of assets from repo
+  // Query count & cache invalidation
   $effect(() => {
-    const fetchVisible = async () => {
-      const needed = endIndex - startIndex;
-      if (needed <= 0) return;
-      const assets = await repo.range(query, startIndex, needed);
-      const newMap = new Map(assetsMap);
-      assets.forEach((a, i) => {
-        newMap.set(startIndex + i, a);
+    const qKey = JSON.stringify(query);
+    if (qKey !== activeQueryKey) {
+      activeQueryKey = qKey;
+      loadedPages.clear();
+      inFlightPages.clear();
+      assetsMap = new Map();
+      repo.count(query).then((cnt) => {
+        totalAssets = cnt;
       });
-      assetsMap = newMap;
-    };
-    fetchVisible();
+    }
   });
 
-  // Query count update
+  // Load pages of 200 assets covering visible rows
   $effect(() => {
-    repo.count(query).then((cnt) => {
-      totalAssets = cnt;
-    });
+    if (totalAssets <= 0) return;
+    const s = startIndex;
+    const e = Math.min(totalAssets, endIndex);
+    if (e <= s) return;
+
+    const startPage = Math.floor(s / PAGE_SIZE);
+    const endPage = Math.floor(Math.max(0, e - 1) / PAGE_SIZE);
+
+    for (let p = startPage; p <= endPage; p++) {
+      if (p * PAGE_SIZE >= totalAssets) continue;
+      if (!loadedPages.has(p) && !inFlightPages.has(p)) {
+        inFlightPages.add(p);
+        const offset = p * PAGE_SIZE;
+        const pageIdx = p;
+        repo.range(query, offset, PAGE_SIZE).then((assets) => {
+          loadedPages.add(pageIdx);
+          inFlightPages.delete(pageIdx);
+          const newMap = new Map(assetsMap);
+          assets.forEach((a, i) => {
+            newMap.set(offset + i, a);
+          });
+          assetsMap = newMap;
+        }).catch(() => {
+          inFlightPages.delete(pageIdx);
+        });
+      }
+    }
   });
 
   onMount(async () => {
@@ -96,8 +124,8 @@
     containerHeight = rect.height || 800;
 
     await tick();
-    // Opens scrolled to the newest photo at the bottom (§4.3)
-    if (totalGridHeight > containerHeight) {
+    // Opens scrolled to the newest photo at the bottom (§4.3) unless viewing an album
+    if (totalGridHeight > containerHeight && query.scope !== 'album') {
       containerRef.scrollTop = totalGridHeight - containerHeight;
     }
   });

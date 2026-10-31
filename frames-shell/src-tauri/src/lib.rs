@@ -1195,10 +1195,14 @@ fn album_asset_count(album_id: String, state: State<'_, AppState>) -> Result<usi
 #[tauri::command]
 fn get_album_assets(
     album_id: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<AssetSummary>, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
-    store.list_album_assets(&album_id).map_err(|e| e.to_string())
+    store
+        .list_album_assets_paged(&album_id, offset, limit)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -1302,18 +1302,29 @@ impl Store {
 
     /// List visible assets in an album, sorted by `taken_at DESC, id ASC`.
     pub fn list_album_assets(&self, album_id: &str) -> Result<Vec<AssetSummary>> {
+        self.list_album_assets_paged(album_id, None, None)
+    }
+
+    /// List visible assets in an album with pagination, sorted by `taken_at DESC, id ASC`.
+    pub fn list_album_assets_paged(
+        &self,
+        album_id: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<Vec<AssetSummary>> {
+        let lim = limit.unwrap_or(usize::MAX) as i64;
+        let off = offset.unwrap_or(0) as i64;
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.kind, s.key, s.filename, s.size, s.taken_at, s.tz_offset,
                     s.date_guessed, s.width, s.height, s.duration_ms, s.thumb_failed
-             FROM album_items ai
-             JOIN albums a ON a.id = ai.album_id
-             JOIN assets s ON s.id = ai.asset_id
-             WHERE ai.album_id = ?1 AND ai.in_album = 1
-               AND a.deleted_at IS NULL
+             FROM assets s
+             WHERE (s.album_id = ?1
+                OR s.id IN (SELECT ai.asset_id FROM album_items ai WHERE ai.album_id = ?1 AND ai.in_album = 1))
                AND s.trashed_at IS NULL AND s.purged_at IS NULL
-             ORDER BY s.taken_at DESC, s.id ASC",
+             ORDER BY s.taken_at DESC, s.id ASC
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map([album_id], row_to_summary)?;
+        let rows = stmt.query_map(params![album_id, lim, off], row_to_summary)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -2565,5 +2576,50 @@ mod tests {
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].asset_count, 5);
     }
+
+    #[test]
+    fn list_album_assets_paged_orders_date_desc_and_supports_limits() {
+        let store = Store::open_in_memory("mac-1").unwrap();
+        let conn = store.connection();
+        let album_id = "album-paged-test";
+        conn.execute(
+            "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, 'Paged Album', 'now', 'now')",
+            [album_id],
+        ).unwrap();
+
+        // Insert 10 assets with increasing taken_at dates
+        for i in 1..=10 {
+            let day = format!("{:02}", i);
+            let taken = format!("2026-05-{}T12:00:00Z", day);
+            conn.execute(
+                "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, album_id)
+                 VALUES (?1, 'photo', ?2, 100, ?3, 'now', 'now', ?4)",
+                params![format!("id-{}", i), format!("photo{}.jpg", i), taken, album_id],
+            ).unwrap();
+        }
+
+        // Page 1: limit 4, offset 0 (newest 4 items: id-10, id-9, id-8, id-7)
+        let page1 = store.list_album_assets_paged(album_id, Some(0), Some(4)).unwrap();
+        assert_eq!(page1.len(), 4);
+        assert_eq!(page1[0].id, "id-10");
+        assert_eq!(page1[1].id, "id-9");
+        assert_eq!(page1[2].id, "id-8");
+        assert_eq!(page1[3].id, "id-7");
+
+        // Page 2: limit 4, offset 4 (next 4 items: id-6, id-5, id-4, id-3)
+        let page2 = store.list_album_assets_paged(album_id, Some(4), Some(4)).unwrap();
+        assert_eq!(page2.len(), 4);
+        assert_eq!(page2[0].id, "id-6");
+        assert_eq!(page2[1].id, "id-5");
+        assert_eq!(page2[2].id, "id-4");
+        assert_eq!(page2[3].id, "id-3");
+
+        // Page 3: limit 4, offset 8 (remaining 2 items: id-2, id-1)
+        let page3 = store.list_album_assets_paged(album_id, Some(8), Some(4)).unwrap();
+        assert_eq!(page3.len(), 2);
+        assert_eq!(page3[0].id, "id-2");
+        assert_eq!(page3[1].id, "id-1");
+    }
 }
+
 

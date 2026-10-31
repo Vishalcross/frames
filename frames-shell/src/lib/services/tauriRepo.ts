@@ -199,10 +199,14 @@ export class TauriAssetRepo implements AssetRepo {
     return Array.from(yearsSet).sort((a, b) => b - a);
   }
 
-  async getAlbumAssets(albumId: string): Promise<Asset[]> {
+  async getAlbumAssets(albumId: string, offset?: number, limit?: number): Promise<Asset[]> {
     if (!isTauriAvailable()) return [];
     try {
-      const list = await invoke<BackendAssetSummary[]>('get_album_assets', { albumId });
+      const list = await invoke<BackendAssetSummary[]>('get_album_assets', {
+        albumId,
+        offset: offset ?? null,
+        limit: limit ?? null
+      });
       return list.map(backendSummaryToAsset);
     } catch (e) {
       console.warn('Failed to get album assets:', e);
@@ -244,6 +248,12 @@ export class TauriAssetRepo implements AssetRepo {
   async range(q: Query, from: number, n: number): Promise<Asset[]> {
     if (!this.isLoaded) {
       await this.loadBootstrap();
+    }
+
+    if (q.scope === 'album' && q.albumId) {
+      if (isTauriAvailable()) {
+        return await this.getAlbumAssets(q.albumId, from, n);
+      }
     }
 
     let list: Asset[] = this.cachedAssets;

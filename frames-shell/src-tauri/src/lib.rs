@@ -15,7 +15,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use frames_core::cache::{CacheStats, LocalCache, DEFAULT_CACHE_LIMIT_BYTES};
-use frames_core::media::{encode_webp_lossless, spawn_hidden_command, RgbImage};
+use frames_core::media::{encode_webp_lossless, RgbImage};
+#[cfg(target_os = "windows")]
+use frames_core::media::spawn_hidden_command;
 use frames_core::ops::{AssetKind, AssetRecord};
 use frames_core::player::{
     detect_best_h264_encoder, H264Encoder, LoopbackStreamServer, PlaybackDecision,
@@ -1142,14 +1144,21 @@ async fn pick_folder_dialog(prompt: Option<String>) -> Result<Option<String>, St
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "macos")]
         {
-            let safe_title = title.replace('"', "\\\"");
-            let script = format!("POSIX path of (choose folder with prompt \"{safe_title}\")");
-            let out = spawn_hidden_command("osascript")
+            let safe_title = title.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!(
+                "tell application \"System Events\" to activate\nPOSIX path of (choose folder with prompt \"{safe_title}\")"
+            );
+            let out = std::process::Command::new("/usr/bin/osascript")
                 .args(["-e", &script])
                 .output()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Could not open the folder dialog: {e}"))?;
             if !out.status.success() {
-                return Ok(None);
+                let err = String::from_utf8_lossy(&out.stderr);
+                // -128 is "User canceled."
+                if err.contains("-128") {
+                    return Ok(None);
+                }
+                return Err(format!("Folder dialog failed: {}", err.trim()));
             }
             let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if chosen.is_empty() {

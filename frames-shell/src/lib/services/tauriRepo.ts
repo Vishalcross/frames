@@ -501,7 +501,7 @@ export class TauriAssetRepo implements AssetRepo {
   }
 
   // Native File Dialog & Import (§4.1, §7)
-  async pickFolderAndImport(): Promise<{ count: number; error?: string }> {
+  async pickFolderAndImport(): Promise<{ count: number; error?: string; note?: string; cancelled?: boolean }> {
     if (!isTauriAvailable()) {
       return { count: 0, error: 'Native folder dialog requires the desktop Tauri runtime.' };
     }
@@ -510,14 +510,23 @@ export class TauriAssetRepo implements AssetRepo {
         prompt: 'Choose a folder of photos to import into Frames'
       });
       if (!chosen) {
-        return { count: 0 };
+        return { count: 0, cancelled: true };
       }
       const report = await invoke<any>('import_from_paths', {
         paths: [chosen],
         albumId: null
       });
       await this.loadBootstrap();
-      return { count: report.imported_count || 0 };
+      const parts: string[] = [];
+      if (report.duplicates_skipped) parts.push(`${report.duplicates_skipped} already imported`);
+      if (report.unknown_files?.length) parts.push(`${report.unknown_files.length} unsupported`);
+      if (report.failed_files?.length) {
+        const f = report.failed_files[0];
+        parts.push(`${report.failed_files.length} failed (${f.path ?? ''} ${f.reason ?? ''})`.trim());
+      }
+      if (report.paused_offline) parts.push('paused: offline');
+      if (report.stopped_space_full) parts.push('stopped: S4 space full');
+      return { count: report.imported_count || 0, note: parts.join(', ') };
     } catch (e: any) {
       return { count: 0, error: e?.toString() || 'Import failed' };
     }

@@ -356,11 +356,17 @@
     const res = await tauriRepo.pickFolderAndImport();
     if (res.error) {
       toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: res.error }];
+    } else if (res.cancelled) {
+      // user dismissed the folder dialog
     } else {
       await loadLibraryData();
       toasts = [
         ...toasts,
-        { id: Date.now().toString(), type: 'info', text: `Imported ${res.count} photos into SQLite database!` }
+        {
+          id: Date.now().toString(),
+          type: res.count > 0 ? 'info' : 'warning',
+          text: `Imported ${res.count} item(s)${res.note ? ` — ${res.note}` : ''}`
+        }
       ];
     }
   }

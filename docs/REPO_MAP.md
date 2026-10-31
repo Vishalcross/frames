@@ -84,3 +84,83 @@ A map of key components, paths, and behaviors across Frames.
   - `csp`: **Set**. Exact value:
     `"default-src 'self'; img-src 'self' data: blob: frames: http://frames.localhost https://frames.localhost; media-src 'self' blob: frames: http://frames.localhost http://127.0.0.1:* https://*.mega.io https://*; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost frames: http://frames.localhost http://127.0.0.1:*"`
 
+## Glass differences
+
+### Diff of Liquid Glass vs Working Themes (Tagged)
+
+1. `frames-shell/src-tauri/tauri.conf.json`: lines 13–30
+   - Shared window settings (`titleBarStyle: "Overlay"`, `hiddenTitle: true`, `windowEffects: ["underWindowBackground", "mica"]`). No theme-specific window rules exist. **[WINDOW]**
+2. `frames-shell/src-tauri/src/lib.rs`: lines 1–1900
+   - No theme branches or theme-specific window settings. **[WINDOW]**
+3. `frames-shell/src/routes/+page.svelte`: lines 408–409
+   - `<Backplate />` rendered behind the sidebar only in glass mode. **[LAYOUT]**
+4. `frames-shell/src/lib/components/effects/Backplate.svelte`: lines 12–16
+   - `{#if theme.appearance === 'glass'}` renders `.sidebar-backplate`. **[LAYOUT]**
+5. `frames-shell/src/lib/components/effects/Backplate.svelte`: lines 19–30
+   - `.sidebar-backplate` defines `position: absolute; top: 8px; left: 8px; width: var(--sidebar-w, 240px); height: calc(100vh - 16px); border-radius: 20px;`. **[LAYOUT]**
+6. `frames-shell/src/lib/components/effects/Backplate.svelte`: lines 32–41
+   - `.backplate-mosaic` blurred multi-stop radial gradient layer. **[MATERIAL]**
+7. `frames-shell/src/lib/components/surface/Surface.svelte`: lines 29–35
+   - `theme.appearance === 'glass'` attaches `setupGlassSpecular(element)` mouse move listeners. **[MATERIAL]**
+8. `frames-shell/src/lib/components/surface/Surface.svelte`: lines 40–44
+   - `if (theme.appearance === 'glass')`: returns `'20px'` radius for `kind === 'sidebar'`. **[LAYOUT]**
+9. `frames-shell/src/lib/components/surface/Surface.svelte`: line 56
+   - `theme.appearance === 'glass' ? 'glass-material' : ''` applies `.glass-material` to surfaces including sidebar. **[MATERIAL]**
+10. `frames-shell/src/lib/components/surface/Surface.svelte`: lines 115–119
+    - `.appearance-glass.surface-sidebar { margin: 8px; height: calc(100vh - 16px); }`. **[LAYOUT]**
+11. `frames-shell/src/lib/components/surface/Surface.svelte`: lines 121–124
+    - `.appearance-glass.surface-cluster, .appearance-glass.surface-floating { box-shadow: var(--shadow-2); }`. **[MATERIAL]**
+12. `frames-shell/src/lib/components/surface/Surface.svelte`: lines 126–129
+    - `.appearance-glass.surface-control { border-radius: 999px; }`. **[LAYOUT]**
+13. `frames-shell/src/lib/theme/themes/glass.css`: lines 6–36
+    - `[data-appearance="glass"][data-scheme="light"]` token declarations (`--bg-sidebar: transparent;`, `--glass-backdrop`, `--glass-tint`, etc.). **[MATERIAL]**
+14. `frames-shell/src/lib/theme/themes/glass.css`: lines 38–68
+    - `[data-appearance="glass"][data-scheme="dark"]` token declarations. **[MATERIAL]**
+15. `frames-shell/src/lib/theme/themes/glass.css`: lines 71–90
+    - `.glass-material` background gradient, backdrop-filter, border-radius, box-shadow. **[MATERIAL]** (border-radius: **[LAYOUT]**)
+16. `frames-shell/src/lib/theme/themes/glass.css`: lines 93–110
+    - `.glass-material::before` gradient rim pseudo-element overlay. **[MATERIAL]**
+17. `frames-shell/src/lib/theme/themes/glass.css`: lines 113–126
+    - `.glass-material::after` specular highlight radial-gradient pseudo-element overlay. **[MATERIAL]**
+18. `frames-shell/src/lib/theme/themes/glass.css`: lines 129–134
+    - `.glass-clear` transparency adjustments. **[MATERIAL]**
+19. `frames-shell/src/lib/theme/themes/glass.css`: lines 137–140
+    - `.glass-clear.dimmed` brightness overlay. **[MATERIAL]**
+20. `frames-shell/src/lib/theme/themes/glass.css`: lines 143–146
+    - `[data-glass-tier="2"] .glass-material` SVG lens refraction filter. **[MATERIAL]**
+21. `frames-shell/src/lib/theme/themes/glass.css`: lines 149–154
+    - `[data-reduce-transparency="true"]` & `[data-glass-gov="L3"]` fallback solid background. **[MATERIAL]**
+22. `frames-shell/src/lib/theme/themes/glass.css`: lines 157–168
+    - `.scroll-edge-fade` top sticky mask and fade. **[LAYOUT]**
+23. `frames-shell/src/lib/theme/engine.svelte.ts`: lines 270–288
+    - Dynamic inline `--glass-tint`, `--glass-tint-amt`, and `--glass-fg` properties. **[MATERIAL]**
+24. `frames-shell/src/lib/components/toolbar/Toolbar.svelte`: lines 79–245, 414–436
+    - `{#if theme.appearance === 'glass'}` renders floating clusters (`.glass-toolbar-container`, `.toolbar-cluster`). **[LAYOUT]**
+25. `frames-shell/src/lib/components/info/InfoPanel.svelte`: lines 195–201
+    - `:global(.appearance-glass .info-panel-surface) { position: absolute; top: 8px; right: 8px; height: calc(100vh - 16px); border-radius: var(--r-xl); }`. **[LAYOUT]**
+26. `frames-shell/src/lib/components/viewer/PhotoViewer.svelte`: line 224
+    - `kind={theme.appearance === 'glass' ? 'cluster' : 'floating'}` viewer toolbar layout. **[LAYOUT]**
+27. `frames-shell/src/lib/components/surface/SegmentedControl.svelte`: lines 127–142
+    - Glass styling for segmented pill. **[MATERIAL]**
+28. `frames-shell/src/lib/components/surface/Button.svelte`: lines 135–154
+    - Glass styling for buttons. **[MATERIAL]**
+29. `frames-shell/src/lib/components/surface/Field.svelte`: lines 164–171
+    - Glass styling for text input fields. **[MATERIAL]**
+30. `frames-shell/src/lib/components/surface/Slider.svelte`: lines 158–164
+    - Glass thumb styling. **[MATERIAL]**
+31. `frames-shell/src/lib/components/settings/AppearancePane.svelte`: lines 259–300, 472–491
+    - Settings controls and preview mockup styling. **[MATERIAL]** / **[LAYOUT]**
+32. `frames-shell/src/lib/styles/aero.css`: lines 1–270
+    - Legacy unimported Aero glass theme stylesheet. **[LAYOUT]** / **[MATERIAL]**
+
+### Light Theme Sidebar Values
+
+- `width`: `240px` (defined via `--sidebar-w: 240px` in `tokens.css` and `sidebarWidth` state bound to `style="width: 240px"` on `Surface`)
+- `padding-top`: `0px` on `.frames-sidebar` / `.sidebar-scrollable`; vertical clearance for traffic lights is provided by `.sidebar-top-inset` with `height: 38px`
+- `padding-left`: `10px` (from `.sidebar-scrollable { padding: 0 10px 10px; }`)
+- `border-right`: `1px solid var(--separator)` which resolves in Light theme to `1px solid rgba(60, 60, 67, 0.16)`
+- `background`: `var(--bg-sidebar)` which resolves in Light theme to `#f2f2f7`
+- **Element that reserves space for the traffic lights:**
+  - Window titlebar: `.mac-traffic-spacer` in `frames-shell/src/lib/components/chrome/TitleBar.svelte` (`width: 78px; height: 100% (32px);`)
+  - Sidebar clearance: `.sidebar-top-inset` in `frames-shell/src/lib/components/sidebar/Sidebar.svelte` (`height: 38px; flex-shrink: 0;`)
+

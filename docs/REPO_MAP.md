@@ -178,4 +178,10 @@ A map of key components, paths, and behaviors across Frames.
 
 All five themes match within 1 px (exact 0 px delta). Human verification by eye is recommended when running the Tauri desktop app on macOS.
 
+## Top Segmented Control (Phase 1.4)
+
+### Highlight Positioning (Task 1.4-a)
+The highlight in the top selector component (`frames-shell/src/lib/components/surface/SegmentedControl.svelte`) is currently positioned using percentage calculations (`width: calc((100% - 6px) / {options.length}); transform: translateX(calc({selectedIndex} * 100%));`) assuming all buttons have identical fixed widths.
+
+
 

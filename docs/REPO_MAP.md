@@ -183,5 +183,23 @@ All five themes match within 1 px (exact 0 px delta). Human verification by eye 
 ### Highlight Positioning (Task 1.4-a)
 The highlight in the top selector component (`frames-shell/src/lib/components/surface/SegmentedControl.svelte`) is currently positioned using percentage calculations (`width: calc((100% - 6px) / {options.length}); transform: translateX(calc({selectedIndex} * 100%));`) assuming all buttons have identical fixed widths.
 
+## Pointer glow (Phase 1.5)
+
+### Located Pointer Glow Rules and Listeners (Task 1.5-a)
+
+- `frames-shell/src/lib/theme/glass.ts`: lines 45–84
+  `setupGlassSpecular(node: HTMLElement)` attaches `pointermove`, `pointerenter`, `pointerleave` event listeners to calculate pointer offset relative to bounding rect and sets CSS variables `--hl`, `--mx`, and `--my`.
+- `frames-shell/src/lib/components/surface/Surface.svelte`: lines 4, 29–35
+  Imports and invokes `setupGlassSpecular(element)` in an `$effect` for surfaces when `theme.appearance === 'glass'`, creating the mouse-tracking halo.
+- `frames-shell/src/lib/theme/themes/glass.css`: lines 113–126
+  `.glass-material::after` pseudo-element renders the specular highlight using `radial-gradient(160px circle at var(--mx, 50%) var(--my, 0%), rgba(255, 255, 255, 0.28), transparent 60%)` and `opacity: var(--hl, 0)`.
+- Other searched terms:
+  - `mousemove`: `VirtualGrid.svelte` (marquee selection drag), `Sidebar.svelte` (sidebar resize drag), `PhotoViewer.svelte` (panned image drag). None of these are visual glow/halo effects.
+  - `pointermove`: `VirtualGrid.svelte` (scrubbing/column resizing), `PhotoViewer.svelte` (reset idle HUD fade). Neither is a pointer glow effect.
+  - `cursor:`: All occurrences in `src` use standard system cursors (`pointer`, `default`, `grab`, `grabbing`, `col-resize`, `not-allowed`). No custom image cursor exists.
+  - `drop-shadow`: Used only as static filter on `Badge.svelte` (line 67).
+  - `glow`: Used for ambient photo backplate in `PhotoViewer.svelte` (`.viewer-ambient-glow`) and palette derivation comments; no cursor glow.
+
+
 
 

@@ -1,7 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { theme, resolved } from '$lib/theme/engine.svelte';
-  import { setupGlassSpecular } from '$lib/theme/glass';
 
   let {
     kind = 'control',
@@ -24,15 +23,6 @@
   } = $props();
 
   let element: HTMLElement | null = $state(null);
-
-  $effect(() => {
-    if (theme.appearance === 'glass' && element) {
-      const specular = setupGlassSpecular(element);
-      return () => {
-        specular.destroy();
-      };
-    }
-  });
 
   // Radii selection based on kind and mode (§8.1 #2)
   const resolvedRadius = $derived.by(() => {

@@ -40,50 +40,7 @@ export function detectGlassTier(): 1 | 2 {
 }
 
 /**
- * Update pointer specular highlight on glass surface (§8.4)
- */
-export function setupGlassSpecular(node: HTMLElement): { destroy: () => void } {
-  let rafId: number | null = null;
-  let isHovered = false;
 
-  const handlePointerEnter = () => {
-    isHovered = true;
-    node.style.setProperty('--hl', '1');
-  };
-
-  const handlePointerLeave = () => {
-    isHovered = false;
-    node.style.setProperty('--hl', '0');
-  };
-
-  const handlePointerMove = (e: PointerEvent) => {
-    if (!isHovered) return;
-    if (rafId !== null) cancelAnimationFrame(rafId);
-    rafId = requestAnimationFrame(() => {
-      const rect = node.getBoundingClientRect();
-      const x = ((e.clientX - rect.left) / rect.width) * 100;
-      const y = ((e.clientY - rect.top) / rect.height) * 100;
-      node.style.setProperty('--mx', `${x.toFixed(1)}%`);
-      node.style.setProperty('--my', `${y.toFixed(1)}%`);
-      rafId = null;
-    });
-  };
-
-  node.addEventListener('pointerenter', handlePointerEnter);
-  node.addEventListener('pointerleave', handlePointerLeave);
-  node.addEventListener('pointermove', handlePointerMove);
-
-  return {
-    destroy() {
-      node.removeEventListener('pointerenter', handlePointerEnter);
-      node.removeEventListener('pointerleave', handlePointerLeave);
-      node.removeEventListener('pointermove', handlePointerMove);
-      if (rafId !== null) cancelAnimationFrame(rafId);
-    }
-  };
-}
-
-/**
  * Adaptive foreground color calculation based on underlying tile luminance (§8.4)
  * Flip to dark above 0.62, back to light below 0.50 (hysteresis)
  */

@@ -115,21 +115,6 @@
   pointer-events: none;
 }
 
-/* Pointer specular highlight (§8.2, §8.4) */
-.glass-material::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  opacity: var(--hl, 0);
-  background: radial-gradient(
-    160px circle at var(--mx, 50%) var(--my, 0%),
-    rgba(255, 255, 255, 0.28),
-    transparent 60%
-  );
-  transition: opacity 120ms ease;
-}
 
 /* Clear variant (viewer controls over photo, §8.2) */
 .glass-clear {

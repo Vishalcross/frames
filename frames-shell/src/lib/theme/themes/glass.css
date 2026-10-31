@@ -6,7 +6,10 @@
 [data-appearance="glass"][data-scheme="light"] {
   color-scheme: light;
   --bg-canvas: #f8f8fa;
-  --bg-sidebar: transparent;
+  --sidebar-bg: rgba(255, 255, 255, 0.55);
+  --sidebar-border: rgba(0, 0, 0, 0.08);
+  --sidebar-blur: blur(24px) saturate(1.4);
+  --bg-sidebar: var(--sidebar-bg);
   --bg-viewer: #f4f4f7;
   --surface-raised: rgba(255, 255, 255, 0.72);
   --surface-overlay: rgba(255, 255, 255, 0.82);
@@ -38,7 +41,10 @@
 [data-appearance="glass"][data-scheme="dark"] {
   color-scheme: dark;
   --bg-canvas: #121214;
-  --bg-sidebar: transparent;
+  --sidebar-bg: rgba(40, 40, 46, 0.55);
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+  --sidebar-blur: blur(24px) saturate(1.4);
+  --bg-sidebar: var(--sidebar-bg);
   --bg-viewer: #09090b;
   --surface-raised: rgba(36, 36, 40, 0.70);
   --surface-overlay: rgba(44, 44, 48, 0.82);

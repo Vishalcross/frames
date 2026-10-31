@@ -7,6 +7,9 @@
   color-scheme: light;
   --bg-canvas: #ffffff;
   --bg-sidebar: #f2f2f7;
+  --sidebar-bg: #f2f2f7;
+  --sidebar-border: rgba(60, 60, 67, 0.16);
+  --sidebar-blur: none;
   --bg-viewer: #ffffff;
   --surface-raised: #ffffff;
   --surface-overlay: rgba(255, 255, 255, 0.92);
@@ -39,6 +42,9 @@
   color-scheme: dark;
   --bg-canvas: #1c1c1e;
   --bg-sidebar: #262628;
+  --sidebar-bg: #262628;
+  --sidebar-border: rgba(84, 84, 88, 0.55);
+  --sidebar-blur: none;
   --bg-viewer: #000000;
   --surface-raised: #2c2c2e;
   --surface-overlay: rgba(44, 44, 46, 0.92);

@@ -19,8 +19,15 @@
 @property --accent-fg       { syntax: "<color>"; inherits: true; initial-value: #ffffff; }
 @property --ad-ambient-1    { syntax: "<color>"; inherits: true; initial-value: rgba(0, 122, 255, 0.38); }
 @property --ad-ambient-2    { syntax: "<color>"; inherits: true; initial-value: rgba(88, 86, 214, 0.28); }
+@property --sidebar-bg      { syntax: "<color>"; inherits: true; initial-value: #f2f2f7; }
+@property --sidebar-border  { syntax: "<color>"; inherits: true; initial-value: rgba(60, 60, 67, 0.16); }
 
 :root {
+  /* Sidebar Tokens (§1.1-d) */
+  --sidebar-bg: #f2f2f7;
+  --sidebar-border: rgba(60, 60, 67, 0.16);
+  --sidebar-blur: none;
+
   /* Fonts (§2) */
   --font-stack: -apple-system, 'SF Pro Text', system-ui, 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
   --font-display: -apple-system, 'SF Pro Display', system-ui, 'Segoe UI Variable Display', 'Segoe UI', sans-serif;

@@ -43,8 +43,9 @@
   --glass-fg: #f5f5f7;
 }
 
-/* Sidebar in Adaptive mode has light blur and alpha (§7.3) */
-[data-appearance="adaptive"] .sidebar-docked {
-  backdrop-filter: blur(30px);
-  -webkit-backdrop-filter: blur(30px);
+  /* Sidebar tokens (§1.1-d) */
+  --sidebar-bg: var(--bg-sidebar);
+  --sidebar-border: var(--separator);
+  --sidebar-blur: none;
 }
+

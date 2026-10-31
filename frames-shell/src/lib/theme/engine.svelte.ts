@@ -253,6 +253,8 @@ function syncDOMTokens(): void {
     // Apply variables to root for smooth CSS transition
     root.style.setProperty('--bg-canvas', roles.bgCanvas);
     root.style.setProperty('--bg-sidebar', roles.bgSidebar);
+    root.style.setProperty('--sidebar-bg', roles.bgSidebar);
+    root.style.setProperty('--sidebar-border', roles.separator);
     root.style.setProperty('--bg-viewer', roles.bgViewer);
     root.style.setProperty('--surface-raised', roles.surfaceRaised);
     root.style.setProperty('--surface-overlay', roles.surfaceOverlay);
@@ -267,7 +269,29 @@ function syncDOMTokens(): void {
     root.style.setProperty('--accent-fg', roles.accentFg);
     root.style.setProperty('--ad-ambient-1', roles.ambient1);
     root.style.setProperty('--ad-ambient-2', roles.ambient2);
-  } else if (theme.appearance === 'glass') {
+  } else {
+    // When not in adaptive mode, reset inline overrides so stylesheet tokens apply cleanly
+    root.style.removeProperty('--bg-canvas');
+    root.style.removeProperty('--bg-sidebar');
+    root.style.removeProperty('--sidebar-bg');
+    root.style.removeProperty('--sidebar-border');
+    root.style.removeProperty('--bg-viewer');
+    root.style.removeProperty('--surface-raised');
+    root.style.removeProperty('--surface-overlay');
+    root.style.removeProperty('--fill-1');
+    root.style.removeProperty('--fill-2');
+    root.style.removeProperty('--fill-3');
+    root.style.removeProperty('--text-1');
+    root.style.removeProperty('--text-2');
+    root.style.removeProperty('--text-3');
+    root.style.removeProperty('--separator');
+    root.style.removeProperty('--accent');
+    root.style.removeProperty('--accent-fg');
+    root.style.removeProperty('--ad-ambient-1');
+    root.style.removeProperty('--ad-ambient-2');
+  }
+
+  if (theme.appearance === 'glass') {
     // Glass Tint = Adaptive (§8.4)
     if (theme.glassTint === 'adaptive' && resolved.palette) {
       const tintColor = oklchToCss(
@@ -286,23 +310,9 @@ function syncDOMTokens(): void {
     const glassFg = resolveGlassForeground(resolved.palette?.lum ?? null);
     root.style.setProperty('--glass-fg', glassFg === 'dark' ? '#111113' : '#ffffff');
   } else {
-    // In Standard mode, reset inline overrides so standard.css tokens apply cleanly
-    root.style.removeProperty('--bg-canvas');
-    root.style.removeProperty('--bg-sidebar');
-    root.style.removeProperty('--bg-viewer');
-    root.style.removeProperty('--surface-raised');
-    root.style.removeProperty('--surface-overlay');
-    root.style.removeProperty('--fill-1');
-    root.style.removeProperty('--fill-2');
-    root.style.removeProperty('--fill-3');
-    root.style.removeProperty('--text-1');
-    root.style.removeProperty('--text-2');
-    root.style.removeProperty('--text-3');
-    root.style.removeProperty('--separator');
-    root.style.removeProperty('--accent');
-    root.style.removeProperty('--accent-fg');
-    root.style.removeProperty('--ad-ambient-1');
-    root.style.removeProperty('--ad-ambient-2');
+    root.style.removeProperty('--glass-tint');
+    root.style.removeProperty('--glass-tint-amt');
+    root.style.removeProperty('--glass-fg');
   }
 }
 

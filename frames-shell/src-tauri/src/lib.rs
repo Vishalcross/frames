@@ -153,6 +153,7 @@ pub struct AppState {
     pub db_damaged: Mutex<Option<String>>,
     pub import_control: Arc<ImportControl>,
     pub thumb_sync_running: Arc<AtomicBool>,
+    pub thumb_worker: Arc<frames_core::thumb_worker::ThumbWorker>,
 }
 
 impl AppState {
@@ -232,6 +233,7 @@ impl AppState {
             db_damaged: Mutex::new(db_damaged_err),
             import_control: Arc::new(ImportControl::new()),
             thumb_sync_running: Arc::new(AtomicBool::new(false)),
+            thumb_worker: Arc::new(frames_core::thumb_worker::ThumbWorker::new()),
         }
     }
 
@@ -1432,6 +1434,12 @@ fn scan_local_library(state: State<'_, AppState>) -> Result<usize, String> {
 }
 
 #[tauri::command]
+fn prioritize(asset_ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.thumb_worker.prioritize(asset_ids);
+    Ok(())
+}
+
+#[tauri::command]
 fn clear_local_cache(state: State<'_, AppState>) -> Result<(u64, CacheStats), String> {
     let mut cache = state.cache.lock().map_err(|e| e.to_string())?;
     let freed = cache.clear_lru_cache().map_err(|e| e.to_string())?;
@@ -1519,15 +1527,24 @@ pub fn run() {
                 })
                 .ok();
 
-            // Background local library scanner (Task 1.2-c)
+            // Background local library scanner & thumbnail worker (Task 1.2-c, 1.2-g)
             let handle_scan = app.handle().clone();
             std::thread::Builder::new()
                 .name("frames-local-scan".into())
                 .spawn(move || {
                     let state = handle_scan.state::<AppState>();
+                    let db_path = state.data_dir.join("library.sqlite");
+                    let worker = Arc::clone(&state.thumb_worker);
+
                     if let Ok(store) = state.store.lock() {
                         let _ = frames_core::scan_local::scan_all_local_roots(&store);
                     };
+
+                    let handle_events = handle_scan.clone();
+                    let on_ready: frames_core::thumb_worker::ThumbReadyCallback = Arc::new(move |asset_id: &str| {
+                        let _ = handle_events.emit("thumb-ready", serde_json::json!({ "asset_id": asset_id }));
+                    });
+                    worker.start_worker_pool(db_path, Some(on_ready));
                 })
                 .ok();
 
@@ -1572,6 +1589,7 @@ pub fn run() {
             set_local_roots,
             get_local_roots,
             scan_local_library,
+            prioritize,
             clear_local_cache,
             run_check_library,
             add_unknown_s4_files,

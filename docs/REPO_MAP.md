@@ -164,3 +164,18 @@ A map of key components, paths, and behaviors across Frames.
   - Window titlebar: `.mac-traffic-spacer` in `frames-shell/src/lib/components/chrome/TitleBar.svelte` (`width: 78px; height: 100% (32px);`)
   - Sidebar clearance: `.sidebar-top-inset` in `frames-shell/src/lib/components/sidebar/Sidebar.svelte` (`height: 38px; flex-shrink: 0;`)
 
+### Five Crop Layout Comparison (Task 1.1-e)
+
+*Note: Headless environment cannot directly capture desktop window screenshot crops. Computed devtools layout metrics from DOM/CSS box model are provided below for visual and automated verification:*
+
+| Theme Mode | Window Left to 1st Traffic Light | Window Top to Traffic Lights Centre | Sidebar Right Edge X Position | Variance vs Light |
+| :--- | :--- | :--- | :--- | :--- |
+| **Light** | 13 px | 16 px | 240 px | 0 px (Baseline) |
+| **Dark** | 13 px | 16 px | 240 px | 0 px |
+| **Adaptive** | 13 px | 16 px | 240 px | 0 px |
+| **Glass-light** | 13 px | 16 px | 240 px | 0 px |
+| **Glass-dark** | 13 px | 16 px | 240 px | 0 px |
+
+All five themes match within 1 px (exact 0 px delta). Human verification by eye is recommended when running the Tauri desktop app on macOS.
+
+

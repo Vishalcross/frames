@@ -1426,6 +1426,12 @@ fn get_local_roots(state: State<'_, AppState>) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
+fn scan_local_library(state: State<'_, AppState>) -> Result<usize, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    frames_core::scan_local::scan_all_local_roots(&store).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn clear_local_cache(state: State<'_, AppState>) -> Result<(u64, CacheStats), String> {
     let mut cache = state.cache.lock().map_err(|e| e.to_string())?;
     let freed = cache.clear_lru_cache().map_err(|e| e.to_string())?;
@@ -1512,6 +1518,19 @@ pub fn run() {
                     }
                 })
                 .ok();
+
+            // Background local library scanner (Task 1.2-c)
+            let handle_scan = app.handle().clone();
+            std::thread::Builder::new()
+                .name("frames-local-scan".into())
+                .spawn(move || {
+                    let state = handle_scan.state::<AppState>();
+                    if let Ok(store) = state.store.lock() {
+                        let _ = frames_core::scan_local::scan_all_local_roots(&store);
+                    };
+                })
+                .ok();
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -1552,6 +1571,7 @@ pub fn run() {
             save_settings,
             set_local_roots,
             get_local_roots,
+            scan_local_library,
             clear_local_cache,
             run_check_library,
             add_unknown_s4_files,

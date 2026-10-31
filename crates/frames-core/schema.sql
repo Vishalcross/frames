@@ -13,7 +13,7 @@ PRAGMA user_version = 1;
 CREATE TABLE assets (
   id            TEXT PRIMARY KEY,                 -- lowercase hex SHA-256 of the original
   kind          TEXT NOT NULL CHECK (kind IN ('photo', 'video', 'live')),
-  key           TEXT NOT NULL,                    -- S4 key of the original
+  key           TEXT NOT NULL DEFAULT '',         -- S4 key of the original
   filename      TEXT NOT NULL,
   size          INTEGER NOT NULL,
   taken_at      TEXT NOT NULL,                    -- UTC, RFC 3339
@@ -34,7 +34,13 @@ CREATE TABLE assets (
   thumb_failed  INTEGER NOT NULL DEFAULT 0,       -- [+] placeholder thumbnail in use
   trashed_at    TEXT,                             -- UTC time of trashing (30-day clock)
   purged_at     TEXT,                             -- [+] set by asset.purge; row stays as a tombstone
-  state_at      TEXT NOT NULL                     -- stamp of the last existence/trash change
+  state_at      TEXT NOT NULL,                    -- stamp of the last existence/trash change
+  album_id      TEXT,
+  relative_path TEXT,
+  local_path    TEXT,
+  remote_key    TEXT,
+  thumb_state   TEXT NOT NULL DEFAULT 'none' CHECK (thumb_state IN ('none', 'queued', 'ready', 'failed')),
+  content_hash  TEXT
 );
 
 -- Timeline: visible assets by date.
@@ -43,6 +49,8 @@ CREATE INDEX assets_timeline ON assets (taken_at)
 -- Trash view and the daily purge.
 CREATE INDEX assets_trash ON assets (trashed_at)
   WHERE trashed_at IS NOT NULL AND purged_at IS NULL;
+-- Unique asset per album and relative path.
+CREATE UNIQUE INDEX IF NOT EXISTS assets_album_relpath ON assets (album_id, relative_path);
 
 CREATE TABLE albums (
   id          TEXT PRIMARY KEY,                   -- UUID

@@ -331,6 +331,7 @@ impl Store {
         if version == 0 {
             conn.execute_batch(SCHEMA_SQL)?;
         }
+        Self::run_migrations(&conn)?;
 
         let existing_dev: Option<String> = conn
             .query_row(
@@ -369,6 +370,54 @@ impl Store {
 
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Migrates the database to the latest schema safely and idempotently.
+    pub fn run_migrations(conn: &Connection) -> Result<()> {
+        let assets_exists: bool = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'assets'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !assets_exists {
+            conn.execute_batch(SCHEMA_SQL)?;
+        }
+
+        let mut stmt = conn.prepare("PRAGMA table_info(assets)")?;
+        let existing_cols: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if !existing_cols.contains("album_id") {
+            conn.execute("ALTER TABLE assets ADD COLUMN album_id TEXT", [])?;
+        }
+        if !existing_cols.contains("relative_path") {
+            conn.execute("ALTER TABLE assets ADD COLUMN relative_path TEXT", [])?;
+        }
+        if !existing_cols.contains("local_path") {
+            conn.execute("ALTER TABLE assets ADD COLUMN local_path TEXT", [])?;
+        }
+        if !existing_cols.contains("remote_key") {
+            conn.execute("ALTER TABLE assets ADD COLUMN remote_key TEXT", [])?;
+        }
+        if !existing_cols.contains("thumb_state") {
+            conn.execute("ALTER TABLE assets ADD COLUMN thumb_state TEXT NOT NULL DEFAULT 'none'", [])?;
+        }
+        if !existing_cols.contains("content_hash") {
+            conn.execute("ALTER TABLE assets ADD COLUMN content_hash TEXT", [])?;
+        }
+
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS assets_album_relpath ON assets (album_id, relative_path)",
+            [],
+        )?;
+
+        Ok(())
     }
 
     /// Own device id stored in `local_meta`.

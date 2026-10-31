@@ -5,6 +5,7 @@
 //! Spec: `docs/design-spec.md`.
 
 pub mod cache;
+pub mod color;
 pub mod dates;
 pub mod importer;
 pub mod keys;

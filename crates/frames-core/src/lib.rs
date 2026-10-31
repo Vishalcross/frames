@@ -20,6 +20,7 @@ pub mod thumbs;
 pub mod thumb_worker;
 
 pub use store::MatchedAlbumFolder;
+pub use s4::{RemoteAsset, RemoteFetcher};
 
 /// The local SQLite schema (spec section 5), applied when a database is created.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");

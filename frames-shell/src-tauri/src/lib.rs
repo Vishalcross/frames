@@ -2,7 +2,8 @@
 //! to `frames-core` (`store`, `s4`, `sync`, `importer`, `media`, `player`, `cache`, `trash`).
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,9 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use frames_core::cache::{CacheStats, LocalCache, DEFAULT_CACHE_LIMIT_BYTES};
-use frames_core::media::{
-    encode_webp_lossless, prepare_photo_bytes_for_webview, spawn_hidden_command, RgbImage,
-};
+use frames_core::media::{encode_webp_lossless, spawn_hidden_command, RgbImage};
 use frames_core::ops::{AssetKind, AssetRecord};
 use frames_core::player::{
     detect_best_h264_encoder, H264Encoder, LoopbackStreamServer, PlaybackDecision,
@@ -439,6 +438,7 @@ fn fetch_preview_unlocked(
 }
 
 /// Fetch original file path, releasing `cache.lock()` before streaming from S4 to disk.
+#[allow(dead_code)]
 fn fetch_original_unlocked(
     cache_mutex: &Mutex<LocalCache>,
     s4: Option<&dyn ObjectStore>,
@@ -459,6 +459,98 @@ fn fetch_original_unlocked(
         return c.register_downloaded_original(id, filename).ok().flatten();
     }
     None
+}
+
+fn serve_file_with_range(
+    file_path: &Path,
+    request_headers: &tauri::http::HeaderMap,
+) -> Response<Vec<u8>> {
+    let metadata = match fs::metadata(file_path) {
+        Ok(m) => m,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Vec::new())
+                .unwrap();
+        }
+    };
+
+    let file_len = metadata.len();
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let content_type = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "heic" | "heif" => "image/heic",
+        "tif" | "tiff" => "image/tiff",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "m4v" => "video/x-m4v",
+        _ => "application/octet-stream",
+    };
+
+    if let Some(range_hdr) = request_headers.get("range").and_then(|v| v.to_str().ok()) {
+        if let Some(spec) = range_hdr.strip_prefix("bytes=") {
+            let (s_str, e_str) = spec.split_once('-').unwrap_or((spec, ""));
+            let start: u64 = s_str.parse().unwrap_or(0);
+            let end: u64 = if e_str.is_empty() {
+                file_len.saturating_sub(1)
+            } else {
+                e_str.parse().unwrap_or(file_len.saturating_sub(1)).min(file_len.saturating_sub(1))
+            };
+
+            if start <= end && start < file_len {
+                let chunk_len = (end - start + 1) as usize;
+                let mut f = match fs::File::open(file_path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        return Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .body(Vec::new())
+                            .unwrap();
+                    }
+                };
+                if f.seek(SeekFrom::Start(start)).is_ok() {
+                    let mut buf = vec![0u8; chunk_len];
+                    if f.read_exact(&mut buf).is_ok() {
+                        return Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::CONTENT_TYPE, content_type)
+                            .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_len}"))
+                            .header(header::CONTENT_LENGTH, chunk_len.to_string())
+                            .header(header::ACCEPT_RANGES, "bytes")
+                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .body(buf)
+                            .unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    match fs::read(file_path) {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, file_len.to_string())
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .body(bytes)
+            .unwrap(),
+        Err(_) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(Vec::new())
+            .unwrap(),
+    }
 }
 
 /// Serve `frames://localhost/<kind>/<id>` custom protocol requests asynchronously
@@ -503,6 +595,85 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
 
     match kind {
         "thumb" => {
+            let size = match segments.get(2).copied() {
+                Some("1024") => frames_core::thumbs::ThumbSize::Large,
+                _ => frames_core::thumbs::ThumbSize::Small,
+            };
+            let thumb_file = frames_core::thumbs::thumb_path(id, size);
+            if thumb_file.exists() {
+                if let Ok(bytes) = fs::read(&thumb_file) {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "image/webp")
+                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                        .body(bytes)
+                        .unwrap();
+                }
+            }
+
+            // Look up asset in db
+            let asset_info: Option<(String, Option<String>, Option<String>)> = {
+                let store = state.store.lock().ok();
+                store.and_then(|s| {
+                    s.connection()
+                        .query_row(
+                            "SELECT kind, local_path, remote_key FROM assets WHERE id = ?1",
+                            [id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .ok()
+                })
+            };
+
+            if let Some((kind, local_path, remote_key)) = asset_info {
+                if let Some(lp) = local_path {
+                    let src = Path::new(&lp);
+                    if src.exists() {
+                        let gen_res = if kind == "video" {
+                            frames_core::thumbs::generate_video_thumb(src, id, size)
+                        } else {
+                            frames_core::thumbs::generate_image_thumb(src, id, size)
+                        };
+                        if let Ok(p) = gen_res {
+                            if let Ok(bytes) = fs::read(p) {
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "image/webp")
+                                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                                    .body(bytes)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+
+                if let Ok(s4) = state.require_s4() {
+                    let fetcher = frames_core::RemoteFetcher::new(s4);
+                    let remote_asset = frames_core::RemoteAsset {
+                        id: id.to_string(),
+                        kind: kind.clone(),
+                        remote_key,
+                    };
+                    if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_thumb(&remote_asset, size)) {
+                        if let Ok(bytes) = fs::read(p) {
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "image/webp")
+                                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                                .body(bytes)
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+
+            // Fallback: check old small thumb cache / S4
             if let Some(p) = fetch_small_thumb_unlocked(&state.cache, s4_ref, id) {
                 if let Ok(bytes) = fs::read(p) {
                     return Response::builder()
@@ -515,6 +686,55 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                         .unwrap();
                 }
             }
+
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Vec::new())
+                .unwrap()
+        }
+        "photo" | "original" => {
+            let asset_info: Option<(String, Option<String>, Option<String>)> = {
+                let store = state.store.lock().ok();
+                store.and_then(|s| {
+                    s.connection()
+                        .query_row(
+                            "SELECT kind, local_path, remote_key FROM assets WHERE id = ?1",
+                            [id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .ok()
+                })
+            };
+
+            if let Some((kind, local_path, remote_key)) = asset_info {
+                if let Some(lp) = local_path {
+                    let src = Path::new(&lp);
+                    if src.is_file() {
+                        return serve_file_with_range(src, request.headers());
+                    }
+                }
+
+                let cached_orig = frames_core::thumbs::app_cache_dir().join("originals").join(id);
+                if cached_orig.is_file() {
+                    return serve_file_with_range(&cached_orig, request.headers());
+                }
+
+                if let Ok(s4) = state.require_s4() {
+                    let fetcher = frames_core::RemoteFetcher::new(s4);
+                    let remote_asset = frames_core::RemoteAsset {
+                        id: id.to_string(),
+                        kind,
+                        remote_key,
+                    };
+                    if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_original(&remote_asset)) {
+                        if p.is_file() {
+                            return serve_file_with_range(&p, request.headers());
+                        }
+                    }
+                }
+            }
+
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
@@ -522,6 +742,20 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                 .unwrap()
         }
         "preview" => {
+            let size = frames_core::thumbs::ThumbSize::Large;
+            let thumb_file = frames_core::thumbs::thumb_path(id, size);
+            if thumb_file.exists() {
+                if let Ok(bytes) = fs::read(&thumb_file) {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "image/webp")
+                        .header(header::CACHE_CONTROL, "public, max-age=3600")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                        .body(bytes)
+                        .unwrap();
+                }
+            }
             if let Some(p) = fetch_preview_unlocked(&state.cache, s4_ref, id) {
                 if let Ok(bytes) = fs::read(p) {
                     return Response::builder()
@@ -530,65 +764,6 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                         .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
                         .header(header::CACHE_CONTROL, "public, max-age=3600")
-                        .body(bytes)
-                        .unwrap();
-                }
-            }
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Vec::new())
-                .unwrap()
-        }
-        "original" => {
-            let detail_opt = {
-                let store = match state.store.lock() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .body(Vec::new())
-                            .unwrap()
-                    }
-                };
-                store.get_asset(id).ok().flatten()
-            };
-            let Some(detail) = detail_opt else {
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .body(Vec::new())
-                    .unwrap();
-            };
-
-            if let Some(orig_path) = fetch_original_unlocked(
-                &state.cache,
-                s4_ref,
-                &detail.record.id,
-                &detail.record.filename,
-                &detail.record.key,
-            ) {
-                if let Some((bytes, mime)) = prepare_photo_bytes_for_webview(&orig_path) {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, mime)
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                        .header(header::CACHE_CONTROL, "public, max-age=3600")
-                        .body(bytes)
-                        .unwrap();
-                }
-            }
-
-            // Fallback to preview if original is not cached/reachable offline
-            if let Some(p) = fetch_preview_unlocked(&state.cache, s4_ref, id) {
-                if let Ok(bytes) = fs::read(p) {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "image/webp")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
                         .body(bytes)
                         .unwrap();
                 }

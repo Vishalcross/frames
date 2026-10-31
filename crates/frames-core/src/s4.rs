@@ -420,6 +420,169 @@ pub trait ObjectStore: Send + Sync {
     fn config(&self) -> &S4Config;
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoteAsset {
+    pub id: String,
+    pub kind: String,
+    pub remote_key: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct RemoteFetcher {
+    store: Arc<dyn ObjectStore>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    in_flight_originals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<std::path::PathBuf>>>>>,
+    in_flight_thumbs: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, u32), tokio::sync::watch::Receiver<Option<std::path::PathBuf>>>>>,
+}
+
+impl RemoteFetcher {
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(6)),
+            in_flight_originals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            in_flight_thumbs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    pub async fn fetch_remote_original(&self, asset: &RemoteAsset) -> std::result::Result<std::path::PathBuf, String> {
+        let dest = crate::thumbs::app_cache_dir().join("originals").join(&asset.id);
+        if dest.exists() {
+            return Ok(dest);
+        }
+
+        let remote_key = match &asset.remote_key {
+            Some(k) if !k.is_empty() => k.clone(),
+            _ => return Err(format!("asset {} has no remote_key", asset.id)),
+        };
+
+        let (mut rx, am_leader) = {
+            let mut map = self.in_flight_originals.lock().await;
+            if let Some(rx) = map.get(&asset.id) {
+                (rx.clone(), false)
+            } else {
+                let (_, rx) = tokio::sync::watch::channel(None);
+                map.insert(asset.id.clone(), rx.clone());
+                (rx, true)
+            }
+        };
+
+        if !am_leader {
+            let _ = rx.changed().await;
+            return match rx.borrow().clone() {
+                Some(p) => Ok(p),
+                None => Err("in-flight download failed".into()),
+            };
+        }
+
+        let permit = self.semaphore.acquire().await.map_err(|e| e.to_string())?;
+
+        let store = Arc::clone(&self.store);
+        let dest_clone = dest.clone();
+        let remote_key_clone = remote_key.clone();
+
+        let res = tokio::task::spawn_blocking(move || -> std::result::Result<std::path::PathBuf, String> {
+            if let Some(parent) = dest_clone.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let temp = dest_clone.with_extension(format!("tmp.{}", fastrand::u64(..)));
+            let ok = store.get_object_to_file(&remote_key_clone, &temp)
+                .map_err(|e| e.to_string())?;
+            if !ok || !temp.exists() || std::fs::metadata(&temp).map(|m| m.len() == 0).unwrap_or(true) {
+                let _ = std::fs::remove_file(&temp);
+                return Err("remote object not found or empty".into());
+            }
+            std::fs::rename(&temp, &dest_clone).map_err(|e| e.to_string())?;
+            Ok(dest_clone)
+        }).await.map_err(|e| e.to_string())?;
+
+        drop(permit);
+
+        let mut map = self.in_flight_originals.lock().await;
+        map.remove(&asset.id);
+
+        res
+    }
+
+    pub async fn fetch_remote_thumb(&self, asset: &RemoteAsset, size: crate::thumbs::ThumbSize) -> std::result::Result<std::path::PathBuf, String> {
+        let dest = crate::thumbs::thumb_path(&asset.id, size);
+        if dest.exists() {
+            return Ok(dest);
+        }
+
+        let key_pair = (asset.id.clone(), size.pixels());
+
+        let (mut rx, am_leader) = {
+            let mut map = self.in_flight_thumbs.lock().await;
+            if let Some(rx) = map.get(&key_pair) {
+                (rx.clone(), false)
+            } else {
+                let (_, rx) = tokio::sync::watch::channel(None);
+                map.insert(key_pair.clone(), rx.clone());
+                (rx, true)
+            }
+        };
+
+        if !am_leader {
+            let _ = rx.changed().await;
+            return match rx.borrow().clone() {
+                Some(p) => Ok(p),
+                None => Err("in-flight thumbnail download failed".into()),
+            };
+        }
+
+        let permit = self.semaphore.acquire().await.map_err(|e| e.to_string())?;
+
+        let thumb_key = if size == crate::thumbs::ThumbSize::Large {
+            crate::keys::thumb_preview_key(&asset.id)
+        } else {
+            crate::keys::thumb_small_key(&asset.id)
+        };
+
+        let store = Arc::clone(&self.store);
+        let dest_clone = dest.clone();
+
+        // 1. Try downloading thumbnail directly from S4
+        let downloaded = tokio::task::spawn_blocking(move || -> bool {
+            if let Some(parent) = dest_clone.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let temp = dest_clone.with_extension(format!("tmp.{}", fastrand::u64(..)));
+            let ok = store.get_object_to_file(&thumb_key, &temp).unwrap_or(false);
+            if ok && temp.exists() && std::fs::metadata(&temp).map(|m| m.len() > 0).unwrap_or(false) {
+                let _ = std::fs::rename(&temp, &dest_clone);
+                true
+            } else {
+                let _ = std::fs::remove_file(&temp);
+                false
+            }
+        }).await.unwrap_or(false);
+
+        drop(permit);
+
+        let final_res = if downloaded && dest.exists() {
+            Ok(dest)
+        } else {
+            // 2. Fall back to downloading original and generating thumbnail
+            let orig_path = self.fetch_remote_original(asset).await?;
+            let asset_id = asset.id.clone();
+            let is_video = asset.kind == "video";
+            tokio::task::spawn_blocking(move || {
+                if is_video {
+                    crate::thumbs::generate_video_thumb(&orig_path, &asset_id, size)
+                } else {
+                    crate::thumbs::generate_image_thumb(&orig_path, &asset_id, size)
+                }
+            }).await.map_err(|e| e.to_string())?
+        };
+
+        let mut map = self.in_flight_thumbs.lock().await;
+        map.remove(&key_pair);
+
+        final_res
+    }
+}
+
 /// Resumable file upload helper with exponential backoff retry (spec section 7, step 6):
 /// - Files <= `multipart_threshold_bytes` upload via a single streamed `PUT`.
 /// - Larger files upload via S3 multipart (`CreateMultipartUpload` -> `ListParts` when

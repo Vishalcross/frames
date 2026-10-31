@@ -4,6 +4,7 @@
 //!
 //! Spec: `docs/design-spec.md`.
 
+pub mod album_palette;
 pub mod cache;
 pub mod color;
 pub mod dates;
@@ -25,7 +26,11 @@ pub mod upload_worker;
 pub use store::{AlbumDebugInfo, MatchedAlbumFolder};
 pub use s4::{RemoteAsset, RemoteFetcher};
 pub use upload_worker::UploadWorker;
-pub use palette::{extract_palette, normalise_roles, Palette, Tone};
+pub use palette::{
+    extract_palette, get_album_theme, get_palette_from_db, normalise_roles, set_album_theme,
+    AlbumTheme, Palette, Tone,
+};
+pub use album_palette::{derive_album_palette, generate_and_save_album_palette};
 
 /// The local SQLite schema (spec section 5), applied when a database is created.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");

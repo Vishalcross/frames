@@ -132,6 +132,7 @@ impl ThumbWorker {
                         if !in_flight.contains(&pid) {
                             if crate::thumbs::thumb_exists(&pid, ThumbSize::Small) {
                                 crate::thumbs::update_thumb_state(&conn, &pid, "ready");
+                                let _ = crate::palette::compute_and_store_palette(&conn, &pid);
                                 continue;
                             }
                             // Look up asset in db
@@ -199,6 +200,9 @@ impl ThumbWorker {
                     };
 
                     if res.is_ok() {
+                        if let Some(c) = conn.as_ref() {
+                            let _ = crate::palette::compute_and_store_palette(c, &task.id);
+                        }
                         if let Some(cb) = &on_ready {
                             cb(&task.id);
                         }

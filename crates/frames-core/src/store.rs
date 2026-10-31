@@ -451,6 +451,36 @@ impl Store {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS photo_palettes (
+                asset_id    TEXT PRIMARY KEY,
+                bg          TEXT NOT NULL,
+                sidebar     TEXT NOT NULL,
+                accent      TEXT NOT NULL,
+                on_bg       TEXT NOT NULL,
+                on_sidebar  TEXT NOT NULL,
+                computed_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS album_theme (
+                album_id        TEXT PRIMARY KEY,
+                mode            TEXT NOT NULL DEFAULT 'dynamic',
+                source          TEXT NOT NULL DEFAULT 'auto',
+                bg              TEXT,
+                sidebar         TEXT,
+                accent          TEXT,
+                auto_bg         TEXT,
+                auto_sidebar    TEXT,
+                auto_accent     TEXT,
+                auto_on_bg      TEXT,
+                auto_on_sidebar TEXT
+            )",
+            [],
+        )?;
+
         Ok(())
     }
 

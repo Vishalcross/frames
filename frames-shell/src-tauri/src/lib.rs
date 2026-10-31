@@ -42,6 +42,9 @@ use frames_core::trash::{
     PurgeReport, TrashSummary,
 };
 
+pub mod adaptive_commands;
+pub use adaptive_commands::*;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSettings {
     pub endpoint: String,
@@ -774,6 +777,11 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                         remote_key,
                     };
                     if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_thumb(&remote_asset, size)) {
+                        if size == frames_core::thumbs::ThumbSize::Small {
+                            if let Ok(store) = state.store.lock() {
+                                let _ = frames_core::palette::compute_and_store_palette(store.connection(), id);
+                            }
+                        }
                         if let Ok(bytes) = fs::read(p) {
                             return Response::builder()
                                 .status(StatusCode::OK)
@@ -1958,6 +1966,10 @@ pub fn run() {
             run_check_library,
             add_unknown_s4_files,
             run_rebuild_database,
+            get_palette,
+            get_album_theme,
+            set_album_theme,
+            regenerate_album_palette,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

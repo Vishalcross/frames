@@ -1,4 +1,4 @@
-//! Image palette extraction and role normalisation.
+//! Image palette extraction, caching, and role normalisation.
 
 use std::path::Path;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,23 @@ pub struct Palette {
     pub accent: String,
     pub on_bg: String,
     pub on_sidebar: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumTheme {
+    pub album_id: String,
+    pub mode: String,
+    pub source: String,
+    pub bg: Option<String>,
+    pub sidebar: Option<String>,
+    pub accent: Option<String>,
+    pub on_bg: Option<String>,
+    pub on_sidebar: Option<String>,
+    pub auto_bg: Option<String>,
+    pub auto_sidebar: Option<String>,
+    pub auto_accent: Option<String>,
+    pub auto_on_bg: Option<String>,
+    pub auto_on_sidebar: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -52,7 +69,7 @@ struct EvaluatedBucket {
     avg_rgb: [u8; 3],
 }
 
-fn fallback_palette(tone: Tone) -> Palette {
+pub fn fallback_palette(tone: Tone) -> Palette {
     match tone {
         Tone::Dark => Palette {
             bg: "#141416".to_string(),
@@ -277,6 +294,171 @@ pub fn extract_palette(thumb: &Path, tone: Tone) -> Palette {
     normalise_roles(&bg_hex, &sidebar_hex, &accent_hex, tone)
 }
 
+/// Compute palette from the 256px thumbnail for asset_id and store in photo_palettes.
+pub fn compute_and_store_palette(conn: &rusqlite::Connection, asset_id: &str) -> Result<Palette, String> {
+    let thumb_file = crate::thumbs::thumb_path(asset_id, crate::thumbs::ThumbSize::Small);
+    if !thumb_file.exists() {
+        return Err(format!("thumbnail does not exist for asset {asset_id}"));
+    }
+    let palette = extract_palette(&thumb_file, Tone::Dark);
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO photo_palettes (asset_id, bg, sidebar, accent, on_bg, on_sidebar, computed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(asset_id) DO UPDATE SET
+             bg = excluded.bg,
+             sidebar = excluded.sidebar,
+             accent = excluded.accent,
+             on_bg = excluded.on_bg,
+             on_sidebar = excluded.on_sidebar,
+             computed_at = excluded.computed_at",
+        rusqlite::params![
+            asset_id,
+            palette.bg,
+            palette.sidebar,
+            palette.accent,
+            palette.on_bg,
+            palette.on_sidebar,
+            now,
+        ],
+    ).map_err(|e| format!("failed to store palette: {e}"))?;
+
+    Ok(palette)
+}
+
+/// Retrieve the cached palette for an asset from photo_palettes.
+pub fn get_palette_from_db(conn: &rusqlite::Connection, asset_id: &str) -> rusqlite::Result<Option<Palette>> {
+    let mut stmt = conn.prepare(
+        "SELECT bg, sidebar, accent, on_bg, on_sidebar FROM photo_palettes WHERE asset_id = ?1",
+    )?;
+    let mut rows = stmt.query([asset_id])?;
+    if let Some(r) = rows.next()? {
+        Ok(Some(Palette {
+            bg: r.get(0)?,
+            sidebar: r.get(1)?,
+            accent: r.get(2)?,
+            on_bg: r.get(3)?,
+            on_sidebar: r.get(4)?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_valid_hex_color(s: &str) -> bool {
+    if s.len() != 7 || !s.starts_with('#') {
+        return false;
+    }
+    s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Retrieve the album theme settings, returning default values if not configured.
+pub fn get_album_theme(conn: &rusqlite::Connection, album_id: &str) -> rusqlite::Result<AlbumTheme> {
+    let mut stmt = conn.prepare(
+        "SELECT mode, source, bg, sidebar, accent, auto_bg, auto_sidebar, auto_accent, auto_on_bg, auto_on_sidebar
+         FROM album_theme WHERE album_id = ?1",
+    )?;
+    let mut rows = stmt.query([album_id])?;
+    if let Some(r) = rows.next()? {
+        let mode: String = r.get(0)?;
+        let source: String = r.get(1)?;
+        let bg: Option<String> = r.get(2)?;
+        let sidebar: Option<String> = r.get(3)?;
+        let accent: Option<String> = r.get(4)?;
+        let auto_bg: Option<String> = r.get(5)?;
+        let auto_sidebar: Option<String> = r.get(6)?;
+        let auto_accent: Option<String> = r.get(7)?;
+        let auto_on_bg: Option<String> = r.get(8)?;
+        let auto_on_sidebar: Option<String> = r.get(9)?;
+
+        let (on_bg, on_sidebar) = if source == "manual" {
+            let ob = bg.as_deref().and_then(|h| from_hex(h).ok()).map(text_color_for);
+            let os = sidebar.as_deref().and_then(|h| from_hex(h).ok()).map(text_color_for);
+            (ob, os)
+        } else {
+            (None, None)
+        };
+
+        Ok(AlbumTheme {
+            album_id: album_id.to_string(),
+            mode,
+            source,
+            bg,
+            sidebar,
+            accent,
+            on_bg,
+            on_sidebar,
+            auto_bg,
+            auto_sidebar,
+            auto_accent,
+            auto_on_bg,
+            auto_on_sidebar,
+        })
+    } else {
+        Ok(AlbumTheme {
+            album_id: album_id.to_string(),
+            mode: "dynamic".to_string(),
+            source: "auto".to_string(),
+            bg: None,
+            sidebar: None,
+            accent: None,
+            on_bg: None,
+            on_sidebar: None,
+            auto_bg: None,
+            auto_sidebar: None,
+            auto_accent: None,
+            auto_on_bg: None,
+            auto_on_sidebar: None,
+        })
+    }
+}
+
+/// Set the album theme settings with strict validation.
+pub fn set_album_theme(
+    conn: &rusqlite::Connection,
+    album_id: &str,
+    mode: &str,
+    source: &str,
+    bg: Option<String>,
+    sidebar: Option<String>,
+    accent: Option<String>,
+) -> Result<AlbumTheme, String> {
+    if mode != "dynamic" && mode != "album" {
+        return Err(format!("invalid mode '{mode}', expected 'dynamic' or 'album'"));
+    }
+    if source != "auto" && source != "manual" {
+        return Err(format!("invalid source '{source}', expected 'auto' or 'manual'"));
+    }
+
+    if source == "manual" {
+        if bg.is_none() || sidebar.is_none() || accent.is_none() {
+            return Err("source = manual requires all three colours (bg, sidebar, accent)".into());
+        }
+    }
+
+    for (label, col) in [("bg", &bg), ("sidebar", &sidebar), ("accent", &accent)] {
+        if let Some(c) = col {
+            if !is_valid_hex_color(c) {
+                return Err(format!("invalid hex colour for {label}: '{c}', expected #RRGGBB"));
+            }
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO album_theme (album_id, mode, source, bg, sidebar, accent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(album_id) DO UPDATE SET
+             mode = excluded.mode,
+             source = excluded.source,
+             bg = excluded.bg,
+             sidebar = excluded.sidebar,
+             accent = excluded.accent",
+        rusqlite::params![album_id, mode, source, bg, sidebar, accent],
+    ).map_err(|e| format!("failed to save album theme: {e}"))?;
+
+    get_album_theme(conn, album_id).map_err(|e| format!("failed to read back album theme: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,7 +483,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let acc_rgb = from_hex(&p.accent).expect("valid hex");
-        // Accent should be dominant in red channel with low green and blue
         assert!(
             acc_rgb[0] > 200 && acc_rgb[1] < 60 && acc_rgb[2] < 60,
             "expected accent near red, got {:?}",
@@ -313,9 +494,9 @@ mod tests {
     fn half_blue_half_orange_gives_three_different_colours() {
         let path = make_test_image(256, 256, |_, y| {
             if y < 128 {
-                Rgba([0, 80, 255, 255]) // Blue
+                Rgba([0, 80, 255, 255])
             } else {
-                Rgba([255, 140, 0, 255]) // Orange
+                Rgba([255, 140, 0, 255])
             }
         });
         let p = extract_palette(&path, Tone::Dark);
@@ -337,7 +518,6 @@ mod tests {
 
     #[test]
     fn white_and_black_images_both_give_text_contrast_at_least_4_5() {
-        // White image (tested on Light tone)
         let white_path = make_test_image(256, 256, |_, _| Rgba([255, 255, 255, 255]));
         let white_pal = extract_palette(&white_path, Tone::Light);
         let _ = std::fs::remove_file(&white_path);
@@ -352,7 +532,6 @@ mod tests {
         assert!(cr_bg >= 4.5, "white image bg text contrast {cr_bg} < 4.5");
         assert!(cr_sb >= 4.5, "white image sidebar text contrast {cr_sb} < 4.5");
 
-        // Black image (tested on Dark tone)
         let black_path = make_test_image(256, 256, |_, _| Rgba([0, 0, 0, 255]));
         let black_pal = extract_palette(&black_path, Tone::Dark);
         let _ = std::fs::remove_file(&black_path);
@@ -366,5 +545,63 @@ mod tests {
         let cr_sb = contrast_ratio(on_sb_rgb, sb_rgb);
         assert!(cr_bg >= 4.5, "black image bg text contrast {cr_bg} < 4.5");
         assert!(cr_sb >= 4.5, "black image sidebar text contrast {cr_sb} < 4.5");
+    }
+
+    #[test]
+    fn album_theme_defaults_for_unknown_album() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::Store::run_migrations(&conn).unwrap();
+
+        let theme = get_album_theme(&conn, "unknown-album").unwrap();
+        assert_eq!(theme.mode, "dynamic");
+        assert_eq!(theme.source, "auto");
+        assert!(theme.bg.is_none());
+        assert!(theme.sidebar.is_none());
+        assert!(theme.accent.is_none());
+    }
+
+    #[test]
+    fn album_theme_manual_save_with_two_colours_is_rejected() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::Store::run_migrations(&conn).unwrap();
+
+        let res = set_album_theme(
+            &conn,
+            "alb1",
+            "album",
+            "manual",
+            Some("#112233".into()),
+            Some("#445566".into()),
+            None, // Missing accent!
+        );
+        assert!(res.is_err(), "manual save with only two colours must be rejected");
+    }
+
+    #[test]
+    fn album_theme_valid_save_round_trips() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::Store::run_migrations(&conn).unwrap();
+
+        let saved = set_album_theme(
+            &conn,
+            "alb1",
+            "album",
+            "manual",
+            Some("#1A2B3C".into()),
+            Some("#2B3C4D".into()),
+            Some("#FF5500".into()),
+        ).expect("valid save");
+
+        assert_eq!(saved.mode, "album");
+        assert_eq!(saved.source, "manual");
+        assert_eq!(saved.bg.as_deref(), Some("#1A2B3C"));
+        assert_eq!(saved.sidebar.as_deref(), Some("#2B3C4D"));
+        assert_eq!(saved.accent.as_deref(), Some("#FF5500"));
+        // Text colours computed automatically without altering manual colours
+        assert!(saved.on_bg.is_some());
+        assert!(saved.on_sidebar.is_some());
+
+        let loaded = get_album_theme(&conn, "alb1").expect("load saved");
+        assert_eq!(loaded, saved);
     }
 }

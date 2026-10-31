@@ -47,6 +47,26 @@
     onchange?.(id);
   }
 
+  function handleKeydown(e: KeyboardEvent, currentIndex: number) {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      const nextIndex = (currentIndex + 1) % controlItems.length;
+      const nextItem = controlItems[nextIndex];
+      if (nextItem) {
+        select(nextItem.id);
+        buttons[nextIndex]?.focus();
+      }
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const prevIndex = (currentIndex - 1 + controlItems.length) % controlItems.length;
+      const prevItem = controlItems[prevIndex];
+      if (prevItem) {
+        select(prevItem.id);
+        buttons[prevIndex]?.focus();
+      }
+    }
+  }
+
   onMount(() => {
     if (typeof document !== 'undefined' && document.fonts) {
       document.fonts.ready.then(async () => {
@@ -69,16 +89,25 @@
   });
 </script>
 
-<div class="seg segmented-control appearance-{theme.appearance} {klass}">
+<div
+  class="seg segmented-control appearance-{theme.appearance} {klass}"
+  role="tablist"
+  aria-label="View mode selector"
+>
   <div class="pill segmented-thumb" class:ready style="transform: translateX({left}px); width: {width}px"></div>
   {#each controlItems as it, i}
+    {@const isSelected = it.id === activeId}
     <button
       bind:this={buttons[i]}
       type="button"
+      role="tab"
+      aria-selected={isSelected}
+      tabindex={isSelected ? 0 : -1}
       class="segmented-btn"
-      class:active={it.id === activeId}
-      class:selected={it.id === activeId}
+      class:active={isSelected}
+      class:selected={isSelected}
       onclick={() => select(it.id)}
+      onkeydown={(e) => handleKeydown(e, i)}
     >
       {it.label}
     </button>

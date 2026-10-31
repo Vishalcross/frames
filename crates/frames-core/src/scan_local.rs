@@ -1,6 +1,6 @@
 use std::path::Path;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use walkdir::WalkDir;
 
 use crate::store::{Result, Store};
@@ -67,51 +67,36 @@ pub fn upsert_local_asset(
     let mtime_str = crate::store::format_utc(mtime);
     let stamp = format!("{mtime_str}|{device_id}");
 
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
-            params![album_id, norm_rel],
-            |r| r.get(0),
+    let new_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO assets (
+            id, kind, key, filename, size, taken_at, date_at, state_at,
+            album_id, relative_path, local_path, thumb_state
+        ) VALUES (
+            ?1, ?2, '', ?3, ?4, ?5, ?6, ?6,
+            ?7, ?8, ?9, 'none'
         )
-        .optional()?;
+        ON CONFLICT(album_id, relative_path) DO UPDATE SET
+            local_path = excluded.local_path,
+            size = CASE WHEN assets.size = 0 THEN excluded.size ELSE assets.size END",
+        params![
+            new_id,
+            kind,
+            filename,
+            size as i64,
+            mtime_str,
+            stamp,
+            album_id,
+            norm_rel,
+            local_path,
+        ],
+    )?;
 
-    let asset_id = if let Some(id) = existing {
-        conn.execute(
-            "UPDATE assets SET local_path = ?1, size = CASE WHEN size = 0 THEN ?2 ELSE size END WHERE id = ?3",
-            params![local_path, size as i64, id],
-        )?;
-        id
-    } else {
-        let new_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO assets (
-                id, kind, key, filename, size, taken_at, date_at, state_at,
-                album_id, relative_path, local_path, thumb_state
-            ) VALUES (
-                ?1, ?2, '', ?3, ?4, ?5, ?6, ?6,
-                ?7, ?8, ?9, 'none'
-            )
-            ON CONFLICT(album_id, relative_path) DO UPDATE SET
-                local_path = excluded.local_path,
-                size = excluded.size",
-            params![
-                new_id,
-                kind,
-                filename,
-                size as i64,
-                mtime_str,
-                stamp,
-                album_id,
-                norm_rel,
-                local_path,
-            ],
-        )?;
-        conn.query_row(
-            "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
-            params![album_id, norm_rel],
-            |r| r.get(0),
-        )?
-    };
+    let asset_id: String = conn.query_row(
+        "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
+        params![album_id, norm_rel],
+        |r| r.get(0),
+    )?;
 
     conn.execute(
         "INSERT INTO album_items (album_id, asset_id, in_album, at)
@@ -264,4 +249,75 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn local_scan_and_remote_listing_same_file_gives_one_row() {
+        let store = Store::open_in_memory("mac-1").unwrap();
+        let conn = store.connection();
+        let album_id = "album-dup-test";
+        conn.execute(
+            "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, 'Dup Test', 'now', 'now')",
+            [album_id],
+        ).unwrap();
+
+        // 1. Local scan arrives first
+        let id1 = upsert_local_asset(
+            conn,
+            album_id,
+            "beach.jpg",
+            "/photos/beach.jpg",
+            "beach.jpg",
+            1024,
+            Utc::now(),
+            "mac-1",
+        ).unwrap();
+
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM assets WHERE album_id = ?1",
+            [album_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+
+        // 2. Remote listing arrives for the same relative path
+        let norm_rel = normalize_relpath("beach.jpg");
+        let new_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO assets (
+                id, kind, key, filename, size, taken_at, date_at, state_at,
+                album_id, relative_path, remote_key, thumb_state
+            ) VALUES (
+                ?1, 'photo', 'albums/album-dup-test/beach.jpg', 'beach.jpg', 1024, 'now', 'now', 'now',
+                ?2, ?3, 'albums/album-dup-test/beach.jpg', 'none'
+            )
+            ON CONFLICT(album_id, relative_path) DO UPDATE SET
+                remote_key = excluded.remote_key,
+                size = CASE WHEN assets.size = 0 THEN excluded.size ELSE assets.size END",
+            rusqlite::params![new_id, album_id, norm_rel],
+        ).unwrap();
+
+        // Still exactly one row!
+        let total_count: i64 = conn.query_row(
+            "SELECT count(*) FROM assets WHERE album_id = ?1",
+            [album_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(total_count, 1, "Must not duplicate row when same file arrives from remote");
+
+        let (id2, local_p, remote_k): (String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT id, local_path, remote_key FROM assets WHERE album_id = ?1",
+            [album_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(id1, id2, "Original ID must be preserved");
+        assert_eq!(local_p.as_deref(), Some("/photos/beach.jpg"));
+        assert_eq!(remote_k.as_deref(), Some("albums/album-dup-test/beach.jpg"));
+
+        // Verify hidden files are skipped
+        assert!(is_hidden_or_system_file(".DS_Store"));
+        assert!(is_hidden_or_system_file("Thumbs.db"));
+        assert!(is_hidden_or_system_file("sub/._hidden.jpg"));
+        assert!(!is_hidden_or_system_file("sub/normal.jpg"));
+    }
 }
+

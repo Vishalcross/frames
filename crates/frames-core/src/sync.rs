@@ -1588,51 +1588,36 @@ where
                 .unwrap_or("");
             let kind = crate::scan_local::classify_kind(ext);
 
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
-                    rusqlite::params![album_id, normalized_rel],
-                    |r| r.get(0),
+            let new_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO assets (
+                    id, kind, key, filename, size, taken_at, date_at, state_at,
+                    album_id, relative_path, remote_key, thumb_state
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7,
+                    ?8, ?9, ?3, 'none'
                 )
-                .ok();
+                ON CONFLICT(album_id, relative_path) DO UPDATE SET
+                    remote_key = excluded.remote_key,
+                    size = CASE WHEN assets.size = 0 THEN excluded.size ELSE assets.size END",
+                rusqlite::params![
+                    new_id,
+                    kind,
+                    obj.key,
+                    filename,
+                    obj.size as i64,
+                    now_str,
+                    stamp,
+                    album_id,
+                    normalized_rel,
+                ],
+            )?;
 
-            let asset_id = if let Some(id) = existing {
-                conn.execute(
-                    "UPDATE assets SET remote_key = ?1 WHERE id = ?2",
-                    rusqlite::params![obj.key, id],
-                )?;
-                id
-            } else {
-                let new_id = uuid::Uuid::new_v4().to_string();
-                conn.execute(
-                    "INSERT INTO assets (
-                        id, kind, key, filename, size, taken_at, date_at, state_at,
-                        album_id, relative_path, remote_key, thumb_state
-                    ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7,
-                        ?8, ?9, ?3, 'none'
-                    )
-                    ON CONFLICT(album_id, relative_path) DO UPDATE SET
-                        remote_key = excluded.remote_key,
-                        size = CASE WHEN assets.size = 0 THEN excluded.size ELSE assets.size END",
-                    rusqlite::params![
-                        new_id,
-                        kind,
-                        obj.key,
-                        filename,
-                        obj.size as i64,
-                        now_str,
-                        stamp,
-                        album_id,
-                        normalized_rel,
-                    ],
-                )?;
-                conn.query_row(
-                    "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
-                    rusqlite::params![album_id, normalized_rel],
-                    |r| r.get(0),
-                )?
-            };
+            let asset_id: String = conn.query_row(
+                "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
+                rusqlite::params![album_id, normalized_rel],
+                |r| r.get(0),
+            )?;
 
             conn.execute(
                 "INSERT INTO album_items (album_id, asset_id, in_album, at)

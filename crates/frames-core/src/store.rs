@@ -425,6 +425,23 @@ impl Store {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS upload_jobs (
+                id          TEXT PRIMARY KEY,
+                asset_id    TEXT NOT NULL,
+                state       TEXT NOT NULL CHECK (state IN ('queued', 'running', 'done', 'failed')),
+                error       TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                updated_at  TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS upload_jobs_state ON upload_jobs(state)",
+            [],
+        )?;
+
         Ok(())
     }
 

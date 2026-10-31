@@ -22,6 +22,15 @@ pub struct AssetThumbTask {
 
 pub type ThumbReadyCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Returns the count of assets still pending thumbnail generation.
+pub fn get_pending_thumb_count(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.query_row(
+        "SELECT count(*) FROM assets WHERE local_path IS NOT NULL AND thumb_state IN ('none', 'failed')",
+        [],
+        |r| r.get(0),
+    )
+}
+
 pub struct ThumbWorker {
     priority_ids: Arc<Mutex<VecDeque<String>>>,
     active_in_flight: Arc<Mutex<HashSet<String>>>,
@@ -81,6 +90,15 @@ impl ThumbWorker {
             }
         }
         Ok(tasks)
+    }
+
+    /// Returns the count of assets still pending thumbnail generation.
+    pub fn get_pending_thumb_count(conn: &Connection) -> rusqlite::Result<usize> {
+        conn.query_row(
+            "SELECT count(*) FROM assets WHERE local_path IS NOT NULL AND thumb_state IN ('none', 'failed')",
+            [],
+            |r| r.get(0),
+        )
     }
 
     /// Starts the background thumbnail worker pool of 4 tasks.

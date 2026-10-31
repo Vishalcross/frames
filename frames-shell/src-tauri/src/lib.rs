@@ -153,6 +153,7 @@ pub struct AppState {
     pub import_control: Arc<ImportControl>,
     pub thumb_sync_running: Arc<AtomicBool>,
     pub thumb_worker: Arc<frames_core::thumb_worker::ThumbWorker>,
+    pub upload_worker: Arc<frames_core::UploadWorker>,
 }
 
 impl AppState {
@@ -233,6 +234,7 @@ impl AppState {
             import_control: Arc::new(ImportControl::new()),
             thumb_sync_running: Arc::new(AtomicBool::new(false)),
             thumb_worker: Arc::new(frames_core::thumb_worker::ThumbWorker::new()),
+            upload_worker: Arc::new(frames_core::UploadWorker::new()),
         }
     }
 
@@ -1614,6 +1616,32 @@ fn prioritize(asset_ids: Vec<String>, state: State<'_, AppState>) -> Result<(), 
     Ok(())
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct WorkerStatus {
+    pub uploading_count: usize,
+    pub thumb_generating_count: usize,
+}
+
+#[tauri::command]
+fn get_worker_status(state: State<'_, AppState>) -> Result<WorkerStatus, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let uploading_count = frames_core::upload_worker::get_active_upload_count(store.connection())
+        .unwrap_or(0);
+    let thumb_generating_count = frames_core::thumb_worker::get_pending_thumb_count(store.connection())
+        .unwrap_or(0);
+    Ok(WorkerStatus {
+        uploading_count,
+        thumb_generating_count,
+    })
+}
+
+#[tauri::command]
+fn queue_upload(asset_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    frames_core::upload_worker::enqueue_asset_upload(store.connection(), &asset_id)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn clear_local_cache(state: State<'_, AppState>) -> Result<(u64, CacheStats), String> {
     let mut cache = state.cache.lock().map_err(|e| e.to_string())?;
@@ -1724,6 +1752,20 @@ pub fn run() {
                         }
                     }
 
+                    // Start background upload worker (Task 1.2-n)
+                    if let Ok(s4) = state.require_s4() {
+                        let handle_up = handle_scan.clone();
+                        let upload_worker = Arc::clone(&state.upload_worker);
+                        let on_progress: frames_core::upload_worker::UploadProgressCallback =
+                            Arc::new(move |job_id: &str, st: &str| {
+                                let _ = handle_up.emit(
+                                    "upload-progress",
+                                    serde_json::json!({ "job_id": job_id, "state": st }),
+                                );
+                            });
+                        upload_worker.start_worker_pool(db_path.clone(), s4, Some(on_progress));
+                    }
+
                     let handle_events = handle_scan.clone();
                     let on_ready: frames_core::thumb_worker::ThumbReadyCallback = Arc::new(move |asset_id: &str| {
                         let _ = handle_events.emit("thumb-ready", serde_json::json!({ "asset_id": asset_id }));
@@ -1774,6 +1816,8 @@ pub fn run() {
             get_local_roots,
             scan_local_library,
             prioritize,
+            get_worker_status,
+            queue_upload,
             clear_local_cache,
             run_check_library,
             add_unknown_s4_files,

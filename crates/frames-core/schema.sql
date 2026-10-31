@@ -112,3 +112,15 @@ CREATE TABLE import_queue (
   album_id   TEXT,                                -- [+] album to add to once logged
   error      TEXT
 );
+
+-- Persistent background upload jobs (Task 1.2-n)
+CREATE TABLE IF NOT EXISTS upload_jobs (
+  id          TEXT PRIMARY KEY,
+  asset_id    TEXT NOT NULL,
+  state       TEXT NOT NULL CHECK (state IN ('queued', 'running', 'done', 'failed')),
+  error       TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS upload_jobs_state ON upload_jobs(state);
+

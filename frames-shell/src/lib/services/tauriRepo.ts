@@ -66,6 +66,32 @@ export interface BackendBootstrap {
   db_damaged: string | null;
 }
 
+export interface BackendSettingsView {
+  endpoint: string;
+  region: string;
+  bucket: string;
+  access_key_id: string;
+  has_secret_in_keychain: boolean;
+  s4_configured: boolean;
+  space_limit_gb: number;
+  cache_location: string;
+  cache_limit_gb: number;
+  use_real_s4: boolean;
+  device_id: string;
+}
+
+export interface SettingsInput {
+  endpoint: string;
+  region: string;
+  bucket: string;
+  access_key_id: string;
+  secret_access_key: string | null;
+  space_limit_gb: number;
+  cache_location: string;
+  cache_limit_gb: number;
+  use_real_s4: boolean;
+}
+
 export function isTauriAvailable(): boolean {
   if (typeof window === 'undefined') return false;
   return Boolean(
@@ -128,6 +154,13 @@ export class TauriAssetRepo implements AssetRepo {
   public outboxPending = 0;
   public offline = false;
   public deviceId = '';
+  public settings: BackendSettingsView | null = null;
+
+  async saveSettings(input: SettingsInput): Promise<BackendSettingsView> {
+    const view = await invoke<BackendSettingsView>('save_settings', { input });
+    this.settings = view;
+    return view;
+  }
 
   async getThumbnailDataUrl(id: string, preview = false): Promise<string | null> {
     const cacheKey = `${preview ? 'p' : 's'}:${id}`;
@@ -151,6 +184,7 @@ export class TauriAssetRepo implements AssetRepo {
     try {
       const data = await invoke<BackendBootstrap>('get_app_bootstrap');
       this.deviceId = data.device_id;
+      this.settings = data.settings as BackendSettingsView;
       this.cachedAssets = (data.timeline.assets || []).map(backendSummaryToAsset);
       this.cachedAlbums = (data.albums || []).map((a) => ({
         id: a.id,

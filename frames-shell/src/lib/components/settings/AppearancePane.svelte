@@ -8,10 +8,12 @@
 
   let {
     onclose,
-    ontoggleGallery
+    ontoggleGallery,
+    onopenConnection
   }: {
     onclose?: () => void;
     ontoggleGallery?: () => void;
+    onopenConnection?: () => void;
   } = $props();
 
   const appearances: { id: Appearance; label: string; desc: string }[] = [
@@ -92,6 +94,10 @@
         <span class="sheet-sub">Customise visual material, colour derivation and chrome styles</span>
       </div>
       <div class="sheet-header-actions">
+        <Button variant="ghost" onclick={onopenConnection}>
+          <Icon name="cloud" size={15} />
+          <span>MEGA S4 Connection…</span>
+        </Button>
         <Button variant="ghost" onclick={ontoggleGallery}>
           <Icon name="layers" size={15} />
           <span>Component Gallery</span>

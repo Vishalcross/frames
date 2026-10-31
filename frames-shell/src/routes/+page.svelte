@@ -24,6 +24,7 @@
   import InfoPanel from '$lib/components/info/InfoPanel.svelte';
   import EditModal from '$lib/components/edit/EditModal.svelte';
   import AppearancePane from '$lib/components/settings/AppearancePane.svelte';
+  import ConnectionPane from '$lib/components/settings/ConnectionPane.svelte';
   import KitGallery from '$lib/components/settings/KitGallery.svelte';
   import DeleteSheet from '$lib/components/dialogs/DeleteSheet.svelte';
   import ImportOverlay from '$lib/components/dialogs/ImportOverlay.svelte';
@@ -64,6 +65,8 @@
   let infoPanelOpen = $state(false);
   let settingsOpen = $state(false);
   let galleryOpen = $state(false);
+  let connectionOpen = $state(false);
+  let connectionHint = $state('');
   let deleteSheetOpen = $state(false);
   let importDragging = $state(false);
 
@@ -160,6 +163,10 @@
   }
 
   async function handleSyncNow() {
+    if (tauriRepo.settings && !tauriRepo.settings.s4_configured) {
+      openConnection('Add your MEGA S4 Access Key ID and Secret Access Key to sync your albums.');
+      return;
+    }
     isSyncing = true;
     toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Syncing with MEGA S4 cloud…' }];
     const rep = await tauriRepo.syncNow();
@@ -189,7 +196,11 @@
 
     // Initialise real SQLite library and sync down any uploaded album from Mega S4
     loadLibraryData().then(() => {
-      handleSyncNow();
+      if (tauriRepo.settings && !tauriRepo.settings.s4_configured) {
+        openConnection('Welcome! Connect your MEGA S4 bucket to load your albums and import photos.');
+      } else {
+        handleSyncNow();
+      }
     });
 
     // Drag and drop listeners for OS files (§4.12)
@@ -318,6 +329,12 @@
     gridKey++;
   }
 
+  function openConnection(hint = '') {
+    connectionHint = hint;
+    settingsOpen = false;
+    connectionOpen = true;
+  }
+
   // Real Backend Bridge Handlers (M6)
   async function handlePickFolderAndImport() {
     if (!isTauri) {
@@ -329,6 +346,10 @@
           text: 'Running in browser dev server. To access native folder dialog and SQLite, launch via "npm run tauri dev".'
         }
       ];
+      return;
+    }
+    if (tauriRepo.settings && !tauriRepo.settings.s4_configured) {
+      openConnection('Importing uploads your photos to MEGA S4, so add your S4 keys first.');
       return;
     }
     toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Opening system folder dialog…' }];
@@ -582,9 +603,24 @@
   {#if settingsOpen}
     <AppearancePane
       onclose={() => (settingsOpen = false)}
+      onopenConnection={() => openConnection()}
       ontoggleGallery={() => {
         settingsOpen = false;
         galleryOpen = true;
+      }}
+    />
+  {/if}
+
+  {#if connectionOpen}
+    <ConnectionPane
+      hint={connectionHint}
+      onclose={() => (connectionOpen = false)}
+      onsaved={async (view) => {
+        connectionOpen = false;
+        toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Connection saved.' }];
+        if (view.s4_configured) {
+          await handleSyncNow();
+        }
       }}
     />
   {/if}

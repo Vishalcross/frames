@@ -158,6 +158,8 @@ pub struct AppState {
     pub thumb_worker: Arc<frames_core::thumb_worker::ThumbWorker>,
     pub upload_worker: Arc<frames_core::UploadWorker>,
     pub remote_fetcher: Arc<Mutex<Option<frames_core::RemoteFetcher>>>,
+    pub thumb_started: AtomicBool,
+    pub upload_started: AtomicBool,
 }
 
 impl AppState {
@@ -240,6 +242,8 @@ impl AppState {
             thumb_worker: Arc::new(frames_core::thumb_worker::ThumbWorker::new()),
             upload_worker: Arc::new(frames_core::UploadWorker::new()),
             remote_fetcher: Arc::new(Mutex::new(None)),
+            thumb_started: AtomicBool::new(false),
+            upload_started: AtomicBool::new(false),
         }
     }
 
@@ -1731,6 +1735,7 @@ fn toggle_offline_mode(offline: bool, state: State<'_, AppState>) -> Result<bool
 #[tauri::command]
 fn save_settings(
     input: SettingsInput,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<SettingsView, String> {
     let access_key = input.access_key_id.trim();
@@ -1778,6 +1783,13 @@ fn save_settings(
     }
 
     *state.settings.lock().unwrap() = new_settings;
+    // Drop any fetcher built from the previous credentials.
+    *state.remote_fetcher.lock().unwrap() = None;
+
+    // Start the upload worker now if the new credentials make S4 usable.
+    let app_for_workers = app.clone();
+    tauri::async_runtime::spawn_blocking(move || start_background_workers(&app_for_workers));
+
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let dev_id = store.device_id().map_err(|e| e.to_string())?;
     Ok(state.settings_view(dev_id))
@@ -1890,6 +1902,37 @@ async fn run_rebuild_database(state: State<'_, AppState>) -> Result<SyncReport, 
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Start the thumbnail worker (always) and the upload worker (once S4 is usable).
+/// Must be called from a tokio runtime context. Safe to call repeatedly.
+fn start_background_workers(handle: &AppHandle) {
+    let state = handle.state::<AppState>();
+    let db_path = state.data_dir.join("frames.sqlite3");
+
+    if !state.thumb_started.swap(true, Ordering::SeqCst) {
+        let handle_events = handle.clone();
+        let on_ready: frames_core::thumb_worker::ThumbReadyCallback =
+            Arc::new(move |asset_id: &str| {
+                let _ = handle_events.emit("thumb-ready", serde_json::json!({ "asset_id": asset_id }));
+            });
+        Arc::clone(&state.thumb_worker).start_worker_pool(db_path.clone(), Some(on_ready));
+    }
+
+    if !state.upload_started.load(Ordering::SeqCst) {
+        if let Ok(s4) = state.require_s4() {
+            state.upload_started.store(true, Ordering::SeqCst);
+            let handle_up = handle.clone();
+            let on_progress: frames_core::upload_worker::UploadProgressCallback =
+                Arc::new(move |job_id: &str, st: &str| {
+                    let _ = handle_up.emit(
+                        "upload-progress",
+                        serde_json::json!({ "job_id": job_id, "state": st }),
+                    );
+                });
+            Arc::clone(&state.upload_worker).start_worker_pool(db_path, s4, Some(on_progress));
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::init())
@@ -1924,49 +1967,28 @@ pub fn run() {
                 .ok();
 
             // Background local library scanner & thumbnail worker (Task 1.2-c, 1.2-g)
+            // NOTE: must run on the tokio blocking pool (not a bare std::thread):
+            // the worker pools call `tokio::spawn`, which panics without a runtime context.
             let handle_scan = app.handle().clone();
-            std::thread::Builder::new()
-                .name("frames-local-scan".into())
-                .spawn(move || {
-                    let state = handle_scan.state::<AppState>();
-                    let db_path = state.data_dir.join("frames.sqlite3");
-                    let worker = Arc::clone(&state.thumb_worker);
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = handle_scan.state::<AppState>();
 
+                if let Ok(store) = state.store.lock() {
+                    let count = frames_core::scan_local::scan_all_local_roots(&store).unwrap_or(0);
+                    let _ = handle_scan.emit("scan-finished", serde_json::json!({ "count": count }));
+                };
+
+                if let Ok(s4) = state.require_s4() {
                     if let Ok(store) = state.store.lock() {
-                        let count = frames_core::scan_local::scan_all_local_roots(&store).unwrap_or(0);
-                        let _ = handle_scan.emit("scan-finished", serde_json::json!({ "count": count }));
-                    };
-
-                    if let Ok(s4) = state.require_s4() {
-                        if let Ok(store) = state.store.lock() {
-                            let handle_alb = handle_scan.clone();
-                            let _ = frames_core::sync::sync_remote_album_listings(&store, s4.as_ref(), move |album_id| {
-                                let _ = handle_alb.emit("album-synced", serde_json::json!({ "album_id": album_id }));
-                            });
-                        }
+                        let handle_alb = handle_scan.clone();
+                        let _ = frames_core::sync::sync_remote_album_listings(&store, s4.as_ref(), move |album_id| {
+                            let _ = handle_alb.emit("album-synced", serde_json::json!({ "album_id": album_id }));
+                        });
                     }
+                }
 
-                    // Start background upload worker (Task 1.2-n)
-                    if let Ok(s4) = state.require_s4() {
-                        let handle_up = handle_scan.clone();
-                        let upload_worker = Arc::clone(&state.upload_worker);
-                        let on_progress: frames_core::upload_worker::UploadProgressCallback =
-                            Arc::new(move |job_id: &str, st: &str| {
-                                let _ = handle_up.emit(
-                                    "upload-progress",
-                                    serde_json::json!({ "job_id": job_id, "state": st }),
-                                );
-                            });
-                        upload_worker.start_worker_pool(db_path.clone(), s4, Some(on_progress));
-                    }
-
-                    let handle_events = handle_scan.clone();
-                    let on_ready: frames_core::thumb_worker::ThumbReadyCallback = Arc::new(move |asset_id: &str| {
-                        let _ = handle_events.emit("thumb-ready", serde_json::json!({ "asset_id": asset_id }));
-                    });
-                    worker.start_worker_pool(db_path, Some(on_ready));
-                })
-                .ok();
+                start_background_workers(&handle_scan);
+            });
 
             Ok(())
         })

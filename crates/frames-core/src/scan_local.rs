@@ -15,6 +15,29 @@ pub fn is_supported_media_extension(ext: &str) -> bool {
     SUPPORTED_EXTENSIONS.contains(&lower.as_str())
 }
 
+pub fn is_hidden_or_system_file(path_or_name: &str) -> bool {
+    let normalized = path_or_name.replace('\\', "/");
+    for part in normalized.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        if part.starts_with('.')
+            || part.starts_with("._")
+            || part.eq_ignore_ascii_case("thumbs.db")
+            || part.eq_ignore_ascii_case(".ds_store")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn normalize_relpath(relpath: &str) -> String {
+    let forward = relpath.replace('\\', "/");
+    let trimmed = forward.trim_matches('/');
+    crate::keys::normalize_nfc(trimmed)
+}
+
 pub fn classify_kind(ext: &str) -> &'static str {
     match ext.to_lowercase().as_str() {
         "mp4" | "mov" | "m4v" => "video",
@@ -35,6 +58,7 @@ pub fn upsert_local_asset(
     mtime: DateTime<Utc>,
     device_id: &str,
 ) -> Result<String> {
+    let norm_rel = normalize_relpath(relative_path);
     let ext = Path::new(filename)
         .extension()
         .and_then(|s| s.to_str())
@@ -46,15 +70,15 @@ pub fn upsert_local_asset(
     let existing: Option<String> = conn
         .query_row(
             "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
-            params![album_id, relative_path],
+            params![album_id, norm_rel],
             |r| r.get(0),
         )
         .optional()?;
 
     let asset_id = if let Some(id) = existing {
         conn.execute(
-            "UPDATE assets SET local_path = ?1 WHERE id = ?2",
-            params![local_path, id],
+            "UPDATE assets SET local_path = ?1, size = CASE WHEN size = 0 THEN ?2 ELSE size END WHERE id = ?3",
+            params![local_path, size as i64, id],
         )?;
         id
     } else {
@@ -66,7 +90,10 @@ pub fn upsert_local_asset(
             ) VALUES (
                 ?1, ?2, '', ?3, ?4, ?5, ?6, ?6,
                 ?7, ?8, ?9, 'none'
-            )",
+            )
+            ON CONFLICT(album_id, relative_path) DO UPDATE SET
+                local_path = excluded.local_path,
+                size = excluded.size",
             params![
                 new_id,
                 kind,
@@ -75,11 +102,15 @@ pub fn upsert_local_asset(
                 mtime_str,
                 stamp,
                 album_id,
-                relative_path,
+                norm_rel,
                 local_path,
             ],
         )?;
-        new_id
+        conn.query_row(
+            "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
+            params![album_id, norm_rel],
+            |r| r.get(0),
+        )?
     };
 
     conn.execute(
@@ -110,12 +141,26 @@ pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, devic
         }
 
         let path = entry.path();
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if is_hidden_or_system_file(&filename) {
+            continue;
+        }
+
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e,
             None => continue,
         };
 
         if !is_supported_media_extension(ext) {
+            continue;
+        }
+
+        let relative_raw = path
+            .strip_prefix(folder)
+            .unwrap_or(path)
+            .to_string_lossy();
+        let relative = normalize_relpath(&relative_raw);
+        if is_hidden_or_system_file(&relative) {
             continue;
         }
 
@@ -130,12 +175,6 @@ pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, devic
             .map(DateTime::from)
             .unwrap_or_else(|_| Utc::now());
 
-        let relative = path
-            .strip_prefix(folder)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let filename = entry.file_name().to_string_lossy().to_string();
         let local_path = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf())

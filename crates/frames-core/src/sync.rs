@@ -1491,6 +1491,172 @@ pub fn export_originals(
     Ok(exported)
 }
 
+/// Syncs remote album listings from S4 into the local database (Task 1.2-m).
+///
+/// 1. Lists objects for every album under "albums/" (and discovers any remote-only albums).
+/// 2. Upserts by `(album_id, relative_path)`: sets `remote_key`. Never duplicates a row created by local scan.
+/// 3. Emits `on_album_synced(album_id)` as each album finishes.
+pub fn sync_remote_album_listings<F>(
+    store: &Store,
+    s4: &dyn ObjectStore,
+    mut on_album_synced: F,
+) -> Result<usize>
+where
+    F: FnMut(&str),
+{
+    let device_id = store.device_id().unwrap_or_else(|_| "remote".to_string());
+    let now = Utc::now();
+    let now_str = crate::store::format_utc(now);
+    let stamp = format!("{now_str}|{device_id}");
+
+    let objects = match s4.list_objects("albums/") {
+        Ok(objs) => objs,
+        Err(e) => return Err(SyncError::S4(e)),
+    };
+
+    let conn = store.connection();
+    let mut album_name_to_id: HashMap<String, String> = HashMap::new();
+    let mut album_id_set: HashSet<String> = HashSet::new();
+
+    {
+        let mut stmt = conn.prepare("SELECT id, name FROM albums WHERE deleted_at IS NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, name) = row?;
+            album_name_to_id.insert(name.to_lowercase(), id.clone());
+            album_name_to_id.insert(id.clone(), id.clone());
+            album_id_set.insert(id);
+        }
+    }
+
+    let mut album_objects: HashMap<String, Vec<crate::s4::ObjectMeta>> = HashMap::new();
+
+    for obj in objects {
+        let trimmed = obj.key.trim_start_matches('/');
+        if let Some(rest) = trimmed.strip_prefix("albums/") {
+            if let Some((album_folder, relpath)) = rest.split_once('/') {
+                if !album_folder.is_empty() && !relpath.is_empty() {
+                    album_objects
+                        .entry(album_folder.to_string())
+                        .or_default()
+                        .push(obj);
+                }
+            }
+        }
+    }
+
+    let mut total_upserted = 0usize;
+    let mut synced_album_ids: HashSet<String> = HashSet::new();
+
+    for (folder, objs) in album_objects {
+        let album_id = if let Some(existing_id) = album_name_to_id.get(&folder.to_lowercase()) {
+            existing_id.clone()
+        } else {
+            let new_album_id = if uuid::Uuid::parse_str(&folder).is_ok() {
+                folder.clone()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            conn.execute(
+                "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![new_album_id, folder, stamp, now_str],
+            )?;
+            album_name_to_id.insert(folder.to_lowercase(), new_album_id.clone());
+            album_name_to_id.insert(new_album_id.clone(), new_album_id.clone());
+            album_id_set.insert(new_album_id.clone());
+            new_album_id
+        };
+
+        for obj in objs {
+            let prefix = format!("albums/{folder}/");
+            let rel = obj.key.strip_prefix(&prefix).unwrap_or(&obj.key);
+            let normalized_rel = crate::scan_local::normalize_relpath(rel);
+
+            if crate::scan_local::is_hidden_or_system_file(&normalized_rel) {
+                continue;
+            }
+
+            let filename = normalized_rel
+                .rsplit('/')
+                .next()
+                .unwrap_or(&normalized_rel)
+                .to_string();
+
+            let ext = Path::new(&filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let kind = crate::scan_local::classify_kind(ext);
+
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
+                    rusqlite::params![album_id, normalized_rel],
+                    |r| r.get(0),
+                )
+                .ok();
+
+            let asset_id = if let Some(id) = existing {
+                conn.execute(
+                    "UPDATE assets SET remote_key = ?1 WHERE id = ?2",
+                    rusqlite::params![obj.key, id],
+                )?;
+                id
+            } else {
+                let new_id = uuid::Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO assets (
+                        id, kind, key, filename, size, taken_at, date_at, state_at,
+                        album_id, relative_path, remote_key, thumb_state
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7,
+                        ?8, ?9, ?3, 'none'
+                    )
+                    ON CONFLICT(album_id, relative_path) DO UPDATE SET
+                        remote_key = excluded.remote_key,
+                        size = CASE WHEN assets.size = 0 THEN excluded.size ELSE assets.size END",
+                    rusqlite::params![
+                        new_id,
+                        kind,
+                        obj.key,
+                        filename,
+                        obj.size as i64,
+                        now_str,
+                        stamp,
+                        album_id,
+                        normalized_rel,
+                    ],
+                )?;
+                conn.query_row(
+                    "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
+                    rusqlite::params![album_id, normalized_rel],
+                    |r| r.get(0),
+                )?
+            };
+
+            conn.execute(
+                "INSERT INTO album_items (album_id, asset_id, in_album, at)
+                 VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(album_id, asset_id) DO UPDATE SET in_album = 1, at = excluded.at",
+                rusqlite::params![album_id, asset_id, stamp],
+            )?;
+
+            total_upserted += 1;
+        }
+
+        synced_album_ids.insert(album_id.clone());
+        on_album_synced(&album_id);
+    }
+
+    for id in album_id_set {
+        if !synced_album_ids.contains(&id) {
+            on_album_synced(&id);
+        }
+    }
+
+    Ok(total_upserted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1749,5 +1915,72 @@ mod tests {
         assert_eq!(rep.imported_count, 6);
         assert!(!control.is_running());
         assert_eq!(store.lock().unwrap().list_timeline(None, None).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn sync_remote_album_listings_creates_remote_album_and_deduplicates_local() {
+        let store = Store::open_in_memory("mac-1").unwrap();
+        let s4 = InMemoryObjectStore::new(S4Config::default());
+
+        let local_album_id = "album-local-1";
+        store.connection().execute(
+            "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, 'Vacation', 'now', 'now')",
+            rusqlite::params![local_album_id],
+        ).unwrap();
+
+        let asset_id = crate::scan_local::upsert_local_asset(
+            store.connection(),
+            local_album_id,
+            "beach.jpg",
+            "/local/disk/Vacation/beach.jpg",
+            "beach.jpg",
+            12345,
+            Utc::now(),
+            "mac-1",
+        ).unwrap();
+
+        s4.put_object("albums/Vacation/beach.jpg", b"fake-jpg", "image/jpeg").unwrap();
+        s4.put_object("albums/Vacation/sunset.jpg", b"fake-jpg-2", "image/jpeg").unwrap();
+        s4.put_object("albums/Remote Only/pyramids.jpg", b"fake-jpg-3", "image/jpeg").unwrap();
+
+        let mut synced_albums = Vec::new();
+        let upserted = sync_remote_album_listings(&store, &s4, |alb_id| {
+            synced_albums.push(alb_id.to_string());
+        }).unwrap();
+
+        assert_eq!(upserted, 3);
+        assert!(synced_albums.contains(&local_album_id.to_string()));
+
+        let beach_row: (String, Option<String>, Option<String>) = store.connection().query_row(
+            "SELECT id, local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'beach.jpg'",
+            rusqlite::params![local_album_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(beach_row.0, asset_id);
+        assert_eq!(beach_row.1.as_deref(), Some("/local/disk/Vacation/beach.jpg"));
+        assert_eq!(beach_row.2.as_deref(), Some("albums/Vacation/beach.jpg"));
+
+        let sunset_row: (Option<String>, Option<String>) = store.connection().query_row(
+            "SELECT local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'sunset.jpg'",
+            rusqlite::params![local_album_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(sunset_row.0.is_none());
+        assert_eq!(sunset_row.1.as_deref(), Some("albums/Vacation/sunset.jpg"));
+
+        let remote_album: (String, String) = store.connection().query_row(
+            "SELECT id, name FROM albums WHERE name = 'Remote Only'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(remote_album.1, "Remote Only");
+
+        let pyramid_row: (Option<String>, Option<String>) = store.connection().query_row(
+            "SELECT local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'pyramids.jpg'",
+            rusqlite::params![remote_album.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(pyramid_row.0.is_none());
+        assert_eq!(pyramid_row.1.as_deref(), Some("albums/Remote Only/pyramids.jpg"));
     }
 }

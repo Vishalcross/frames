@@ -1715,6 +1715,15 @@ pub fn run() {
                         let _ = frames_core::scan_local::scan_all_local_roots(&store);
                     };
 
+                    if let Ok(s4) = state.require_s4() {
+                        if let Ok(store) = state.store.lock() {
+                            let handle_alb = handle_scan.clone();
+                            let _ = frames_core::sync::sync_remote_album_listings(&store, s4.as_ref(), move |album_id| {
+                                let _ = handle_alb.emit("album-synced", serde_json::json!({ "album_id": album_id }));
+                            });
+                        }
+                    }
+
                     let handle_events = handle_scan.clone();
                     let on_ready: frames_core::thumb_worker::ThumbReadyCallback = Arc::new(move |asset_id: &str| {
                         let _ = handle_events.emit("thumb-ready", serde_json::json!({ "asset_id": asset_id }));

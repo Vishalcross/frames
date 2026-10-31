@@ -1187,6 +1187,12 @@ fn list_albums(state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> 
 }
 
 #[tauri::command]
+fn album_asset_count(album_id: String, state: State<'_, AppState>) -> Result<usize, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.album_asset_count(&album_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_album_assets(
     album_id: String,
     state: State<'_, AppState>,
@@ -1717,9 +1723,11 @@ fn get_local_roots(state: State<'_, AppState>) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn scan_local_library(state: State<'_, AppState>) -> Result<usize, String> {
+fn scan_local_library(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<usize, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
-    frames_core::scan_local::scan_all_local_roots(&store).map_err(|e| e.to_string())
+    let count = frames_core::scan_local::scan_all_local_roots(&store).map_err(|e| e.to_string())?;
+    let _ = app.emit("scan-finished", serde_json::json!({ "count": count }));
+    Ok(count)
 }
 
 #[tauri::command]
@@ -1852,7 +1860,8 @@ pub fn run() {
                     let worker = Arc::clone(&state.thumb_worker);
 
                     if let Ok(store) = state.store.lock() {
-                        let _ = frames_core::scan_local::scan_all_local_roots(&store);
+                        let count = frames_core::scan_local::scan_all_local_roots(&store).unwrap_or(0);
+                        let _ = handle_scan.emit("scan-finished", serde_json::json!({ "count": count }));
                     };
 
                     if let Ok(s4) = state.require_s4() {
@@ -1901,6 +1910,7 @@ pub fn run() {
             export_assets,
             pick_folder_dialog,
             list_albums,
+            album_asset_count,
             get_album_assets,
             create_album,
             rename_album,

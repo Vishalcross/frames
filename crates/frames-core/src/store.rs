@@ -1250,16 +1250,31 @@ impl Store {
         }))
     }
 
+    /// Return the count of assets in an album.
+    /// Uses `SELECT COUNT(*) FROM assets WHERE album_id = ?`.
+    pub fn album_asset_count(&self, album_id: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM assets WHERE album_id = ?1",
+            [album_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// List all non-deleted albums with item counts and newest cover photo id
     /// (spec section 9: "Album contents are sorted by date taken; the cover is the newest photo").
     pub fn list_albums(&self) -> Result<Vec<AlbumSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT a.id, a.name, a.created_at,
-                    (SELECT count(*)
-                     FROM album_items ai
-                     JOIN assets s ON s.id = ai.asset_id
-                     WHERE ai.album_id = a.id AND ai.in_album = 1
-                       AND s.trashed_at IS NULL AND s.purged_at IS NULL) AS cnt,
+                    (SELECT CASE
+                        WHEN (SELECT count(*) FROM assets WHERE album_id = a.id) > 0
+                        THEN (SELECT count(*) FROM assets WHERE album_id = a.id)
+                        ELSE (SELECT count(*)
+                              FROM album_items ai
+                              JOIN assets s ON s.id = ai.asset_id
+                              WHERE ai.album_id = a.id AND ai.in_album = 1
+                                AND s.trashed_at IS NULL AND s.purged_at IS NULL)
+                     END) AS cnt,
                     (SELECT s.id
                      FROM album_items ai
                      JOIN assets s ON s.id = ai.asset_id
@@ -2126,6 +2141,17 @@ fn apply_album_membership(
                     at = excluded.at",
                 params![album_id, asset_id, i32::from(in_album), stamp],
             )?;
+            if in_album {
+                let _ = tx.execute(
+                    "UPDATE assets SET album_id = ?1 WHERE id = ?2 AND (album_id IS NULL OR album_id = '')",
+                    params![album_id, asset_id],
+                );
+            } else {
+                let _ = tx.execute(
+                    "UPDATE assets SET album_id = NULL WHERE id = ?2 AND album_id = ?1",
+                    params![album_id, asset_id],
+                );
+            }
             refresh_fts_for_asset(tx, asset_id)?;
         }
     }
@@ -2515,4 +2541,29 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn album_asset_count_inserts_5_assets_expects_5() {
+        let store = Store::open_in_memory("mac-1").unwrap();
+        let conn = store.connection();
+        let album_id = "album-five";
+        conn.execute(
+            "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, 'Five Album', 'now', 'now')",
+            [album_id],
+        ).unwrap();
+
+        for i in 1..=5 {
+            conn.execute(
+                "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, album_id)
+                 VALUES (?1, 'photo', ?2, 100, '2026-01-01T00:00:00Z', 'now', 'now', ?3)",
+                params![format!("asset-{}", i), format!("photo{}.jpg", i), album_id],
+            ).unwrap();
+        }
+
+        assert_eq!(store.album_asset_count(album_id).unwrap(), 5);
+        let albums = store.list_albums().unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].asset_count, 5);
+    }
 }
+

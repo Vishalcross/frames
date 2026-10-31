@@ -210,15 +210,29 @@ export class TauriAssetRepo implements AssetRepo {
     }
   }
 
+  async getAlbumAssetCount(albumId: string): Promise<number> {
+    if (!isTauriAvailable()) {
+      const alb = this.cachedAlbums.find((a) => a.id === albumId);
+      return alb ? alb.assetCount : 0;
+    }
+    try {
+      const cnt = await invoke<number>('album_asset_count', { albumId });
+      const alb = this.cachedAlbums.find((a) => a.id === albumId);
+      if (alb) alb.assetCount = cnt;
+      return cnt;
+    } catch (e) {
+      console.warn('Failed to get album asset count:', e);
+      const alb = this.cachedAlbums.find((a) => a.id === albumId);
+      return alb ? alb.assetCount : 0;
+    }
+  }
+
   async count(q: Query): Promise<number> {
     if (!this.isLoaded) {
       await this.loadBootstrap();
     }
     if (q.scope === 'album' && q.albumId) {
-      const alb = this.cachedAlbums.find((a) => a.id === q.albumId);
-      if (alb) return alb.assetCount;
-      const list = await this.getAlbumAssets(q.albumId);
-      return list.length;
+      return await this.getAlbumAssetCount(q.albumId);
     }
     if (q.search || q.filter || q.year) {
       const items = await this.range(q, 0, 10000);

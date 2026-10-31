@@ -22,7 +22,49 @@
     onselectionchange?: (ids: Set<string>) => void;
   } = $props();
 
+  import { onMount } from 'svelte';
+
   let heroFallback = $state<string | null>(null);
+  let countOverride = $state<number | null>(null);
+  const assetCount = $derived(countOverride ?? album.assetCount);
+
+  $effect(() => {
+    // Reset override when album id changes
+    const _id = album.id;
+    countOverride = null;
+    if (_id && isTauriAvailable()) {
+      tauriRepo.getAlbumAssetCount(_id).then((cnt) => {
+        countOverride = cnt;
+      });
+    }
+  });
+
+  onMount(() => {
+    if (!isTauriAvailable()) return;
+    let unlistens: Array<() => void> = [];
+
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      listen<{ album_id?: string }>('album-synced', (ev) => {
+        if (!ev.payload?.album_id || ev.payload.album_id === album.id) {
+          tauriRepo.getAlbumAssetCount(album.id).then((cnt) => {
+            countOverride = cnt;
+          });
+        }
+      }).then((un) => unlistens.push(un));
+
+      listen('scan-finished', () => {
+        tauriRepo.getAlbumAssetCount(album.id).then((cnt) => {
+          countOverride = cnt;
+        });
+      }).then((un) => unlistens.push(un));
+    });
+
+    return () => {
+      for (const un of unlistens) {
+        un();
+      }
+    };
+  });
 
   const heroThumb = $derived(
     heroFallback || (album.keyAssetId ? getAssetUrl('preview', album.keyAssetId) : '')
@@ -69,7 +111,7 @@
           <span>{album.dateRange}</span>
           <span class="meta-dot">·</span>
         {/if}
-        <span>{album.assetCount.toLocaleString()} {album.assetCount === 1 ? 'item' : 'items'}</span>
+        <span>{assetCount.toLocaleString()} {assetCount === 1 ? 'item' : 'items'}</span>
       </div>
     </div>
   </div>

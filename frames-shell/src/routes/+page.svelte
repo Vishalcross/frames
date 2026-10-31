@@ -197,12 +197,26 @@
       importDragging = true;
     };
 
-    window.addEventListener('dragenter', handleDragEnter);
+    let unlistens: Array<() => void> = [];
+    if (isTauri) {
+      import('@tauri-apps/api/event').then(({ listen }) => {
+        listen('album-synced', async () => {
+          await loadLibraryData();
+        }).then((un) => unlistens.push(un));
+
+        listen('scan-finished', async () => {
+          await loadLibraryData();
+        }).then((un) => unlistens.push(un));
+      });
+    }
 
     return () => {
       cleanupEngine();
       cleanupGovernor();
       window.removeEventListener('dragenter', handleDragEnter);
+      for (const un of unlistens) {
+        un();
+      }
     };
   });
 

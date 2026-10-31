@@ -11,6 +11,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "7"
 fastrand = "2"
 flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 png = "0.18"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

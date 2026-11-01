@@ -220,6 +220,16 @@
         listen('scan-finished', async () => {
           await loadLibraryData();
         }).then((un) => unlistens.push(un));
+
+        let importRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+        listen('frames://import-progress', () => {
+          if (!importRefreshTimer) {
+            importRefreshTimer = setTimeout(async () => {
+              importRefreshTimer = null;
+              await loadLibraryData();
+            }, 1000);
+          }
+        }).then((un) => unlistens.push(un));
       });
     }
 
@@ -547,6 +557,7 @@
             onimport={handlePickFolderAndImport}
             onsync={handleSyncNow}
             onimported={() => loadLibraryData()}
+            onnavigatelibrary={() => navigate('library')}
           />
         {:else}
           <!-- Generic Filtered Grid for Favorites, Videos, Hidden, Captured by Me -->

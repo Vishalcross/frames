@@ -14,12 +14,14 @@
     isTauri = true,
     onimport,
     onsync,
-    onimported
+    onimported,
+    onnavigatelibrary
   }: {
     isTauri?: boolean;
     onimport?: () => void;
     onsync?: () => void;
     onimported?: () => void;
+    onnavigatelibrary?: () => void;
   } = $props();
 
   let status = $state<BackendImportStatusView>({
@@ -281,6 +283,12 @@
           <Button variant="accent" onclick={onimport}>
             <Icon name="arrow-down-to-line" size={14} />
             <span>Import Photos…</span>
+          </Button>
+        {/if}
+        {#if onnavigatelibrary && status.progress.completed_files > 0}
+          <Button variant="standard" onclick={onnavigatelibrary} title="View imported photos in Library">
+            <Icon name="photo" size={14} />
+            <span>View in Library</span>
           </Button>
         {/if}
         {#if status.queue.length > 0}

@@ -13,3 +13,7 @@ Thumbs.db
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Bundled native sidecar binaries (downloaded dynamically via scripts/prepare-binaries.js)
+frames-shell/src-tauri/binaries/
+binaries/

@@ -91,34 +91,160 @@ pub fn is_heic_extension(ext: &str) -> bool {
 }
 
 /// Resolve a bundled sidecar or system binary (`"ffmpeg"` or `"ffprobe"`), checking:
-/// 1. Adjacent to `std::env::current_exe()` and `../Resources/bin` (bundled app resources).
-/// 2. Common macOS Homebrew locations (`/opt/homebrew/bin`, `/usr/local/bin`).
-/// 3. Fallback to `PATH`.
+/// 1. Environment variable override (`FRAMES_FFMPEG_PATH`, `FRAMES_FFPROBE_PATH`, or `FRAMES_<TOOL>_PATH`).
+/// 2. Executable adjacent and bundle directories (`dir`, `dir/bin`, `dir/resources`, `dir/../Resources`, etc.).
+/// 3. Workspace development directories (`frames-shell/src-tauri/binaries/`, `src-tauri/binaries/`).
+/// 4. Platform-specific fallback paths (macOS `/opt/homebrew/bin`, Windows standard paths).
+/// 5. System `PATH`.
 pub fn resolve_tool_binary(tool: &str) -> std::path::PathBuf {
-    let exe_name = if cfg!(target_os = "windows") && !tool.ends_with(".exe") {
-        format!("{tool}.exe")
+    // If an existing file path was passed directly, return it immediately.
+    let direct_path = std::path::Path::new(tool);
+    if direct_path.is_file() {
+        return direct_path.to_path_buf();
+    }
+
+    let clean_tool = if let Some(stripped) = tool.strip_suffix(".exe") {
+        stripped
+    } else if let Some(stripped) = tool.strip_suffix(".EXE") {
+        stripped
     } else {
-        tool.to_string()
+        tool
     };
 
+    let env_var_name = format!("FRAMES_{}_PATH", clean_tool.to_ascii_uppercase());
+    if let Ok(val) = std::env::var(&env_var_name) {
+        let p = std::path::PathBuf::from(val);
+        if p.is_file() {
+            return p;
+        }
+    }
+
+    let exe_name = if cfg!(target_os = "windows") && !tool.ends_with(".exe") && !tool.ends_with(".EXE") {
+        format!("{clean_tool}.exe")
+    } else {
+        clean_tool.to_string()
+    };
+
+    let target_triple_names: &[&str] = if cfg!(target_os = "windows") {
+        &[
+            "x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-gnu",
+            "aarch64-pc-windows-msvc",
+        ]
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            &[
+                "aarch64-apple-darwin",
+                "universal-apple-darwin",
+                "x86_64-apple-darwin",
+            ]
+        } else {
+            &[
+                "x86_64-apple-darwin",
+                "universal-apple-darwin",
+                "aarch64-apple-darwin",
+            ]
+        }
+    } else {
+        &[]
+    };
+
+    let mut sidecar_variants = vec![exe_name.clone()];
+    for triple in target_triple_names {
+        if cfg!(target_os = "windows") {
+            sidecar_variants.push(format!("{clean_tool}-{triple}.exe"));
+        } else {
+            sidecar_variants.push(format!("{clean_tool}-{triple}"));
+        }
+    }
+
+    // 1. Check relative to current executable
     if let Ok(cur_exe) = std::env::current_exe() {
+        let cur_exe = std::fs::canonicalize(&cur_exe).unwrap_or(cur_exe);
         if let Some(dir) = cur_exe.parent() {
-            for candidate in [
-                dir.join(&exe_name),
-                dir.join("bin").join(&exe_name),
-                dir.join("../Resources").join(&exe_name),
-                dir.join("../Resources/bin").join(&exe_name),
+            for sub in [
+                dir.to_path_buf(),
+                dir.join("bin"),
+                dir.join("binaries"),
+                dir.join("resources"),
+                dir.join("resources/bin"),
+                dir.join("../Resources"),
+                dir.join("../Resources/bin"),
+                dir.join("../Resources/binaries"),
             ] {
-                if candidate.is_file() {
-                    return candidate;
+                for variant in &sidecar_variants {
+                    let candidate = sub.join(variant);
+                    if candidate.is_file() {
+                        return candidate;
+                    }
                 }
+            }
+
+            // Check ancestor directories for workspace development trees
+            let mut current = dir;
+            for _ in 0..6 {
+                if let Some(parent) = current.parent() {
+                    for dev_sub in [
+                        parent.join("frames-shell/src-tauri/binaries"),
+                        parent.join("src-tauri/binaries"),
+                        parent.join("binaries"),
+                    ] {
+                        for variant in &sidecar_variants {
+                            let candidate = dev_sub.join(variant);
+                            if candidate.is_file() {
+                                return candidate;
+                            }
+                        }
+                    }
+                    current = parent;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Check current working directory ancestors (e.g. running from repo root or frames-shell)
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut current = cwd.as_path();
+        for _ in 0..6 {
+            for dev_sub in [
+                current.join("frames-shell/src-tauri/binaries"),
+                current.join("src-tauri/binaries"),
+                current.join("binaries"),
+            ] {
+                for variant in &sidecar_variants {
+                    let candidate = dev_sub.join(variant);
+                    if candidate.is_file() {
+                        return candidate;
+                    }
+                }
+            }
+            if let Some(parent) = current.parent() {
+                current = parent;
+            } else {
+                break;
             }
         }
     }
 
     #[cfg(target_os = "macos")]
     {
-        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+            let candidate = Path::new(dir).join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        for dir in [
+            r"C:\ffmpeg\bin",
+            r"C:\tools\ffmpeg\bin",
+            r"C:\ProgramData\chocolatey\bin",
+        ] {
             let candidate = Path::new(dir).join(&exe_name);
             if candidate.is_file() {
                 return candidate;
@@ -2032,5 +2158,71 @@ mod tests {
         let small_meta = parse_metadata_from_bytes(&pair.small_webp, "webp");
         assert_eq!(small_meta.width, Some(300));
         assert_eq!(small_meta.height, Some(450));
+    }
+
+    #[test]
+    fn resolve_tool_binary_finds_bundled_ffmpeg_and_ffprobe() {
+        let ffmpeg = resolve_tool_binary("ffmpeg");
+        assert!(
+            ffmpeg.is_file(),
+            "Expected ffmpeg to resolve to an existing file, got: {:?}",
+            ffmpeg
+        );
+
+        let ffprobe = resolve_tool_binary("ffprobe");
+        assert!(
+            ffprobe.is_file(),
+            "Expected ffprobe to resolve to an existing file, got: {:?}",
+            ffprobe
+        );
+    }
+
+    #[test]
+    fn resolve_tool_binary_respects_env_override() {
+        let dummy = std::env::temp_dir().join(format!("dummy-ffmpeg-{}", fastrand::u64(..)));
+        std::fs::write(&dummy, b"dummy binary").unwrap();
+        std::env::set_var("FRAMES_FFMPEG_PATH", &dummy);
+
+        let resolved = resolve_tool_binary("ffmpeg");
+        assert_eq!(resolved, dummy);
+
+        std::env::remove_var("FRAMES_FFMPEG_PATH");
+        let _ = std::fs::remove_file(&dummy);
+    }
+
+    #[test]
+    fn resolve_tool_binary_handles_direct_file_path() {
+        let dummy = std::env::temp_dir().join(format!("direct-tool-{}.bin", fastrand::u64(..)));
+        std::fs::write(&dummy, b"dummy").unwrap();
+
+        let resolved = resolve_tool_binary(dummy.to_str().unwrap());
+        assert_eq!(resolved, dummy);
+
+        let _ = std::fs::remove_file(&dummy);
+    }
+
+    #[test]
+    fn resolve_tool_binary_handles_exe_and_case() {
+        // Test that "ffprobe.exe" does not get truncated to "ffprob"
+        let p1 = resolve_tool_binary("ffprobe.exe");
+        assert!(
+            p1.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .contains("ffprobe"),
+            "Expected ffprobe in resolved filename, got: {:?}",
+            p1
+        );
+
+        // Test that "ffmpeg.EXE" is properly handled
+        let p2 = resolve_tool_binary("ffmpeg.EXE");
+        assert!(
+            p2.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .contains("ffmpeg"),
+            "Expected ffmpeg in resolved filename, got: {:?}",
+            p2
+        );
     }
 }

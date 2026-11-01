@@ -8,6 +8,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "prepare": "svelte-kit sync || echo ''",
+    "prepare:binaries": "node ../scripts/prepare-binaries.js",
+    "bundle:mac": "tauri build --bundles app",
+    "bundle:win": "tauri build --bundles nsis",
+    "bundle": "tauri build",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri"

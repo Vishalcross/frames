@@ -1,5 +1,5 @@
 <script module lang="ts">
-  import { isTauriAvailable } from '$lib/services/tauriRepo';
+  import { isTauriAvailable, tauriRepo } from '$lib/services/tauriRepo';
 
   type ThumbReadyCallback = (assetId: string) => void;
   const thumbReadyListeners = new Set<ThumbReadyCallback>();
@@ -120,12 +120,14 @@
   let isLoaded = $state(false);
   let reloadCounter = $state(0);
   let fallbackDataUrl = $state<string | null>(null);
+  let fallbackAttempted = false;
 
   $effect(() => {
     const _ = asset.id;
     isLoaded = false;
     reloadCounter = 0;
     fallbackDataUrl = null;
+    fallbackAttempted = false;
   });
 
   const currentThumbUrl = $derived(
@@ -133,15 +135,14 @@
   );
 
   async function handleImgError() {
-    if (!fallbackDataUrl) {
-      try {
-        const { tauriRepo } = await import('$lib/services/tauriRepo');
-        const dataUrl = await tauriRepo.getThumbnailDataUrl(asset.id, false);
-        if (dataUrl) {
-          fallbackDataUrl = dataUrl;
-        }
-      } catch {}
-    }
+    if (fallbackAttempted) return;
+    fallbackAttempted = true;
+    try {
+      const dataUrl = await tauriRepo.getThumbnailDataUrl(asset.id, false);
+      if (dataUrl) {
+        fallbackDataUrl = dataUrl;
+      }
+    } catch {}
   }
 
   onMount(() => {

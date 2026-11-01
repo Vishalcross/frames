@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
   import Tile from './Tile.svelte';
   import type { Asset, AssetRepo, Query } from '$lib/types';
   import { tauriRepo } from '$lib/services/tauriRepo';
@@ -31,12 +31,19 @@
   let scrollTop = $state(0);
 
   let totalAssets = $state(0);
-  let assetsMap = $state<Map<number, Asset>>(new Map());
+  let pagesMap = $state<Map<number, Asset[]>>(new Map());
 
   const PAGE_SIZE = 200;
   let loadedPages = new Set<number>();
   let inFlightPages = new Set<number>();
   let activeQueryKey = '';
+
+  export function getAsset(index: number): Asset | undefined {
+    const pageIdx = Math.floor(index / PAGE_SIZE);
+    const page = pagesMap.get(pageIdx);
+    if (!page) return undefined;
+    return page[index % PAGE_SIZE];
+  }
 
   // Date pill state (§4.3)
   let datePillText = $state('October 2026');
@@ -84,7 +91,7 @@
       const currentKey = qKey;
       loadedPages.clear();
       inFlightPages.clear();
-      assetsMap = new Map();
+      pagesMap = new Map();
       totalAssets = 0;
       scrollTop = 0;
       if (containerRef) containerRef.scrollTop = 0;
@@ -117,11 +124,9 @@
           if (activeQueryKey !== reqKey) return;
           loadedPages.add(pageIdx);
           inFlightPages.delete(pageIdx);
-          const newMap = new Map(assetsMap);
-          assets.forEach((a, i) => {
-            newMap.set(offset + i, a);
-          });
-          assetsMap = newMap;
+          const newPages = new Map(pagesMap);
+          newPages.set(pageIdx, assets);
+          pagesMap = newPages;
         }).catch(() => {
           if (activeQueryKey === reqKey) {
             inFlightPages.delete(pageIdx);
@@ -131,11 +136,26 @@
     }
   });
 
+  let resizeObserver: ResizeObserver | null = null;
   onMount(async () => {
     if (!containerRef) return;
     const rect = containerRef.getBoundingClientRect();
     containerWidth = rect.width || 1000;
     containerHeight = rect.height || 800;
+
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          if (entry.contentRect.width > 0) {
+            containerWidth = entry.contentRect.width;
+          }
+          if (entry.contentRect.height > 0) {
+            containerHeight = entry.contentRect.height;
+          }
+        }
+      });
+      resizeObserver.observe(containerRef);
+    }
 
     await tick();
     // Opens scrolled to the newest photo at the bottom (§4.3) unless viewing an album
@@ -144,33 +164,43 @@
     }
   });
 
+  onDestroy(() => {
+    resizeObserver?.disconnect();
+  });
+
   // Handle scroll events: Sticky date pill & center tile focus (§4.3, §7.6)
+  let scrollRafId: number | null = null;
   function handleScroll(e: Event) {
     const target = e.target as HTMLDivElement;
     scrollTop = target.scrollTop;
 
-    // Show date pill and reset fade timer (1.2s fade, §4.3)
-    datePillVisible = true;
-    if (datePillTimer) clearTimeout(datePillTimer);
-    datePillTimer = setTimeout(() => {
-      datePillVisible = false;
-    }, 1200);
+    if (scrollRafId !== null) return;
+    scrollRafId = requestAnimationFrame(() => {
+      scrollRafId = null;
 
-    // Compute month & year of topmost visible row
-    const topRowIndex = Math.floor(scrollTop / rowHeight);
-    const topAssetIndex = Math.min(totalAssets - 1, topRowIndex * cols);
-    const topAsset = assetsMap.get(topAssetIndex);
-    if (topAsset) {
-      const d = new Date(topAsset.takenAt);
-      datePillText = d.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+      // Show date pill and reset fade timer (1.2s fade, §4.3)
+      datePillVisible = true;
+      if (datePillTimer) clearTimeout(datePillTimer);
+      datePillTimer = setTimeout(() => {
+        datePillVisible = false;
+      }, 1200);
 
-      // Adaptive scroll center focus (§7.6 #4)
-      const centerAssetIndex = Math.min(totalAssets - 1, topAssetIndex + Math.floor((cols * visibleRowCount) / 2));
-      const centerAsset = assetsMap.get(centerAssetIndex);
-      if (centerAsset) {
-        focusAsset(centerAsset.id, { source: 'scroll' });
+      // Compute month & year of topmost visible row
+      const topRowIndex = Math.floor(scrollTop / rowHeight);
+      const topAssetIndex = Math.min(totalAssets - 1, topRowIndex * cols);
+      const topAsset = getAsset(topAssetIndex);
+      if (topAsset) {
+        const d = new Date(topAsset.takenAt);
+        datePillText = d.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+
+        // Adaptive scroll center focus (§7.6 #4)
+        const centerAssetIndex = Math.min(totalAssets - 1, topAssetIndex + Math.floor((cols * visibleRowCount) / 2));
+        const centerAsset = getAsset(centerAssetIndex);
+        if (centerAsset) {
+          focusAsset(centerAsset.id, { source: 'scroll' });
+        }
       }
-    }
+    });
   }
 
   // Right-edge scrubber interaction (§4.3)
@@ -200,7 +230,7 @@
 
     scrubberBubbleY = e.clientY - rect.top;
     const approxIndex = Math.floor(progress * (totalAssets - 1));
-    const approxAsset = assetsMap.get(approxIndex);
+    const approxAsset = getAsset(approxIndex);
     if (approxAsset) {
       const d = new Date(approxAsset.takenAt);
       scrubberBubbleText = d.toLocaleString('en-US', { month: 'short', year: 'numeric' });
@@ -218,7 +248,7 @@
       const start = Math.min(lastSelectedIndex, index);
       const end = Math.max(lastSelectedIndex, index);
       for (let i = start; i <= end; i++) {
-        const a = assetsMap.get(i);
+        const a = getAsset(i);
         if (a) newSelection.add(a.id);
       }
     } else if (e.metaKey || e.ctrlKey) {
@@ -283,7 +313,7 @@
       // Select All (§4.5)
       const allSet = new Set<string>();
       for (let i = 0; i < Math.min(totalAssets, 2000); i++) {
-        const a = assetsMap.get(i);
+        const a = getAsset(i);
         if (a) allSet.add(a.id);
       }
       selectedIds = allSet;
@@ -324,17 +354,17 @@
     class="virtual-grid-content"
     style="height: {totalGridHeight}px; width: {containerWidth}px;"
   >
-    {#each Array(Math.max(0, endRow - startRow)) as _, r}
+    {#each Array(Math.max(0, endRow - startRow)) as _, r (startRow + r)}
       {@const rowIndex = startRow + r}
       {@const rowTop = rowIndex * rowHeight}
       <div
         class="virtual-grid-row"
         style="top: {rowTop}px; height: {actualTileSize}px; gap: {gap}px;"
       >
-        {#each Array(cols) as __, c}
+        {#each Array(cols) as __, c (rowIndex * cols + c)}
           {@const itemIndex = rowIndex * cols + c}
           {#if itemIndex < totalAssets}
-            {@const asset = assetsMap.get(itemIndex)}
+            {@const asset = getAsset(itemIndex)}
             {#if asset}
               <Tile
                 {asset}

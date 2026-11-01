@@ -106,14 +106,37 @@ pub fn regenerate_album_palette(
     state: State<'_, AppState>,
     album_id: String,
 ) -> Result<(), String> {
+    static IN_FLIGHT: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+
+    {
+        let mut guard = IN_FLIGHT.lock().unwrap();
+        let set = guard.get_or_insert_with(std::collections::HashSet::new);
+        if !set.insert(album_id.clone()) {
+            return Ok(()); // Already computing in background
+        }
+    }
+
     let app_handle = app.clone();
     let alb_id = album_id.clone();
     let store_arc = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || {
-        if let Ok(store) = store_arc.lock() {
-            if frames_core::album_palette::generate_and_save_album_palette(store.connection(), &alb_id).is_ok() {
-                let _ = app_handle.emit("album-palette-ready", serde_json::json!({ "album_id": alb_id }));
+        let is_ok = {
+            if let Ok(store) = store_arc.lock() {
+                frames_core::album_palette::generate_and_save_album_palette(store.connection(), &alb_id).is_ok()
+            } else {
+                false
             }
+        };
+
+        if let Ok(mut guard) = IN_FLIGHT.lock() {
+            if let Some(set) = guard.as_mut() {
+                set.remove(&alb_id);
+            }
+        }
+
+        if is_ok {
+            let _ = app_handle.emit("album-palette-ready", serde_json::json!({ "album_id": alb_id }));
         }
     });
     Ok(())

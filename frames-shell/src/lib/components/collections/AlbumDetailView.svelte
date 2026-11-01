@@ -100,14 +100,6 @@
   );
 
   $effect(() => {
-    if (album.keyAssetId && isTauriAvailable()) {
-      tauriRepo.getThumbnailDataUrl(album.keyAssetId, true).then((url) => {
-        if (url) heroFallback = url;
-      });
-    }
-  });
-
-  $effect(() => {
     if (album.keyAssetId) {
       focusAsset(album.keyAssetId, {
         source: 'collection'

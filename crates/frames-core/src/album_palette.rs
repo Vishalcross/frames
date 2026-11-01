@@ -111,18 +111,45 @@ pub fn derive_album_palette(palettes: &[Palette], tone: Tone) -> Palette {
 /// Query album assets, sample up to 60, extract/cache their palettes,
 /// generate the automatic album palette and persist it into the auto_* columns.
 pub fn generate_and_save_album_palette(conn: &Connection, album_id: &str) -> rusqlite::Result<Palette> {
-    // 1. Take the album's assets sorted by date.
+    // 1. Take the album's assets sorted by date using indexed UNION
     let mut stmt = conn.prepare(
-        "SELECT a.id FROM assets a
-         WHERE (a.album_id = ?1
-            OR a.id IN (SELECT ai.asset_id FROM album_items ai WHERE ai.album_id = ?1 AND ai.in_album = 1))
-           AND a.trashed_at IS NULL AND a.purged_at IS NULL
-         ORDER BY a.taken_at ASC",
+        "SELECT a.id FROM (
+            SELECT s.id, s.taken_at FROM assets s
+            WHERE s.album_id = ?1 AND s.trashed_at IS NULL AND s.purged_at IS NULL
+            UNION
+            SELECT s.id, s.taken_at FROM album_items ai
+            JOIN assets s ON s.id = ai.asset_id
+            WHERE ai.album_id = ?1 AND ai.in_album = 1 AND s.trashed_at IS NULL AND s.purged_at IS NULL
+         ) a
+         ORDER BY a.taken_at DESC, a.id ASC",
     )?;
     let asset_ids: Vec<String> = stmt
         .query_map([album_id], |r| r.get(0))?
         .filter_map(|r| r.ok())
         .collect();
+
+    if asset_ids.is_empty() {
+        let pal = derive_album_palette(&[], Tone::Dark);
+        let _ = conn.execute(
+            "INSERT INTO album_theme (album_id, auto_bg, auto_sidebar, auto_accent, auto_on_bg, auto_on_sidebar)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(album_id) DO UPDATE SET
+                 auto_bg = excluded.auto_bg,
+                 auto_sidebar = excluded.auto_sidebar,
+                 auto_accent = excluded.auto_accent,
+                 auto_on_bg = excluded.auto_on_bg,
+                 auto_on_sidebar = excluded.auto_on_sidebar",
+            rusqlite::params![
+                album_id,
+                pal.bg,
+                pal.sidebar,
+                pal.accent,
+                pal.on_bg,
+                pal.on_sidebar,
+            ],
+        );
+        return Ok(pal);
+    }
 
     // Pick up to 60, evenly spaced
     let total = asset_ids.len();

@@ -33,6 +33,184 @@ pub fn is_hidden_or_system_file(path_or_name: &str) -> bool {
     false
 }
 
+/// Returns true if a path component is a known system, cache, editor or preset directory name.
+pub fn is_ignored_folder_component(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    // 1. Hidden & system prefixes / exact names
+    if lower.starts_with('.')
+        || lower.starts_with("._")
+        || lower.starts_with('$')
+        || lower == "thumbs.db"
+        || lower == ".ds_store"
+        || lower == "desktop.ini"
+        || lower == "__macosx"
+        || lower == "system volume information"
+        || lower == "$recycle.bin"
+        || lower == "lost+found"
+    {
+        return true;
+    }
+
+    // 2. Photo editors and catalog software directories (case-insensitive substring)
+    let editor_keywords = [
+        "luminar",
+        "skylum",
+        "lightroom",
+        "photoshop",
+        "camera raw",
+        "cameraraw",
+        "capture one",
+        "captureone",
+        "cosession",
+        "darktable",
+        "rawtherapee",
+        "dxo",
+        "photolab",
+        "pureraw",
+        "aperture",
+        "photo booth",
+        "photobooth",
+        "affinity",
+        "topaz",
+        "pixelmator",
+        "photoroom",
+        "gimp",
+        "digikam",
+        "on1",
+        "corel",
+        "paintshop",
+        "nik collection",
+        "final cut",
+        "fcp",
+        "imovie",
+        "davinci",
+        "premiere",
+        "after effects",
+    ];
+    for kw in &editor_keywords {
+        if lower.contains(kw) {
+            return true;
+        }
+    }
+
+    // 3. Apple Photos & photo catalog / library bundles
+    let bundle_extensions = [
+        ".photoslibrary",
+        ".photolibrary",
+        ".migratedphotolibrary",
+        ".aplibrary",
+        ".fcpbundle",
+        ".imovielibrary",
+        ".lrlibrary",
+        ".lrdata",
+        ".lrcat",
+        ".catalog",
+        ".cosessiondb",
+        ".colcat",
+        ".cocatalog",
+        ".pxv",
+    ];
+    for ext in &bundle_extensions {
+        if lower.ends_with(ext) || lower.contains(ext) {
+            return true;
+        }
+    }
+
+    // 4. Token-based matching for tool, preset, template, and cache directories
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let tool_tokens = [
+        "preset",
+        "presets",
+        "template",
+        "templates",
+        "lut",
+        "luts",
+        "brush",
+        "brushes",
+        "plugin",
+        "plugins",
+        "extension",
+        "extensions",
+        "overlay",
+        "overlays",
+        "watermark",
+        "watermarks",
+        "gradient",
+        "gradients",
+        "swatch",
+        "swatches",
+    ];
+    for t in &tokens {
+        if tool_tokens.contains(t) {
+            return true;
+        }
+    }
+
+    // Exact standalone tool folder names
+    if lower == "actions" || lower == "looks" || lower == "styles" || lower == "textures" || lower == "patterns" {
+        return true;
+    }
+
+    // 5. Cache, previews, thumbnails, logs, crash reports, app data, node_modules
+    let cache_tokens = [
+        "cache",
+        "caches",
+        "thumbnail",
+        "thumbnails",
+        "thumbs",
+        "preview",
+        "previews",
+        "temp",
+        "tmp",
+        "crashreport",
+        "crashreports",
+        "appdata",
+        "node_modules",
+    ];
+    for t in &tokens {
+        if cache_tokens.contains(t) {
+            return true;
+        }
+    }
+
+    let cache_phrases = [
+        "smart previews",
+        "catalog backups",
+        "application support",
+        "crash reports",
+    ];
+    for phrase in &cache_phrases {
+        if lower.contains(phrase) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns true if any component in the path matches an ignored directory or system name.
+pub fn is_ignored_album_folder(path_or_name: &str) -> bool {
+    let normalized = path_or_name.replace('\\', "/");
+    for part in normalized.split('/') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_ignored_folder_component(trimmed) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn normalize_relpath(relpath: &str) -> String {
     let forward = relpath.replace('\\', "/");
     let trimmed = forward.trim_matches('/');
@@ -111,12 +289,39 @@ pub fn upsert_local_asset(
 
 /// Scans a single matched album directory and upserts rows for all supported media files.
 pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, device_id: &str) -> Result<usize> {
+    scan_album_folder_with_depth(conn, album_id, folder, device_id, None)
+}
+
+/// Scans a single matched album directory with an optional maximum traversal depth.
+/// When scanning a root folder directly, `max_depth = Some(1)` ensures files directly in the root
+/// are indexed without recursing into subdirectories that are separate albums.
+pub fn scan_album_folder_with_depth(
+    conn: &Connection,
+    album_id: &str,
+    folder: &Path,
+    device_id: &str,
+    max_depth: Option<usize>,
+) -> Result<usize> {
     if !folder.is_dir() {
         return Ok(0);
     }
 
     let mut count = 0;
-    for entry in WalkDir::new(folder).follow_links(true) {
+    let mut builder = WalkDir::new(folder).follow_links(false);
+    if let Some(md) = max_depth {
+        builder = builder.max_depth(md);
+    }
+
+    for entry in builder
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !is_ignored_folder_component(&name)
+        })
+    {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -128,7 +333,7 @@ pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, devic
 
         let path = entry.path();
         let filename = entry.file_name().to_string_lossy().to_string();
-        if is_hidden_or_system_file(&filename) {
+        if is_hidden_or_system_file(&filename) || is_ignored_folder_component(&filename) {
             continue;
         }
 
@@ -146,7 +351,7 @@ pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, devic
             .unwrap_or(path)
             .to_string_lossy();
         let relative = normalize_relpath(&relative_raw);
-        if is_hidden_or_system_file(&relative) {
+        if is_hidden_or_system_file(&relative) || is_ignored_album_folder(&relative) {
             continue;
         }
 
@@ -191,6 +396,7 @@ pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, devic
 
 /// Scans all local roots configured in the store against matched albums.
 pub fn scan_all_local_roots(store: &Store) -> Result<usize> {
+    let _ = store.cleanup_ignored_albums();
     let mut roots = store.get_local_roots()?;
     if roots.is_empty() {
         if let Some(pic_dir) = dirs::picture_dir() {
@@ -203,9 +409,24 @@ pub fn scan_all_local_roots(store: &Store) -> Result<usize> {
     let device_id = store.device_id().unwrap_or_else(|_| "local".to_string());
     let mut total = 0;
 
+    let roots_canonical: Vec<std::path::PathBuf> = roots
+        .iter()
+        .map(|r| Path::new(r).canonicalize().unwrap_or_else(|_| std::path::PathBuf::from(r)))
+        .collect();
+
     for m in matches {
+        if is_ignored_album_folder(&m.album_name) || is_ignored_album_folder(&m.folder_path) {
+            continue;
+        }
         let folder = Path::new(&m.folder_path);
-        let n = scan_album_folder(store.connection(), &m.album_id, folder, &device_id)?;
+        let folder_canon = folder.canonicalize().unwrap_or_else(|_| folder.to_path_buf());
+        let is_root_dir = roots_canonical.contains(&folder_canon);
+
+        let n = if is_root_dir {
+            scan_album_folder_with_depth(store.connection(), &m.album_id, folder, &device_id, Some(1))?
+        } else {
+            scan_album_folder(store.connection(), &m.album_id, folder, &device_id)?
+        };
         total += n;
     }
 
@@ -340,6 +561,42 @@ mod tests {
         assert!(is_hidden_or_system_file("sub/._hidden.jpg"));
         assert!(is_hidden_or_system_file(".hidden_dir/photo.jpg"));
         assert!(!is_hidden_or_system_file("sub/normal.jpg"));
+
+        // Verify editor presets, templates, caches, and system albums are ignored
+        assert!(is_ignored_album_folder("Luminar Neo"));
+        assert!(is_ignored_album_folder("Luminar Neo Catalog"));
+        assert!(is_ignored_album_folder("Lightroom"));
+        assert!(is_ignored_album_folder("Lightroom Catalog"));
+        assert!(is_ignored_album_folder("Presets"));
+        assert!(is_ignored_album_folder("Develop Presets"));
+        assert!(is_ignored_album_folder("Templates"));
+        assert!(is_ignored_album_folder("Photo Booth Library"));
+        assert!(is_ignored_album_folder("Photos Library.photoslibrary"));
+        assert!(is_ignored_album_folder("Cache"));
+        assert!(is_ignored_album_folder("Previews.lrdata"));
+        assert!(is_ignored_album_folder("Capture One"));
+        assert!(is_ignored_album_folder("sub/Presets/img.jpg"));
+        assert!(is_ignored_album_folder("root/Cache/thumb.png"));
+        assert!(is_ignored_album_folder("Topaz Photo AI"));
+        assert!(is_ignored_album_folder("Affinity Photo"));
+        assert!(is_ignored_album_folder("Pixelmator Pro"));
+        assert!(is_ignored_album_folder("3D LUTs"));
+        assert!(is_ignored_album_folder("My_Presets_2024"));
+        assert!(is_ignored_album_folder("Develop Preset"));
+        assert!(is_ignored_album_folder("Custom Brushes"));
+        assert!(is_ignored_album_folder("Actions"));
+        assert!(is_ignored_album_folder("Lightroom/Export Presets"));
+        assert!(is_ignored_album_folder("$Recycle.Bin"));
+        assert!(is_ignored_album_folder(".Trash"));
+
+        // Verify genuine user photo folders are NOT ignored
+        assert!(!is_ignored_album_folder("Summer Vacation 2024"));
+        assert!(!is_ignored_album_folder("Family Christmas"));
+        assert!(!is_ignored_album_folder("Japan Trip"));
+        assert!(!is_ignored_album_folder("Portraits"));
+        assert!(!is_ignored_album_folder("Action Shots"));
+        assert!(!is_ignored_album_folder("Street Style"));
+        assert!(!is_ignored_album_folder("Overlook Point"));
     }
 }
 

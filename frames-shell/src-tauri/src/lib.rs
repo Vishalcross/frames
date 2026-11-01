@@ -870,6 +870,54 @@ fn resolve_local_media_path(state: &AppState, id: &str) -> Option<PathBuf> {
     None
 }
 
+/// RAII concurrency limiter for bounded background image/video decode threads.
+struct ConcurrencyLimiter {
+    permits: std::sync::Mutex<usize>,
+    cvar: std::sync::Condvar,
+    max: usize,
+}
+
+impl ConcurrencyLimiter {
+    pub const fn new(max: usize) -> Self {
+        Self {
+            permits: std::sync::Mutex::new(0),
+            cvar: std::sync::Condvar::new(),
+            max,
+        }
+    }
+
+    pub fn acquire_timeout(&self, timeout: std::time::Duration) -> Option<Permit<'_>> {
+        let start = std::time::Instant::now();
+        let mut count = self.permits.lock().unwrap();
+        while *count >= self.max {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return None;
+            }
+            let remaining = timeout - elapsed;
+            let (next_count, timeout_result) = self.cvar.wait_timeout(count, remaining).unwrap();
+            count = next_count;
+            if timeout_result.timed_out() && *count >= self.max {
+                return None;
+            }
+        }
+        *count += 1;
+        Some(Permit { limiter: self })
+    }
+}
+
+struct Permit<'a> {
+    limiter: &'a ConcurrencyLimiter,
+}
+
+impl<'a> Drop for Permit<'a> {
+    fn drop(&mut self) {
+        let mut count = self.limiter.permits.lock().unwrap();
+        *count -= 1;
+        self.limiter.cvar.notify_one();
+    }
+}
+
 /// Serve a thumbnail or preview response for an asset with local-first priority.
 fn serve_thumbnail_response(
     state: &AppState,
@@ -922,39 +970,56 @@ fn serve_thumbnail_response(
         }
     }
 
-    // 3. Resolve from local disk and generate on the fly
+    // 3. Resolve from local disk and generate on the fly with concurrency guard
+    static DECODE_LIMITER: ConcurrencyLimiter = ConcurrencyLimiter::new(3);
+
     if let Some(src) = resolve_local_media_path(state, id) {
-        let kind = {
-            let store = state.store.lock().ok();
-            store.and_then(|s| {
-                s.connection()
-                    .query_row("SELECT kind FROM assets WHERE id = ?1", [id], |r| r.get::<_, String>(0))
-                    .ok()
-            }).unwrap_or_else(|| "photo".to_string())
-        };
+        state.thumb_worker.prioritize(vec![id.to_string()]);
 
-        let gen_res = if kind == "video" {
-            frames_core::thumbs::generate_video_thumb(&src, id, size)
-        } else {
-            frames_core::thumbs::generate_image_thumb(&src, id, size)
-        };
-
-        if let Ok(p) = gen_res {
-            if let Ok(store) = state.store.lock() {
-                frames_core::thumbs::update_thumb_state(store.connection(), id, "ready");
-                if size == frames_core::thumbs::ThumbSize::Small {
-                    let _ = frames_core::palette::compute_and_store_palette(store.connection(), id);
+        if let Some(_permit) = DECODE_LIMITER.acquire_timeout(std::time::Duration::from_secs(8)) {
+            // Re-check disk thumbnail cache: another thread or background worker may have generated it while waiting!
+            if thumb_file.is_file() {
+                if let Ok(bytes) = fs::read(&thumb_file) {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "image/webp")
+                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                        .body(if empty_body { Vec::new() } else { bytes })
+                        .unwrap();
                 }
             }
-            if let Ok(bytes) = fs::read(&p) {
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/webp")
-                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                    .body(if empty_body { Vec::new() } else { bytes })
-                    .unwrap();
+
+            let kind = {
+                let store = state.store.lock().ok();
+                store.and_then(|s| {
+                    s.connection()
+                        .query_row("SELECT kind FROM assets WHERE id = ?1", [id], |r| r.get::<_, String>(0))
+                        .ok()
+                }).unwrap_or_else(|| "photo".to_string())
+            };
+
+            let gen_res = if kind == "video" {
+                frames_core::thumbs::generate_video_thumb(&src, id, size)
+            } else {
+                frames_core::thumbs::generate_image_thumb(&src, id, size)
+            };
+
+            if let Ok(p) = gen_res {
+                if let Ok(store) = state.store.lock() {
+                    frames_core::thumbs::update_thumb_state(store.connection(), id, "ready");
+                }
+                if let Ok(bytes) = fs::read(&p) {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "image/webp")
+                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                        .body(if empty_body { Vec::new() } else { bytes })
+                        .unwrap();
+                }
             }
         }
     }

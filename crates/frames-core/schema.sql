@@ -51,6 +51,12 @@ CREATE INDEX assets_trash ON assets (trashed_at)
   WHERE trashed_at IS NOT NULL AND purged_at IS NULL;
 -- Unique asset per album and relative path.
 CREATE UNIQUE INDEX IF NOT EXISTS assets_album_relpath ON assets (album_id, relative_path);
+-- Fast indexed album querying sorted by date.
+CREATE INDEX IF NOT EXISTS assets_album_id ON assets (album_id, taken_at DESC, id ASC)
+  WHERE trashed_at IS NULL AND purged_at IS NULL;
+-- Fast timeline sorted query index.
+CREATE INDEX IF NOT EXISTS assets_taken_desc ON assets (taken_at DESC, id ASC)
+  WHERE trashed_at IS NULL AND purged_at IS NULL;
 
 CREATE TABLE albums (
   id          TEXT PRIMARY KEY,                   -- UUID
@@ -69,6 +75,7 @@ CREATE TABLE album_items (
   PRIMARY KEY (album_id, asset_id)
 ) WITHOUT ROWID;
 CREATE INDEX album_items_asset ON album_items (asset_id);
+CREATE INDEX IF NOT EXISTS album_items_album_in ON album_items (album_id, in_album, asset_id);
 
 -- Search over filename, camera make/model, file type words and album names.
 CREATE VIRTUAL TABLE search_fts USING fts5(

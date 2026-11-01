@@ -333,13 +333,12 @@ export class TauriAssetRepo implements AssetRepo {
       if (isTauriAvailable()) {
         return await this.getAlbumAssets(q.albumId, from, n);
       }
+      return [];
     }
 
     let list: Asset[] = this.cachedAssets;
 
-    if (q.scope === 'album' && q.albumId) {
-      list = await this.getAlbumAssets(q.albumId);
-    } else if (q.search && q.search.trim()) {
+    if (q.search && q.search.trim()) {
       try {
         const found = await invoke<BackendAssetSummary[]>('search_assets', {
           filter: {

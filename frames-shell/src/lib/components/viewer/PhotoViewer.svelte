@@ -71,7 +71,9 @@
       // Focus asset in viewer with top priority (§7.6 #1)
       focusAsset(asset.id, { source: 'viewer', swatches: asset.palette || undefined, lum: asset.lum || undefined });
       handleViewedPhotoChange(asset.id, albumId);
-      // Reset zoom
+      // Reset zoom and error fallback states
+      previewError = false;
+      fallbackPreviewUrl = null;
       zoomScale = 1.0;
       panOffset = { x: 0, y: 0 };
       rotationDeg = 0;

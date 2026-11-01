@@ -1291,6 +1291,25 @@ fn upload_and_log_one_asset(
         None,
     )?;
 
+    // Link local_path and album info so local rendering never hits web
+    let _ = store.connection().execute(
+        "UPDATE assets SET
+            local_path = ?1,
+            album_id = coalesce(album_id, ?2),
+            relative_path = coalesce(relative_path, ?3),
+            thumb_state = 'ready'
+         WHERE id = ?4",
+        rusqlite::params![path_str, album_id, item.record.filename, item.record.id],
+    );
+
+    let small_path = crate::thumbs::thumb_path(&item.record.id, crate::thumbs::ThumbSize::Small);
+    if let Some(p) = small_path.parent() { let _ = std::fs::create_dir_all(p); }
+    let _ = std::fs::write(&small_path, &thumbs.small_webp);
+
+    let large_path = crate::thumbs::thumb_path(&item.record.id, crate::thumbs::ThumbSize::Large);
+    if let Some(p) = large_path.parent() { let _ = std::fs::create_dir_all(p); }
+    let _ = std::fs::write(&large_path, &thumbs.preview_webp);
+
     Ok(())
 }
 
@@ -1426,7 +1445,26 @@ where
             1,
             None,
         )?;
+
+        // Link local_path and album info so local rendering never hits web
+        let _ = st.connection().execute(
+            "UPDATE assets SET
+                local_path = ?1,
+                album_id = coalesce(album_id, ?2),
+                relative_path = coalesce(relative_path, ?3),
+                thumb_state = 'ready'
+             WHERE id = ?4",
+            rusqlite::params![path_str, album_id, item.record.filename, item.record.id],
+        );
     }
+
+    let small_path = crate::thumbs::thumb_path(&item.record.id, crate::thumbs::ThumbSize::Small);
+    if let Some(p) = small_path.parent() { let _ = std::fs::create_dir_all(p); }
+    let _ = std::fs::write(&small_path, &thumbs.small_webp);
+
+    let large_path = crate::thumbs::thumb_path(&item.record.id, crate::thumbs::ThumbSize::Large);
+    if let Some(p) = large_path.parent() { let _ = std::fs::create_dir_all(p); }
+    let _ = std::fs::write(&large_path, &thumbs.preview_webp);
 
     Ok(())
 }
@@ -1505,6 +1543,21 @@ pub fn export_originals(
 pub fn sync_remote_album_listings<F>(
     store: &Store,
     s4: &dyn ObjectStore,
+    on_album_synced: F,
+) -> Result<usize>
+where
+    F: FnMut(&str),
+{
+    let objects = match s4.list_objects("albums/") {
+        Ok(objs) => objs,
+        Err(e) => return Err(SyncError::S4(e)),
+    };
+    apply_remote_album_objects(store, objects, on_album_synced)
+}
+
+pub fn apply_remote_album_objects<F>(
+    store: &Store,
+    objects: Vec<crate::s4::ObjectMeta>,
     mut on_album_synced: F,
 ) -> Result<usize>
 where
@@ -1514,11 +1567,6 @@ where
     let now = Utc::now();
     let now_str = crate::store::format_utc(now);
     let stamp = format!("{now_str}|{device_id}");
-
-    let objects = match s4.list_objects("albums/") {
-        Ok(objs) => objs,
-        Err(e) => return Err(SyncError::S4(e)),
-    };
 
     let conn = store.connection();
     let mut album_name_to_id: HashMap<String, String> = HashMap::new();

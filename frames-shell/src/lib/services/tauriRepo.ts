@@ -143,14 +143,16 @@ export function isTauriAvailable(): boolean {
 }
 
 /**
- * Canonical custom protocol URL for an asset (§2: frames://localhost/{kind}/{id})
+ * Canonical custom protocol URL for an asset (§2: frames://localhost/{kind}/{id} or http://frames.localhost/{kind}/{id} on Windows)
  */
 export function getAssetUrl(
   kind: 'thumb' | 'preview' | 'original',
   id: string
 ): string {
   if (!id) return '';
-  return `frames://localhost/${kind}/${encodeURIComponent(id)}`;
+  const isWindows = typeof navigator !== 'undefined' ? navigator.userAgent.includes('Windows') : false;
+  const base = isWindows ? 'http://frames.localhost' : 'frames://localhost';
+  return `${base}/${kind}/${encodeURIComponent(id)}`;
 }
 
 export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
@@ -638,6 +640,67 @@ export class TauriAssetRepo implements AssetRepo {
   async clearImportQueue(all = false): Promise<BackendImportStatusView> {
     if (!isTauriAvailable()) return this.getImportStatus();
     return await invoke<BackendImportStatusView>('clear_import_queue', { all });
+  }
+
+  // Local Library Roots & Background Scan (§1.2, §1.3)
+  async getLocalRoots(): Promise<string[]> {
+    if (!isTauriAvailable()) return [];
+    try {
+      return await invoke<string[]>('get_local_roots');
+    } catch (e) {
+      console.error('Failed to get local roots:', e);
+      return [];
+    }
+  }
+
+  async setLocalRoots(paths: string[]): Promise<void> {
+    if (!isTauriAvailable()) return;
+    try {
+      await invoke('set_local_roots', { paths });
+      await this.loadBootstrap();
+    } catch (e) {
+      console.error('Failed to set local roots:', e);
+    }
+  }
+
+  async scanLocalLibrary(): Promise<number> {
+    if (!isTauriAvailable()) return 0;
+    try {
+      const count = await invoke<number>('scan_local_library');
+      await this.loadBootstrap();
+      return count;
+    } catch (e) {
+      console.error('Failed to scan local library:', e);
+      return 0;
+    }
+  }
+
+  async queueUpload(assetId: string): Promise<string> {
+    if (!isTauriAvailable()) return '';
+    try {
+      return await invoke<string>('queue_upload', { assetId });
+    } catch (e) {
+      console.error('Failed to queue upload:', e);
+      return '';
+    }
+  }
+
+  async getWorkerStatus(): Promise<{ uploading_count: number; thumb_generating_count: number }> {
+    if (!isTauriAvailable()) return { uploading_count: 0, thumb_generating_count: 0 };
+    try {
+      return await invoke<{ uploading_count: number; thumb_generating_count: number }>('get_worker_status');
+    } catch (e) {
+      return { uploading_count: 0, thumb_generating_count: 0 };
+    }
+  }
+
+  async prioritize(assetIds: string[]): Promise<void> {
+    if (!isTauriAvailable()) return;
+    try {
+      await invoke('prioritize', { assetIds });
+    } catch (e) {
+      console.warn('Failed to prioritize assets:', e);
+    }
   }
 }
 

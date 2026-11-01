@@ -6,8 +6,9 @@ use walkdir::WalkDir;
 use crate::store::{Result, Store};
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "heic", "webp", "gif", "tif", "tiff",
-    "mp4", "mov", "m4v",
+    "jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tif", "tiff",
+    "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "raw",
+    "mp4", "mov", "m4v", "avi", "mts", "m2ts", "mkv", "3gp", "wmv", "webm",
 ];
 
 pub fn is_supported_media_extension(ext: &str) -> bool {
@@ -40,7 +41,7 @@ pub fn normalize_relpath(relpath: &str) -> String {
 
 pub fn classify_kind(ext: &str) -> &'static str {
     match ext.to_lowercase().as_str() {
-        "mp4" | "mov" | "m4v" => "video",
+        "mp4" | "mov" | "m4v" | "avi" | "mts" | "m2ts" | "mkv" | "3gp" | "wmv" | "webm" => "video",
         _ => "photo",
     }
 }
@@ -166,7 +167,7 @@ pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, devic
             .to_string_lossy()
             .to_string();
 
-        upsert_local_asset(
+        let asset_id = upsert_local_asset(
             conn,
             album_id,
             &relative,
@@ -176,6 +177,12 @@ pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, devic
             mtime,
             device_id,
         )?;
+
+        if crate::thumbs::thumb_exists(&asset_id, crate::thumbs::ThumbSize::Small) {
+            crate::thumbs::update_thumb_state(conn, &asset_id, "ready");
+        }
+
+        let _ = crate::upload_worker::enqueue_asset_upload(conn, &asset_id);
         count += 1;
     }
 
@@ -184,7 +191,15 @@ pub fn scan_album_folder(conn: &Connection, album_id: &str, folder: &Path, devic
 
 /// Scans all local roots configured in the store against matched albums.
 pub fn scan_all_local_roots(store: &Store) -> Result<usize> {
-    let matches = store.match_local_albums()?;
+    let mut roots = store.get_local_roots()?;
+    if roots.is_empty() {
+        if let Some(pic_dir) = dirs::picture_dir() {
+            if pic_dir.exists() {
+                roots.push(pic_dir.to_string_lossy().to_string());
+            }
+        }
+    }
+    let matches = store.discover_and_match_local_albums_for_roots(&roots)?;
     let device_id = store.device_id().unwrap_or_else(|_| "local".to_string());
     let mut total = 0;
 

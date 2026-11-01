@@ -30,6 +30,20 @@ pub fn enqueue_asset_upload(conn: &Connection, asset_id: &str) -> rusqlite::Resu
         return Ok(id);
     }
 
+    let remote_key: Option<Option<String>> = conn
+        .query_row(
+            "SELECT remote_key FROM assets WHERE id = ?1",
+            params![asset_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    if let Some(Some(rk)) = remote_key {
+        if !rk.is_empty() {
+            return Ok(format!("already-uploaded:{asset_id}"));
+        }
+    }
+
     let job_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
@@ -291,6 +305,18 @@ pub fn perform_upload(
 
     s4.put_object_from_file(&remote_key, path, mime)
         .map_err(|e| e.to_string())?;
+
+    let small_thumb = crate::thumbs::thumb_path(asset_id, crate::thumbs::ThumbSize::Small);
+    if small_thumb.is_file() {
+        let s_key = crate::keys::thumb_small_key(asset_id);
+        let _ = s4.put_object_from_file(&s_key, &small_thumb, "image/webp");
+    }
+
+    let large_thumb = crate::thumbs::thumb_path(asset_id, crate::thumbs::ThumbSize::Large);
+    if large_thumb.is_file() {
+        let m_key = crate::keys::thumb_preview_key(asset_id);
+        let _ = s4.put_object_from_file(&m_key, &large_thumb, "image/webp");
+    }
 
     Ok(remote_key)
 }

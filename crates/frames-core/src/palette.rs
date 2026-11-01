@@ -204,7 +204,7 @@ pub fn extract_palette(thumb: &Path, tone: Tone) -> Palette {
 
     // 1. Open the 256 px thumbnail and shrink it to 64x64.
     let rgba = img.to_rgba8();
-    let resized = image::imageops::resize(&rgba, 64, 64, image::imageops::FilterType::Triangle);
+    let resized = image::imageops::resize(&rgba, 64, 64, image::imageops::FilterType::Nearest);
 
     // 2. Reduce each pixel to 4 bits per channel (r>>4, g>>4, b>>4).
     // Count pixels per bucket and keep the average real colour of each bucket. Skip alpha < 128.

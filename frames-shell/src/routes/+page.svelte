@@ -406,6 +406,20 @@
     ];
   }
 
+  async function handleScanLocal() {
+    toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Scanning local picture folders…' }];
+    try {
+      const count = await tauriRepo.scanLocalLibrary();
+      await loadLibraryData();
+      toasts = [
+        ...toasts,
+        { id: Date.now().toString(), type: 'info', text: `Scan complete: found ${count} local photos and videos` }
+      ];
+    } catch (e: any) {
+      toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: `Scan error: ${e?.message || e}` }];
+    }
+  }
+
   // Global Keyboard Shortcuts (§12)
   function handleGlobalKeyDown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.altKey && e.key.toLowerCase() === 's') {
@@ -514,16 +528,26 @@
             <MonthsView year={selectedYear} ondrillmonth={handleDrillMonth} />
           {:else}
             <!-- All Continuous Virtualized Grid (§4.3, §4.4) -->
-            {#key gridKey}
-              <VirtualGrid
-                repo={activeRepo}
-                query={currentQuery}
-                bind:zoomLevelIndex
-                bind:isFill
-                bind:selectedIds
-                onopenphoto={openPhoto}
+            {#if activeRepo.getAssets().length === 0}
+              <EmptyLibraryView
+                {isTauri}
+                onimport={handlePickFolderAndImport}
+                onsync={handleSyncNow}
+                onseed={handleSeedDemo}
+                onscan={handleScanLocal}
               />
-            {/key}
+            {:else}
+              {#key gridKey}
+                <VirtualGrid
+                  repo={activeRepo}
+                  query={currentQuery}
+                  bind:zoomLevelIndex
+                  bind:isFill
+                  bind:selectedIds
+                  onopenphoto={openPhoto}
+                />
+              {/key}
+            {/if}
           {/if}
         {:else if currentRoute === 'collections'}
           <!-- Collections Landing Rails (§4.9) -->

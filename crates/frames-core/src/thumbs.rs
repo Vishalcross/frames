@@ -90,7 +90,14 @@ pub fn generate_image_thumb_with_conn(
             .unwrap_or("")
             .to_lowercase();
 
-        let img = if ext == "heic" || ext == "heif" {
+        let img = if crate::media::is_raw_extension(&ext) || ext == "raw" {
+            let raw_bytes = fs::read(src).map_err(|e| e.to_string())?;
+            if let Some(jpeg) = crate::media::extract_embedded_jpeg(&raw_bytes) {
+                image::load_from_memory(jpeg).map_err(|e| e.to_string())?
+            } else {
+                image::open(src).or_else(|_| decode_heic_or_fallback_via_ffmpeg(src))?
+            }
+        } else if ext == "heic" || ext == "heif" {
             image::open(src).or_else(|_| decode_heic_or_fallback_via_ffmpeg(src))?
         } else {
             image::open(src).or_else(|_| decode_heic_or_fallback_via_ffmpeg(src))?
@@ -298,6 +305,53 @@ mod tests {
                 let _ = fs::remove_file(&out_path);
             }
         }
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn generate_image_thumb_extracts_embedded_raw_jpeg() {
+        let temp_dir = std::env::temp_dir().join(format!("frames_raw_test_{}", fastrand::u64(..)));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let raw_src = temp_dir.join("sample_raw.dng");
+
+        // Create a valid 20x20 JPEG image in memory
+        let img = image::RgbImage::new(20, 20);
+        let mut jpeg_bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg_bytes).encode(
+            img.as_raw(),
+            20,
+            20,
+            image::ExtendedColorType::Rgb8,
+        ).unwrap();
+
+        // Synthesize a minimal DNG with 0x0201 JPEGInterchangeFormat pointing to jpeg_bytes
+        let mut dng = Vec::new();
+        dng.extend_from_slice(b"MM\x00\x2a\x00\x00\x00\x08"); // Big-endian TIFF IFD0 at offset 8
+        dng.extend_from_slice(&2u16.to_be_bytes()); // 2 IFD entries
+        let jpg_offset = (8 + 2 + 2 * 12 + 4) as u32;
+
+        // Entry 1: 0x0201 JPEGInterchangeFormat
+        dng.extend_from_slice(&0x0201u16.to_be_bytes());
+        dng.extend_from_slice(&4u16.to_be_bytes()); // LONG
+        dng.extend_from_slice(&1u32.to_be_bytes()); // count 1
+        dng.extend_from_slice(&jpg_offset.to_be_bytes());
+        // Entry 2: 0x0202 JPEGInterchangeFormatLength
+        dng.extend_from_slice(&0x0202u16.to_be_bytes());
+        dng.extend_from_slice(&4u16.to_be_bytes()); // LONG
+        dng.extend_from_slice(&1u32.to_be_bytes()); // count 1
+        dng.extend_from_slice(&(jpeg_bytes.len() as u32).to_be_bytes());
+        dng.extend_from_slice(&0u32.to_be_bytes()); // next IFD = 0
+        dng.extend_from_slice(&jpeg_bytes);
+
+        fs::write(&raw_src, &dng).unwrap();
+
+        let asset_id = format!("test-raw-{}", fastrand::u64(..));
+        let out_path = generate_image_thumb(&raw_src, &asset_id, ThumbSize::Small).unwrap();
+        assert!(out_path.exists());
+        assert!(thumb_exists(&asset_id, ThumbSize::Small));
+
+        let _ = fs::remove_file(&raw_src);
+        let _ = fs::remove_file(&out_path);
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

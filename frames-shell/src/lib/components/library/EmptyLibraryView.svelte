@@ -6,12 +6,14 @@
     isTauri = true,
     onimport,
     onsync,
-    onseed
+    onseed,
+    onscan
   }: {
     isTauri?: boolean;
     onimport?: () => void;
     onsync?: () => void;
     onseed?: () => void;
+    onscan?: () => void;
   } = $props();
 </script>
 
@@ -23,10 +25,17 @@
 
     <h2 class="empty-title">No Photos or Videos</h2>
     <p class="empty-desc">
-      Connected to Rust SQLite Core. Sync your MEGA S4 cloud album, import local folders, or drop photos and videos directly into the app.
+      Connected to Rust SQLite Core. Sync your MEGA S4 cloud album, scan local folders, or drop photos and videos directly into the app.
     </p>
 
     <div class="actions-row">
+      {#if onscan}
+        <Button variant="standard" onclick={onscan}>
+          <Icon name="folder" size={15} />
+          <span>Scan Local Folders</span>
+        </Button>
+      {/if}
+
       {#if onsync}
         <Button variant="accent" onclick={onsync}>
           <Icon name="cloud" size={15} />

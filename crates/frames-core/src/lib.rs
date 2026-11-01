@@ -23,6 +23,8 @@ pub mod thumbs;
 pub mod thumb_worker;
 pub mod upload_worker;
 
+pub use rusqlite;
+pub use walkdir;
 pub use store::{AlbumDebugInfo, MatchedAlbumFolder};
 pub use s4::{RemoteAsset, RemoteFetcher};
 pub use upload_worker::UploadWorker;

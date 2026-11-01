@@ -523,6 +523,23 @@ impl Store {
         let mut matches = Vec::new();
         for root in roots {
             let root_path = std::path::Path::new(root);
+            if !root_path.exists() {
+                continue;
+            }
+
+            // Check if root folder itself matches an album name
+            if let Some(root_name) = root_path.file_name().and_then(|n| n.to_str()) {
+                for (album_id, album_name) in &albums {
+                    if album_name.eq_ignore_ascii_case(root_name) {
+                        matches.push(MatchedAlbumFolder {
+                            album_id: album_id.clone(),
+                            album_name: album_name.clone(),
+                            folder_path: root.clone(),
+                        });
+                    }
+                }
+            }
+
             if let Ok(entries) = std::fs::read_dir(root_path) {
                 for entry in entries.flatten() {
                     if let Ok(ft) = entry.file_type() {
@@ -539,6 +556,127 @@ impl Store {
                             }
                         }
                     }
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    /// Discovers and matches album folders in roots. Matches existing albums by name,
+    /// and automatically creates albums for unmatched subfolders that contain supported media files.
+    pub fn discover_and_match_local_albums_for_roots(&self, roots: &[String]) -> Result<Vec<MatchedAlbumFolder>> {
+        let mut matches = self.match_local_albums_for_roots(roots)?;
+        let matched_paths: std::collections::HashSet<String> = matches.iter().map(|m| m.folder_path.clone()).collect();
+        let now_str = chrono::Utc::now().to_rfc3339();
+
+        for root in roots {
+            let root_path = std::path::Path::new(root);
+            if !root_path.exists() {
+                continue;
+            }
+
+            // 1. Inspect direct subfolders
+            if let Ok(entries) = std::fs::read_dir(root_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let path_str = path.to_string_lossy().to_string();
+                    if matched_paths.contains(&path_str) {
+                        continue;
+                    }
+
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_dir() {
+                            let folder_name = entry.file_name().to_string_lossy().to_string();
+                            if crate::scan_local::is_hidden_or_system_file(&folder_name) {
+                                continue;
+                            }
+
+                            // Check if this subfolder has any supported media files
+                            let has_media = walkdir::WalkDir::new(&path)
+                                .max_depth(3)
+                                .into_iter()
+                                .filter_map(|e| e.ok())
+                                .any(|e| {
+                                    e.file_type().is_file()
+                                        && e.path().extension()
+                                            .and_then(|ext| ext.to_str())
+                                            .map(crate::scan_local::is_supported_media_extension)
+                                            .unwrap_or(false)
+                                });
+
+                            if has_media {
+                                let existing_id: Option<String> = self.conn.query_row(
+                                    "SELECT id FROM albums WHERE name = ?1 AND deleted_at IS NULL",
+                                    [&folder_name],
+                                    |r| r.get(0),
+                                ).optional()?;
+
+                                let album_id = match existing_id {
+                                    Some(id) => id,
+                                    None => {
+                                        let new_album_id = uuid::Uuid::new_v4().to_string();
+                                        self.conn.execute(
+                                            "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, ?2, ?3, ?4)",
+                                            params![new_album_id, folder_name, now_str, now_str],
+                                        )?;
+                                        new_album_id
+                                    }
+                                };
+                                matches.push(MatchedAlbumFolder {
+                                    album_id,
+                                    album_name: folder_name,
+                                    folder_path: path_str,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Check if the root folder itself contains media files directly
+            let root_str = root_path.to_string_lossy().to_string();
+            if !matched_paths.contains(&root_str) {
+                let root_has_media = walkdir::WalkDir::new(root_path)
+                    .max_depth(2)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .any(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension()
+                                .and_then(|ext| ext.to_str())
+                                .map(crate::scan_local::is_supported_media_extension)
+                                .unwrap_or(false)
+                    });
+
+                if root_has_media {
+                    let folder_name = root_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Local Photos".to_string());
+
+                    let existing_id: Option<String> = self.conn.query_row(
+                        "SELECT id FROM albums WHERE name = ?1 AND deleted_at IS NULL",
+                        [&folder_name],
+                        |r| r.get(0),
+                    ).optional()?;
+
+                    let album_id = match existing_id {
+                        Some(id) => id,
+                        None => {
+                            let new_album_id = uuid::Uuid::new_v4().to_string();
+                            self.conn.execute(
+                                "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, ?2, ?3, ?4)",
+                                params![new_album_id, folder_name, now_str, now_str],
+                            )?;
+                            new_album_id
+                        }
+                    };
+
+                    matches.push(MatchedAlbumFolder {
+                        album_id,
+                        album_name: folder_name,
+                        folder_path: root_str,
+                    });
                 }
             }
         }
@@ -1293,7 +1431,10 @@ impl Store {
     /// Uses `SELECT COUNT(*) FROM assets WHERE album_id = ?`.
     pub fn album_asset_count(&self, album_id: &str) -> Result<usize> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM assets WHERE album_id = ?1",
+            "SELECT count(*) FROM assets s
+             WHERE (s.album_id = ?1
+                OR s.id IN (SELECT ai.asset_id FROM album_items ai WHERE ai.album_id = ?1 AND ai.in_album = 1))
+               AND s.trashed_at IS NULL AND s.purged_at IS NULL",
             [album_id],
             |r| r.get(0),
         )?;
@@ -1310,8 +1451,10 @@ impl Store {
                 COUNT(CASE WHEN (remote_key IS NOT NULL AND remote_key != '') OR (key IS NOT NULL AND key != '') THEN 1 END) AS with_remote,
                 COUNT(CASE WHEN (local_path IS NOT NULL AND local_path != '') AND ((remote_key IS NOT NULL AND remote_key != '') OR (key IS NOT NULL AND key != '')) THEN 1 END) AS with_both,
                 COUNT(CASE WHEN thumb_state = 'ready' THEN 1 END) AS thumbs_ready
-             FROM assets
-             WHERE album_id = ?1",
+             FROM assets s
+             WHERE (s.album_id = ?1
+                OR s.id IN (SELECT ai.asset_id FROM album_items ai WHERE ai.album_id = ?1 AND ai.in_album = 1))
+               AND s.trashed_at IS NULL AND s.purged_at IS NULL",
         )?;
         let info = stmt.query_row([album_id], |r| {
             Ok(AlbumDebugInfo {
@@ -1330,19 +1473,15 @@ impl Store {
     pub fn list_albums(&self) -> Result<Vec<AlbumSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT a.id, a.name, a.created_at,
-                    (SELECT CASE
-                        WHEN (SELECT count(*) FROM assets WHERE album_id = a.id) > 0
-                        THEN (SELECT count(*) FROM assets WHERE album_id = a.id)
-                        ELSE (SELECT count(*)
-                              FROM album_items ai
-                              JOIN assets s ON s.id = ai.asset_id
-                              WHERE ai.album_id = a.id AND ai.in_album = 1
-                                AND s.trashed_at IS NULL AND s.purged_at IS NULL)
-                     END) AS cnt,
+                    (SELECT count(*)
+                     FROM assets s
+                     WHERE (s.album_id = a.id
+                        OR s.id IN (SELECT ai.asset_id FROM album_items ai WHERE ai.album_id = a.id AND ai.in_album = 1))
+                       AND s.trashed_at IS NULL AND s.purged_at IS NULL) AS cnt,
                     (SELECT s.id
-                     FROM album_items ai
-                     JOIN assets s ON s.id = ai.asset_id
-                     WHERE ai.album_id = a.id AND ai.in_album = 1
+                     FROM assets s
+                     WHERE (s.album_id = a.id
+                        OR s.id IN (SELECT ai.asset_id FROM album_items ai WHERE ai.album_id = a.id AND ai.in_album = 1))
                        AND s.trashed_at IS NULL AND s.purged_at IS NULL
                      ORDER BY s.taken_at DESC, s.id ASC
                      LIMIT 1) AS cover_id
@@ -2731,6 +2870,46 @@ mod tests {
         assert_eq!(dbg.with_both, 1);
         assert!(dbg.with_both > 0, "with_both must be greater than 0 for an album existing in both places");
         assert_eq!(dbg.thumbs_ready, 1);
+    }
+
+    #[test]
+    fn test_list_albums_empty_and_populated() {
+        let store = Store::open_in_memory("test-dev").unwrap();
+        let conn = store.connection();
+
+        // 1. Create an album with 0 assets
+        conn.execute(
+            "INSERT INTO albums (id, name, name_at, created_at) VALUES ('empty-alb', 'Empty Album', 'now', 'now')",
+            [],
+        ).unwrap();
+
+        let list = store.list_albums().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "empty-alb");
+        assert_eq!(list[0].asset_count, 0);
+        assert_eq!(list[0].cover_asset_id, None);
+
+        // 2. Add an asset via album_items
+        conn.execute(
+            "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, thumb_state)
+             VALUES ('a1', 'photo', 'p1.jpg', 100, '2026-01-01T00:00:00Z', 'now', 'now', 'ready')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO album_items (album_id, asset_id, in_album, at) VALUES ('empty-alb', 'a1', 1, 'now')",
+            [],
+        ).unwrap();
+
+        let list = store.list_albums().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].asset_count, 1);
+        assert_eq!(list[0].cover_asset_id, Some("a1".to_string()));
+
+        // 3. Trashing the asset should reduce count to 0
+        conn.execute("UPDATE assets SET trashed_at = 'now' WHERE id = 'a1'", []).unwrap();
+        let list = store.list_albums().unwrap();
+        assert_eq!(list[0].asset_count, 0);
+        assert_eq!(list[0].cover_asset_id, None);
     }
 }
 

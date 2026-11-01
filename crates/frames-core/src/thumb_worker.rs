@@ -200,6 +200,11 @@ impl ThumbWorker {
                     };
 
                     if res.is_ok() {
+                        let _ = if task.kind == "video" {
+                            generate_video_thumb_with_conn(src, &task.id, ThumbSize::Large, conn.as_ref())
+                        } else {
+                            generate_image_thumb_with_conn(src, &task.id, ThumbSize::Large, conn.as_ref())
+                        };
                         if let Some(c) = conn.as_ref() {
                             let _ = crate::palette::compute_and_store_palette(c, &task.id);
                         }

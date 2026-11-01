@@ -119,20 +119,35 @@
 
   let isLoaded = $state(false);
   let reloadCounter = $state(0);
+  let fallbackDataUrl = $state<string | null>(null);
 
   $effect(() => {
     const _ = asset.id;
     isLoaded = false;
     reloadCounter = 0;
+    fallbackDataUrl = null;
   });
 
   const currentThumbUrl = $derived(
-    reloadCounter > 0 ? `${thumbUrl(asset.id)}?v=${reloadCounter}` : thumbUrl(asset.id)
+    fallbackDataUrl || (reloadCounter > 0 ? `${thumbUrl(asset.id)}?v=${reloadCounter}` : thumbUrl(asset.id))
   );
+
+  async function handleImgError() {
+    if (!fallbackDataUrl) {
+      try {
+        const { tauriRepo } = await import('$lib/services/tauriRepo');
+        const dataUrl = await tauriRepo.getThumbnailDataUrl(asset.id, false);
+        if (dataUrl) {
+          fallbackDataUrl = dataUrl;
+        }
+      } catch {}
+    }
+  }
 
   onMount(() => {
     return onThumbReady((assetId) => {
       if (assetId === asset.id) {
+        fallbackDataUrl = null;
         reloadCounter++;
       }
     });
@@ -180,6 +195,7 @@
       decoding="async"
       class="tile-image {isLoaded ? 'loaded' : ''}"
       onload={() => (isLoaded = true)}
+      onerror={handleImgError}
     />
   </div>
 

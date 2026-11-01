@@ -82,7 +82,7 @@ pub fn classify_path(path: &Path) -> FileClassification {
 pub fn is_raw_extension(ext: &str) -> bool {
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "dng" | "cr2" | "cr3" | "nef" | "arw"
+        "dng" | "cr2" | "cr3" | "nef" | "arw" | "raf" | "orf" | "rw2" | "raw"
     )
 }
 

@@ -43,6 +43,7 @@ use frames_core::trash::{
     delete_trash_items_now, empty_trash, purge_expired_trash_concurrent, trash_summary,
     PurgeReport, TrashSummary,
 };
+use frames_core::rusqlite::params;
 
 pub mod adaptive_commands;
 pub use adaptive_commands::*;
@@ -520,6 +521,9 @@ fn serve_file_with_range(
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
         "m4v" => "video/x-m4v",
+        "avi" => "video/x-msvideo",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
         _ => "application/octet-stream",
     };
 
@@ -557,7 +561,7 @@ fn serve_file_with_range(
                 let suffix = suffix.min(file_len);
                 (file_len - suffix, file_len - 1)
             } else if e_str.is_empty() {
-                // Prefix / open-ended range: bytes=500- (cap chunk to max 8MB)
+                // Prefix / open-ended range: bytes=500- (full range for images; 8MB chunk for videos)
                 let start: u64 = match s_str.parse() {
                     Ok(n) => n,
                     Err(_) => {
@@ -569,8 +573,12 @@ fn serve_file_with_range(
                             .unwrap();
                     }
                 };
-                let max_chunk: u64 = 8 * 1024 * 1024;
-                let end = (start + max_chunk - 1).min(file_len - 1);
+                let end = if content_type.starts_with("image/") {
+                    file_len - 1
+                } else {
+                    let max_chunk: u64 = 8 * 1024 * 1024;
+                    (start + max_chunk - 1).min(file_len - 1)
+                };
                 (start, end)
             } else {
                 let start: u64 = match s_str.parse() {
@@ -678,6 +686,384 @@ fn serve_file_with_range(
     }
 }
 
+/// Attempts to locate the original media file on local disk for an asset.
+/// Checks:
+/// 1. `assets.local_path`
+/// 2. `import_queue` path
+/// 3. Matched local album folders in configured roots and picture dir
+/// 4. Direct files in configured roots
+fn resolve_local_media_path(state: &AppState, id: &str) -> Option<PathBuf> {
+    let store_guard = state.store.lock().ok()?;
+    let conn = store_guard.connection();
+
+    // 1. Direct local_path from assets table
+    let asset_row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT local_path, album_id, relative_path, filename FROM assets WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok();
+
+    if let Some((Some(ref lp), _, _, _)) = asset_row {
+        let p = PathBuf::from(lp);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    // 2. Check import_queue table
+    let import_row: Option<String> = conn
+        .query_row(
+            "SELECT path FROM import_queue WHERE asset_id = ?1 AND path IS NOT NULL ORDER BY mtime DESC LIMIT 1",
+            [id],
+            |r| r.get(0),
+        )
+        .ok();
+
+    if let Some(ip) = import_row {
+        let p = PathBuf::from(&ip);
+        if p.is_file() {
+            let _ = conn.execute(
+                "UPDATE assets SET local_path = ?1 WHERE id = ?2",
+                params![ip, id],
+            );
+            return Some(p);
+        }
+    }
+
+    // 3. Search in matched local album folders
+    let (_, album_id_opt, rel_path_opt, filename_opt) = asset_row?;
+    let filename = filename_opt.unwrap_or_default();
+    let rel_path = rel_path_opt.unwrap_or_default();
+
+    let target_album_id = album_id_opt.or_else(|| {
+        conn.query_row(
+            "SELECT album_id FROM album_items WHERE asset_id = ?1 AND in_album = 1 LIMIT 1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    });
+
+    let mut roots = store_guard.get_local_roots().unwrap_or_default();
+    if roots.is_empty() {
+        if let Some(pic_dir) = dirs::picture_dir() {
+            if pic_dir.exists() {
+                roots.push(pic_dir.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    if let Some(aid) = target_album_id {
+        let album_name: Option<String> = conn
+            .query_row("SELECT name FROM albums WHERE id = ?1", [&aid], |r| r.get(0))
+            .ok();
+
+        if let Some(aname) = album_name {
+            for root in &roots {
+                let root_dir = Path::new(root);
+                if !root_dir.exists() {
+                    continue;
+                }
+
+                let is_root_album = root_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.eq_ignore_ascii_case(&aname))
+                    .unwrap_or(false);
+
+                let mut candidate_folders = Vec::new();
+                if is_root_album {
+                    candidate_folders.push(root_dir.to_path_buf());
+                }
+                candidate_folders.push(root_dir.join(&aname));
+
+                if let Ok(entries) = fs::read_dir(root_dir) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                            if entry.file_name().to_string_lossy().eq_ignore_ascii_case(&aname) {
+                                candidate_folders.push(entry.path());
+                            }
+                        }
+                    }
+                }
+
+                for folder in candidate_folders {
+                    if !folder.is_dir() {
+                        continue;
+                    }
+
+                    if !rel_path.is_empty() {
+                        let cand1 = folder.join(&rel_path);
+                        if cand1.is_file() {
+                            let lp_str = cand1.to_string_lossy().to_string();
+                            let _ = conn.execute(
+                                "UPDATE assets SET local_path = ?1 WHERE id = ?2",
+                                params![lp_str, id],
+                            );
+                            return Some(cand1);
+                        }
+                    }
+
+                    if !filename.is_empty() {
+                        let cand2 = folder.join(&filename);
+                        if cand2.is_file() {
+                            let lp_str = cand2.to_string_lossy().to_string();
+                            let _ = conn.execute(
+                                "UPDATE assets SET local_path = ?1 WHERE id = ?2",
+                                params![lp_str, id],
+                            );
+                            return Some(cand2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Try checking if filename or rel_path exists in any root
+    if !filename.is_empty() {
+        for root in &roots {
+            let root_path = Path::new(root);
+            if !root_path.exists() {
+                continue;
+            }
+
+            let cand = root_path.join(&filename);
+            if cand.is_file() {
+                let lp_str = cand.to_string_lossy().to_string();
+                let _ = conn.execute(
+                    "UPDATE assets SET local_path = ?1 WHERE id = ?2",
+                    params![lp_str, id],
+                );
+                return Some(cand);
+            }
+
+            if !rel_path.is_empty() {
+                let cand_rel = root_path.join(&rel_path);
+                if cand_rel.is_file() {
+                    let lp_str = cand_rel.to_string_lossy().to_string();
+                    let _ = conn.execute(
+                        "UPDATE assets SET local_path = ?1 WHERE id = ?2",
+                        params![lp_str, id],
+                    );
+                    return Some(cand_rel);
+                }
+            }
+
+            // Quick recursive search up to depth 3
+            for entry in walkdir::WalkDir::new(root_path).max_depth(3).into_iter().flatten() {
+                if entry.file_type().is_file() && entry.file_name().to_string_lossy().eq_ignore_ascii_case(&filename) {
+                    let cand = entry.path().to_path_buf();
+                    let lp_str = cand.to_string_lossy().to_string();
+                    let _ = conn.execute(
+                        "UPDATE assets SET local_path = ?1 WHERE id = ?2",
+                        params![lp_str, id],
+                    );
+                    return Some(cand);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Serve a thumbnail or preview response for an asset with local-first priority.
+fn serve_thumbnail_response(
+    state: &AppState,
+    s4_ref: Option<&dyn ObjectStore>,
+    id: &str,
+    size: frames_core::thumbs::ThumbSize,
+    method: &tauri::http::Method,
+) -> Response<Vec<u8>> {
+    let empty_body = *method == tauri::http::Method::HEAD;
+
+    // 1. Check disk thumbnail cache at thumbs/<size>/<id>.webp
+    let thumb_file = frames_core::thumbs::thumb_path(id, size);
+    if thumb_file.is_file() {
+        if let Ok(bytes) = fs::read(&thumb_file) {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/webp")
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                .body(if empty_body { Vec::new() } else { bytes })
+                .unwrap();
+        }
+    }
+
+    // 2. Check LocalCache
+    if size == frames_core::thumbs::ThumbSize::Small {
+        if let Some(p) = fetch_small_thumb_unlocked(&state.cache, None, id) {
+            if let Ok(bytes) = fs::read(&p) {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/webp")
+                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                    .body(if empty_body { Vec::new() } else { bytes })
+                    .unwrap();
+            }
+        }
+    } else if let Some(p) = fetch_preview_unlocked(&state.cache, None, id) {
+        if let Ok(bytes) = fs::read(&p) {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/webp")
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                .body(if empty_body { Vec::new() } else { bytes })
+                .unwrap();
+        }
+    }
+
+    // 3. Resolve from local disk and generate on the fly
+    if let Some(src) = resolve_local_media_path(state, id) {
+        let kind = {
+            let store = state.store.lock().ok();
+            store.and_then(|s| {
+                s.connection()
+                    .query_row("SELECT kind FROM assets WHERE id = ?1", [id], |r| r.get::<_, String>(0))
+                    .ok()
+            }).unwrap_or_else(|| "photo".to_string())
+        };
+
+        let gen_res = if kind == "video" {
+            frames_core::thumbs::generate_video_thumb(&src, id, size)
+        } else {
+            frames_core::thumbs::generate_image_thumb(&src, id, size)
+        };
+
+        if let Ok(p) = gen_res {
+            if let Ok(store) = state.store.lock() {
+                frames_core::thumbs::update_thumb_state(store.connection(), id, "ready");
+                if size == frames_core::thumbs::ThumbSize::Small {
+                    let _ = frames_core::palette::compute_and_store_palette(store.connection(), id);
+                }
+            }
+            if let Ok(bytes) = fs::read(&p) {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/webp")
+                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                    .body(if empty_body { Vec::new() } else { bytes })
+                    .unwrap();
+            }
+        }
+    }
+
+    // 4. Remote fetch fallback
+    if let Some(fetcher) = state.get_or_create_remote_fetcher() {
+        let (kind, remote_key, album_id, rel_path): (String, Option<String>, Option<String>, Option<String>) = {
+            let store = state.store.lock().ok();
+            store.and_then(|s| {
+                s.connection()
+                    .query_row(
+                        "SELECT kind, coalesce(remote_key, NULLIF(key, '')), album_id, relative_path FROM assets WHERE id = ?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .ok()
+            }).unwrap_or_else(|| ("photo".to_string(), None, None, None))
+        };
+
+        let resolved_remote_key = remote_key.or_else(|| {
+            if let (Some(aid), Some(rel)) = (album_id, rel_path) {
+                let store = state.store.lock().ok()?;
+                let aname: String = store.connection()
+                    .query_row("SELECT name FROM albums WHERE id = ?1", [&aid], |r| r.get(0))
+                    .ok()?;
+                Some(format!("albums/{aname}/{rel}"))
+            } else {
+                None
+            }
+        });
+
+        let remote_asset = frames_core::RemoteAsset {
+            id: id.to_string(),
+            kind,
+            remote_key: resolved_remote_key,
+        };
+
+        if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_thumb(&remote_asset, size)) {
+            if let Ok(store) = state.store.lock() {
+                frames_core::thumbs::update_thumb_state(store.connection(), id, "ready");
+                if size == frames_core::thumbs::ThumbSize::Small {
+                    let _ = frames_core::palette::compute_and_store_palette(store.connection(), id);
+                }
+            }
+            if let Ok(bytes) = fs::read(&p) {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/webp")
+                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                    .body(if empty_body { Vec::new() } else { bytes })
+                    .unwrap();
+            }
+        }
+    }
+
+    // 5. Fallback via cache & S4 ref
+    if size == frames_core::thumbs::ThumbSize::Small {
+        if let Some(p) = fetch_small_thumb_unlocked(&state.cache, s4_ref, id) {
+            if let Ok(bytes) = fs::read(p) {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/webp")
+                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                    .body(if empty_body { Vec::new() } else { bytes })
+                    .unwrap();
+            }
+        }
+    } else if let Some(p) = fetch_preview_unlocked(&state.cache, s4_ref, id) {
+        if let Ok(bytes) = fs::read(p) {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/webp")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .body(if empty_body { Vec::new() } else { bytes })
+                .unwrap();
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(Vec::new())
+        .unwrap()
+}
+
+fn url_decode(s: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).into_owned()
+}
+
 /// Serve `frames://localhost/<kind>/<id>` custom protocol requests asynchronously
 /// on a worker thread without holding `cache.lock()` across S4 downloads (Blocker 4).
 fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>>) -> Response<Vec<u8>> {
@@ -697,7 +1083,13 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
     let uri = request.uri();
     let raw_path = uri.path().trim_start_matches('/');
     let host = uri.host().unwrap_or("");
-    let combined = if !host.is_empty() && host != "localhost" && host != "frames.localhost" {
+    let is_local_host = host.is_empty()
+        || host == "localhost"
+        || host == "127.0.0.1"
+        || host.ends_with(".localhost")
+        || host == "frames";
+
+    let combined = if !is_local_host {
         format!("{host}/{raw_path}")
     } else {
         raw_path.to_string()
@@ -713,7 +1105,8 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
     }
 
     let kind = segments[0];
-    let id = segments[1];
+    let decoded_id = url_decode(segments[1]);
+    let id = decoded_id.as_str();
 
     let s4_opt = state.require_s4().ok();
     let s4_ref = s4_opt.as_deref();
@@ -724,178 +1117,120 @@ fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>
                 Some("1024") => frames_core::thumbs::ThumbSize::Large,
                 _ => frames_core::thumbs::ThumbSize::Small,
             };
-            let thumb_file = frames_core::thumbs::thumb_path(id, size);
-            if thumb_file.exists() {
-                if let Ok(bytes) = fs::read(&thumb_file) {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "image/webp")
-                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                        .body(bytes)
-                        .unwrap();
-                }
-            }
-
-            // Look up asset in db
-            let asset_info: Option<(String, Option<String>, Option<String>)> = {
-                let store = state.store.lock().ok();
-                store.and_then(|s| {
-                    s.connection()
-                        .query_row(
-                            "SELECT kind, local_path, remote_key FROM assets WHERE id = ?1",
-                            [id],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                        )
-                        .ok()
-                })
-            };
-
-            if let Some((kind, local_path, remote_key)) = asset_info {
-                if let Some(lp) = local_path {
-                    let src = Path::new(&lp);
-                    if src.exists() {
-                        let gen_res = if kind == "video" {
-                            frames_core::thumbs::generate_video_thumb(src, id, size)
-                        } else {
-                            frames_core::thumbs::generate_image_thumb(src, id, size)
-                        };
-                        if let Ok(p) = gen_res {
-                            if let Ok(bytes) = fs::read(p) {
-                                return Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(header::CONTENT_TYPE, "image/webp")
-                                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                                    .body(bytes)
-                                    .unwrap();
-                            }
-                        }
-                    }
-                }
-
-                if let Some(fetcher) = state.get_or_create_remote_fetcher() {
-                    let remote_asset = frames_core::RemoteAsset {
-                        id: id.to_string(),
-                        kind: kind.clone(),
-                        remote_key,
-                    };
-                    if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_thumb(&remote_asset, size)) {
-                        if size == frames_core::thumbs::ThumbSize::Small {
-                            if let Ok(store) = state.store.lock() {
-                                let _ = frames_core::palette::compute_and_store_palette(store.connection(), id);
-                            }
-                        }
-                        if let Ok(bytes) = fs::read(p) {
-                            return Response::builder()
-                                .status(StatusCode::OK)
-                                .header(header::CONTENT_TYPE, "image/webp")
-                                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                                .body(bytes)
-                                .unwrap();
-                        }
-                    }
-                }
-            }
-
-            // Fallback: check old small thumb cache / S4
-            if let Some(p) = fetch_small_thumb_unlocked(&state.cache, s4_ref, id) {
-                if let Ok(bytes) = fs::read(p) {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "image/webp")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                        .body(bytes)
-                        .unwrap();
-                }
-            }
-
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Vec::new())
-                .unwrap()
-        }
-        "photo" | "original" => {
-            let asset_info: Option<(String, Option<String>, Option<String>)> = {
-                let store = state.store.lock().ok();
-                store.and_then(|s| {
-                    s.connection()
-                        .query_row(
-                            "SELECT kind, local_path, remote_key FROM assets WHERE id = ?1",
-                            [id],
-                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                        )
-                        .ok()
-                })
-            };
-
-            if let Some((kind, local_path, remote_key)) = asset_info {
-                if let Some(lp) = local_path {
-                    let src = Path::new(&lp);
-                    if src.is_file() {
-                        return serve_file_with_range(src, request.headers(), request.method());
-                    }
-                }
-
-                let cached_orig = frames_core::thumbs::app_cache_dir().join("originals").join(id);
-                if cached_orig.is_file() {
-                    return serve_file_with_range(&cached_orig, request.headers(), request.method());
-                }
-
-                if let Some(fetcher) = state.get_or_create_remote_fetcher() {
-                    let remote_asset = frames_core::RemoteAsset {
-                        id: id.to_string(),
-                        kind,
-                        remote_key,
-                    };
-                    if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_original(&remote_asset)) {
-                        if p.is_file() {
-                            return serve_file_with_range(&p, request.headers(), request.method());
-                        }
-                    }
-                }
-            }
-
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Vec::new())
-                .unwrap()
+            serve_thumbnail_response(&state, s4_ref, id, size, request.method())
         }
         "preview" => {
-            let size = frames_core::thumbs::ThumbSize::Large;
-            let thumb_file = frames_core::thumbs::thumb_path(id, size);
-            if thumb_file.exists() {
-                if let Ok(bytes) = fs::read(&thumb_file) {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "image/webp")
-                        .header(header::CACHE_CONTROL, "public, max-age=3600")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                        .body(bytes)
-                        .unwrap();
+            serve_thumbnail_response(&state, s4_ref, id, frames_core::thumbs::ThumbSize::Large, request.method())
+        }
+        "photo" | "original" => {
+            let empty_body = *request.method() == tauri::http::Method::HEAD;
+            // 1. Try local media path first
+            if let Some(src) = resolve_local_media_path(&state, id) {
+                let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                let is_raw = frames_core::media::is_raw_extension(&ext) || ext == "raw" || ext == "tif" || ext == "tiff";
+                if is_raw {
+                    if let Some((bytes, mime)) = frames_core::media::prepare_photo_bytes_for_webview(&src) {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, mime)
+                            .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                            .header(header::CACHE_CONTROL, "public, max-age=3600")
+                            .body(if empty_body { Vec::new() } else { bytes })
+                            .unwrap();
+                    }
+                    return serve_thumbnail_response(&state, s4_ref, id, frames_core::thumbs::ThumbSize::Large, request.method());
+                }
+                return serve_file_with_range(&src, request.headers(), request.method());
+            }
+
+            // 2. Check cached originals on disk
+            let cached_orig = frames_core::thumbs::app_cache_dir().join("originals").join(id);
+            if cached_orig.is_file() {
+                let ext = cached_orig.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                let is_raw = frames_core::media::is_raw_extension(&ext) || ext == "raw" || ext == "tif" || ext == "tiff";
+                if is_raw {
+                    if let Some((bytes, mime)) = frames_core::media::prepare_photo_bytes_for_webview(&cached_orig) {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, mime)
+                            .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                            .header(header::CACHE_CONTROL, "public, max-age=3600")
+                            .body(if empty_body { Vec::new() } else { bytes })
+                            .unwrap();
+                    }
+                    return serve_thumbnail_response(&state, s4_ref, id, frames_core::thumbs::ThumbSize::Large, request.method());
+                }
+                return serve_file_with_range(&cached_orig, request.headers(), request.method());
+            }
+
+            // 3. Remote fetch from S4
+            if let Some(fetcher) = state.get_or_create_remote_fetcher() {
+                let (kind, remote_key, album_id, rel_path, filename): (String, Option<String>, Option<String>, Option<String>, Option<String>) = {
+                    let store = state.store.lock().ok();
+                    store.and_then(|s| {
+                        s.connection()
+                            .query_row(
+                                "SELECT kind, coalesce(remote_key, NULLIF(key, '')), album_id, relative_path, filename FROM assets WHERE id = ?1",
+                                [id],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                            )
+                            .ok()
+                    }).unwrap_or_else(|| ("photo".to_string(), None, None, None, None))
+                };
+
+                let target_aid = album_id.or_else(|| {
+                    let store = state.store.lock().ok()?;
+                    store.connection()
+                        .query_row("SELECT album_id FROM album_items WHERE asset_id = ?1 AND in_album = 1 LIMIT 1", [id], |r| r.get(0))
+                        .ok()
+                });
+
+                let resolved_remote_key = remote_key.or_else(|| {
+                    if let Some(aid) = target_aid {
+                        let store = state.store.lock().ok()?;
+                        let aname: String = store.connection()
+                            .query_row("SELECT name FROM albums WHERE id = ?1", [&aid], |r| r.get(0))
+                            .ok()?;
+                        let rel = rel_path.or(filename).unwrap_or_else(|| id.to_string());
+                        Some(format!("albums/{aname}/{rel}"))
+                    } else {
+                        None
+                    }
+                });
+
+                let remote_asset = frames_core::RemoteAsset {
+                    id: id.to_string(),
+                    kind,
+                    remote_key: resolved_remote_key,
+                };
+
+                if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_original(&remote_asset)) {
+                    if p.is_file() {
+                        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                        let is_raw = frames_core::media::is_raw_extension(&ext) || ext == "raw" || ext == "tif" || ext == "tiff";
+                        if is_raw {
+                            if let Some((bytes, mime)) = frames_core::media::prepare_photo_bytes_for_webview(&p) {
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, mime)
+                                    .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+                                    .header(header::CACHE_CONTROL, "public, max-age=3600")
+                                    .body(if empty_body { Vec::new() } else { bytes })
+                                    .unwrap();
+                            }
+                            return serve_thumbnail_response(&state, s4_ref, id, frames_core::thumbs::ThumbSize::Large, request.method());
+                        }
+                        return serve_file_with_range(&p, request.headers(), request.method());
+                    }
                 }
             }
-            if let Some(p) = fetch_preview_unlocked(&state.cache, s4_ref, id) {
-                if let Ok(bytes) = fs::read(p) {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "image/webp")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                        .header(header::CACHE_CONTROL, "public, max-age=3600")
-                        .body(bytes)
-                        .unwrap();
-                }
-            }
+
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
@@ -1009,17 +1344,17 @@ fn get_thumbnail_data_url(
     preview: bool,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let s4_opt = state.require_s4().ok();
-    let s4_ref = s4_opt.as_deref();
-
-    let path_opt = if preview {
-        fetch_preview_unlocked(&state.cache, s4_ref, &id)
+    let size = if preview {
+        frames_core::thumbs::ThumbSize::Large
     } else {
-        fetch_small_thumb_unlocked(&state.cache, s4_ref, &id)
+        frames_core::thumbs::ThumbSize::Small
     };
 
-    if let Some(p) = path_opt {
-        if let Ok(bytes) = fs::read(p) {
+    let s4_opt = state.require_s4().ok();
+    let resp = serve_thumbnail_response(&state, s4_opt.as_deref(), &id, size, &tauri::http::Method::GET);
+    if resp.status() == StatusCode::OK {
+        let bytes = resp.into_body();
+        if !bytes.is_empty() {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             return Ok(Some(format!("data:image/webp;base64,{b64}")));
         }
@@ -1825,9 +2160,21 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn set_local_roots(paths: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    store.set_local_roots(paths).map_err(|e| e.to_string())
+fn set_local_roots(paths: Vec<String>, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store.set_local_roots(paths).map_err(|e| e.to_string())?;
+    }
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = handle.state::<AppState>();
+        if let Ok(store) = state.store.lock() {
+            let count = frames_core::scan_local::scan_all_local_roots(&store).unwrap_or(0);
+            let _ = handle.emit("scan-finished", serde_json::json!({ "count": count }));
+        }
+        start_background_workers(&handle);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -1838,8 +2185,11 @@ fn get_local_roots(state: State<'_, AppState>) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn scan_local_library(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<usize, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    let count = frames_core::scan_local::scan_all_local_roots(&store).map_err(|e| e.to_string())?;
+    let count = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        frames_core::scan_local::scan_all_local_roots(&store).map_err(|e| e.to_string())?
+    };
+    start_background_workers(&app);
     let _ = app.emit("scan-finished", serde_json::json!({ "count": count }));
     Ok(count)
 }
@@ -2002,21 +2352,28 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(move || {
                 let state = handle_scan.state::<AppState>();
 
+                // 1. Start background workers immediately so thumbnails generate right away
+                start_background_workers(&handle_scan);
+
+                // 2. Scan all local roots first for immediate local availability
                 if let Ok(store) = state.store.lock() {
                     let count = frames_core::scan_local::scan_all_local_roots(&store).unwrap_or(0);
                     let _ = handle_scan.emit("scan-finished", serde_json::json!({ "count": count }));
                 };
 
+                // 3. For remote sync: list objects outside store lock so local UI is never blocked
                 if let Ok(s4) = state.require_s4() {
-                    if let Ok(store) = state.store.lock() {
-                        let handle_alb = handle_scan.clone();
-                        let _ = frames_core::sync::sync_remote_album_listings(&store, s4.as_ref(), move |album_id| {
-                            let _ = handle_alb.emit("album-synced", serde_json::json!({ "album_id": album_id }));
-                        });
+                    let s4_clone = Arc::clone(&s4);
+                    if let Ok(objs) = s4_clone.list_objects("albums/") {
+                        if let Ok(store) = state.store.lock() {
+                            let handle_alb = handle_scan.clone();
+                            let _ = frames_core::sync::apply_remote_album_objects(&store, objs, move |album_id| {
+                                let _ = handle_alb.emit("album-synced", serde_json::json!({ "album_id": album_id }));
+                            });
+                            let _ = frames_core::scan_local::scan_all_local_roots(&store);
+                        }
                     }
                 }
-
-                start_background_workers(&handle_scan);
             });
 
             Ok(())
@@ -2152,7 +2509,47 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes */20");
 
+        // 5. Open-ended image range: bytes=0- should return entire 20 bytes
+        let img_tmp = std::env::temp_dir().join(format!("range-img-test-{}.jpg", fastrand::u64(..)));
+        fs::write(&img_tmp, b"0123456789abcdefghij").unwrap();
+        let mut img_headers = tauri::http::HeaderMap::new();
+        img_headers.insert(header::RANGE, "bytes=0-".parse().unwrap());
+        let resp = serve_file_with_range(&img_tmp, &img_headers, &tauri::http::Method::GET);
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.body().len(), 20);
+        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 0-19/20");
+        let _ = fs::remove_file(&img_tmp);
+
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_resolve_local_media_path_checks_import_queue_without_sql_error() {
+        let tmp = std::env::temp_dir().join(format!("frames-resolve-test-{}", fastrand::u64(..)));
+        let state = AppState::init_with_dir(tmp.clone());
+        let photo_file = tmp.join("imported.jpg");
+        fs::write(&photo_file, b"testphoto").unwrap();
+
+        let asset_id = "test-asset-resolve-1";
+        {
+            let store = state.store.lock().unwrap();
+            let conn = store.connection();
+            conn.execute(
+                "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, thumb_state)
+                 VALUES (?1, 'photo', 'imported.jpg', 9, 'now', 'now', 'now', 'none')",
+                [asset_id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO import_queue (path, size, mtime, state, asset_id)
+                 VALUES (?1, 9, 123456789, 'pending', ?2)",
+                [photo_file.to_str().unwrap(), asset_id],
+            ).unwrap();
+        }
+
+        let resolved = resolve_local_media_path(&state, asset_id);
+        assert_eq!(resolved, Some(photo_file));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

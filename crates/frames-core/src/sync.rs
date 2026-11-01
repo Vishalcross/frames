@@ -118,6 +118,12 @@ impl ImportControl {
         self.cancelled.store(false, Ordering::SeqCst);
         self.running.store(true, Ordering::SeqCst);
     }
+
+    pub fn force_reset(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
+    }
 }
 
 struct RunningGuard<'a>(&'a ImportControl);

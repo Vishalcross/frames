@@ -1846,6 +1846,14 @@ impl Store {
         )?;
         Ok(())
     }
+
+    pub fn clear_all_import_queue(&mut self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM import_queue",
+            [],
+        )?;
+        Ok(())
+    }
 }
 
 // =============================================================================

@@ -1439,15 +1439,35 @@ fn cancel_import(state: State<'_, AppState>) -> Result<ImportStatusView, String>
 }
 
 #[tauri::command]
+fn reset_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
+    state.import_control.force_reset();
+    get_import_status(state)
+}
+
+#[tauri::command]
+fn clear_import_queue(all: Option<bool>, state: State<'_, AppState>) -> Result<ImportStatusView, String> {
+    {
+        let mut store = state.store.lock().map_err(|e| e.to_string())?;
+        if all.unwrap_or(false) {
+            store.clear_all_import_queue().map_err(|e| e.to_string())?;
+        } else {
+            store.clear_finished_imports().map_err(|e| e.to_string())?;
+        }
+    }
+    get_import_status(state)
+}
+
+#[tauri::command]
 fn get_import_status(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let progress = store.import_progress().map_err(|e| e.to_string())?;
+    let queue = store.list_import_queue().unwrap_or_default();
     Ok(ImportStatusView {
         running: state.import_control.is_running(),
         paused: state.import_control.is_paused(),
         cancelled: state.import_control.is_cancelled(),
         progress,
-        queue: Vec::new(),
+        queue,
     })
 }
 
@@ -2034,6 +2054,8 @@ pub fn run() {
             pause_import,
             resume_import,
             cancel_import,
+            reset_import,
+            clear_import_queue,
             get_import_status,
             seed_sample_library,
             sync_now,

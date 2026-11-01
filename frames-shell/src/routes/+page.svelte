@@ -18,6 +18,7 @@
   import TripsView from '$lib/components/collections/TripsView.svelte';
   import TrashView from '$lib/components/library/TrashView.svelte';
   import EmptyLibraryView from '$lib/components/library/EmptyLibraryView.svelte';
+  import ImportsView from '$lib/components/library/ImportsView.svelte';
   import SearchOverlay from '$lib/components/search/SearchOverlay.svelte';
   import SelectionBar from '$lib/components/surface/SelectionBar.svelte';
   import PhotoViewer from '$lib/components/viewer/PhotoViewer.svelte';
@@ -355,6 +356,9 @@
     toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Opening system folder dialog…' }];
     const res = await tauriRepo.pickFolderAndImport();
     if (res.error) {
+      if (res.error.toLowerCase().includes('already running')) {
+        navigate('imports');
+      }
       toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: res.error }];
     } else if (res.cancelled) {
       // user dismissed the folder dialog
@@ -538,11 +542,11 @@
           <!-- Recently Deleted with days-remaining labels (§4.12) -->
           <TrashView />
         {:else if currentRoute === 'imports'}
-          <EmptyLibraryView
+          <ImportsView
             {isTauri}
             onimport={handlePickFolderAndImport}
             onsync={handleSyncNow}
-            onseed={handleSeedDemo}
+            onimported={() => loadLibraryData()}
           />
         {:else}
           <!-- Generic Filtered Grid for Favorites, Videos, Hidden, Captured by Me -->

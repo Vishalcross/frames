@@ -58,12 +58,55 @@ export interface BackendBootstrap {
       total_bytes: number;
     };
   };
+  import_progress?: BackendImportProgress;
+  import_queue?: BackendImportQueueRow[];
   settings: any;
   cache_stats: any;
   space_usage: any;
   outbox_pending: number;
   offline: boolean;
   db_damaged: string | null;
+}
+
+export interface BackendImportProgress {
+  total_files: number;
+  total_bytes: number;
+  completed_files: number;
+  completed_bytes: number;
+  skipped_duplicates: number;
+  failed_files: number;
+  hashed_files: number;
+  uploading_files: number;
+}
+
+export interface BackendImportQueueRow {
+  path: string;
+  size: number;
+  mtime: number;
+  state: 'pending' | 'hashed' | 'uploading' | 'uploaded' | 'logged' | 'skipped' | 'failed';
+  asset_id: string | null;
+  upload_id: string | null;
+  parts_done: number;
+  album_id: string | null;
+  error: string | null;
+}
+
+export interface BackendImportStatusView {
+  running: boolean;
+  paused: boolean;
+  cancelled: boolean;
+  progress: BackendImportProgress;
+  queue: BackendImportQueueRow[];
+}
+
+export interface ImportReportEvent {
+  imported_count: number;
+  duplicates_skipped: number;
+  unknown_files: Array<{ path: string; reason: string }>;
+  failed_files: Array<{ path: string; reason: string }>;
+  paused_offline: boolean;
+  stopped_space_full: boolean;
+  space_usage?: any;
 }
 
 export interface BackendSettingsView {
@@ -543,6 +586,58 @@ export class TauriAssetRepo implements AssetRepo {
       console.error('Failed to seed sample library:', e);
       return 0;
     }
+  }
+
+  // Import Status & Control (§9)
+  async getImportStatus(): Promise<BackendImportStatusView> {
+    const fallback: BackendImportStatusView = {
+      running: false,
+      paused: false,
+      cancelled: false,
+      progress: {
+        total_files: 0,
+        total_bytes: 0,
+        completed_files: 0,
+        completed_bytes: 0,
+        skipped_duplicates: 0,
+        failed_files: 0,
+        hashed_files: 0,
+        uploading_files: 0
+      },
+      queue: []
+    };
+    if (!isTauriAvailable()) return fallback;
+    try {
+      return await invoke<BackendImportStatusView>('get_import_status');
+    } catch (e) {
+      console.error('Failed to get import status:', e);
+      return fallback;
+    }
+  }
+
+  async pauseImport(): Promise<BackendImportStatusView> {
+    if (!isTauriAvailable()) return this.getImportStatus();
+    return await invoke<BackendImportStatusView>('pause_import');
+  }
+
+  async resumeImport(): Promise<BackendImportStatusView> {
+    if (!isTauriAvailable()) return this.getImportStatus();
+    return await invoke<BackendImportStatusView>('resume_import');
+  }
+
+  async cancelImport(): Promise<BackendImportStatusView> {
+    if (!isTauriAvailable()) return this.getImportStatus();
+    return await invoke<BackendImportStatusView>('cancel_import');
+  }
+
+  async resetImport(): Promise<BackendImportStatusView> {
+    if (!isTauriAvailable()) return this.getImportStatus();
+    return await invoke<BackendImportStatusView>('reset_import');
+  }
+
+  async clearImportQueue(all = false): Promise<BackendImportStatusView> {
+    if (!isTauriAvailable()) return this.getImportStatus();
+    return await invoke<BackendImportStatusView>('clear_import_queue', { all });
   }
 }
 

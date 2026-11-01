@@ -39,6 +39,7 @@
 
   let uploadCount = $state(0);
   let thumbCount = $state(0);
+  let isImportRunning = $state(false);
 
   const statusText = $derived.by(() => {
     if (uploadCount > 0) return `Uploading ${uploadCount}`;
@@ -59,6 +60,9 @@
         );
         uploadCount = st.uploading_count;
         thumbCount = st.thumb_generating_count;
+
+        const imp = await invoke<{ running: boolean }>('get_import_status');
+        isImportRunning = imp.running;
       } catch (e) {
         // Ignore if unavailable
       }
@@ -84,6 +88,10 @@
       }).then((un) => unlistens.push(un));
 
       listen('scan-finished', () => {
+        refreshCounts();
+      }).then((un) => unlistens.push(un));
+
+      listen('frames://import-progress', () => {
         refreshCounts();
       }).then((un) => unlistens.push(un));
     });
@@ -329,6 +337,9 @@
         >
           <span class="row-icon"><Icon name="arrow-down-to-line" size={16} /></span>
           <span class="row-label">Imports</span>
+          {#if isImportRunning}
+            <span class="sidebar-import-pulse" title="Import running"></span>
+          {/if}
         </button>
 
         <button
@@ -618,5 +629,25 @@
   .sidebar-resizer:hover,
   .sidebar-resizer.resizing {
     background: var(--accent);
+  }
+
+  .sidebar-import-pulse {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    margin-left: auto;
+    animation: sidebarPulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes sidebarPulse {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.3;
+      transform: scale(0.7);
+    }
   }
 </style>

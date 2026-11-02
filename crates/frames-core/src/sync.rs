@@ -563,19 +563,8 @@ fn prepare_folder_assets(
             item.existing_upload_id = existing_uid.clone();
             item.parts_already_done = *parts_done;
         }
-        // If this paired Live Photo absorbed a companion MOV file, mark the companion MOV row as Skipped
-        // in import_queue so it doesn't linger as 'scanned'.
-        if let Some(ref mov_path) = item.motion_path {
-            let mov_str = mov_path.to_string_lossy().to_string();
-            let _ = store.update_import_state(
-                &mov_str,
-                ImportState::Skipped,
-                item.record.motion_id.as_deref(),
-                None,
-                0,
-                None,
-            );
-        }
+        // The companion MOV travels with its photo and is logged with it.
+        set_motion_import_state(store, &item, ImportState::Hashed);
         let path_str = item.primary_path.to_string_lossy().to_string();
         let state = if item.existing_upload_id.is_some() {
             ImportState::Uploading
@@ -584,7 +573,7 @@ fn prepare_folder_assets(
         };
         store.enqueue_import(&ImportQueueRow {
             path: path_str,
-            size: item.record.size + item.record.motion_size.unwrap_or(0),
+            size: item.record.size,
             mtime: item.primary_mtime_ms,
             state,
             asset_id: Some(item.record.id.clone()),
@@ -917,20 +906,11 @@ where
             } else {
                 ImportState::Hashed
             };
-            if let Some(ref mov_path) = item.motion_path {
-                let mov_str = mov_path.to_string_lossy().to_string();
-                let _ = st.update_import_state(
-                    &mov_str,
-                    ImportState::Skipped,
-                    item.record.motion_id.as_deref(),
-                    None,
-                    0,
-                    None,
-                );
-            }
+            // The companion MOV travels with its photo and is logged with it.
+            set_motion_import_state(&mut st, &item, ImportState::Hashed);
             st.enqueue_import(&ImportQueueRow {
                 path: path_str,
-                size: item.record.size + item.record.motion_size.unwrap_or(0),
+                size: item.record.size,
                 mtime: item.primary_mtime_ms,
                 state,
                 asset_id: Some(item.record.id.clone()),
@@ -1185,8 +1165,132 @@ where
             let _ = flush_outbox(&mut st, s4.as_ref(), now);
         }
     }
+    if control.is_cancelled() {
+        if let Ok(mut st) = store.lock() {
+            let _ = st.cancel_unfinished_imports();
+        }
+    }
     on_progress(&report);
     Ok(report)
+}
+
+/// Largest untagged object compared byte for byte; bigger ones count as a
+/// clash rather than download the whole file to check.
+const UNTAGGED_VERIFY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What is already at `key`: nothing (`None`), this very file (`Some(true)`)
+/// or a different file (`Some(false)`). Uploads carry their SHA-256 as a tag;
+/// objects written before tags existed, or by another S3 tool, are compared
+/// by size and then by content.
+fn object_at_key(s4: &dyn ObjectStore, key: &str, local: &Path, sha256: &str) -> Result<Option<bool>> {
+    let Some(meta) = s4.head_object(key)? else {
+        return Ok(None);
+    };
+    if let Some(tag) = meta.content_sha256 {
+        return Ok(Some(tag == sha256));
+    }
+    let local_size = std::fs::metadata(local)?.len();
+    if meta.size != local_size || local_size > UNTAGGED_VERIFY_MAX_BYTES {
+        return Ok(Some(false));
+    }
+    Ok(s4
+        .get_object(key)?
+        .map(|bytes| crate::media::sha256_bytes(&bytes) == sha256))
+}
+
+/// Settle where this asset's files go and which still need uploading (spec
+/// section 4 name clash). An object at the planned key may be this very file,
+/// left by an interrupted run; otherwise it is another file with the same name
+/// and this one moves to `<name>-<hash8>.<ext>`. Returns
+/// `(upload_primary, upload_motion)`.
+fn plan_original_uploads(item: &mut PreparedImportAsset, s4: &dyn ObjectStore) -> Result<(bool, bool)> {
+    let check = |item: &PreparedImportAsset| -> Result<(Option<bool>, Option<bool>)> {
+        let primary = object_at_key(s4, &item.record.key, &item.primary_path, &item.record.id)?;
+        let motion = match (&item.record.motion_key, &item.motion_path, &item.record.motion_id) {
+            (Some(key), Some(path), Some(sha)) => object_at_key(s4, key, path, sha)?,
+            _ => None,
+        };
+        Ok((primary, motion))
+    };
+
+    let (mut primary, mut motion) = check(item)?;
+    let primary_clash = primary == Some(false);
+    let motion_clash = motion == Some(false);
+    if primary_clash || motion_clash {
+        item.apply_name_clash(primary_clash, motion_clash);
+        // The renamed keys may hold this file from an interrupted run too.
+        (primary, motion) = check(item)?;
+    }
+    Ok((
+        primary != Some(true),
+        item.record.motion_key.is_some() && motion != Some(true),
+    ))
+}
+
+/// Mark a Live Photo's MOV with the same import state as its photo, so an
+/// interrupted pair resumes as a pair.
+fn set_motion_import_state(store: &mut Store, item: &PreparedImportAsset, state: ImportState) {
+    if let Some(ref mov_path) = item.motion_path {
+        let _ = store.update_import_state(
+            &mov_path.to_string_lossy(),
+            state,
+            item.record.motion_id.as_deref(),
+            None,
+            0,
+            None,
+        );
+    }
+}
+
+/// Files an earlier import left unfinished, grouped by the album they were
+/// going into. Files that are no longer on disk (an unplugged drive) stay
+/// queued for the next time they appear.
+pub fn unfinished_imports(store: &Store) -> Result<Vec<(Option<String>, Vec<PathBuf>)>> {
+    let mut groups: BTreeMap<Option<String>, Vec<PathBuf>> = BTreeMap::new();
+    for (path, album_id) in store.unfinished_import_rows()? {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            groups.entry(album_id).or_default().push(path);
+        }
+    }
+    Ok(groups.into_iter().collect())
+}
+
+/// Resume every unfinished import (spec section 7: "Unplugging the disk,
+/// losing the network or quitting pauses it; the next run resumes").
+/// Returns the report of the last run, or `None` if there was nothing to do.
+#[allow(clippy::too_many_arguments)]
+pub fn resume_unfinished_imports<F>(
+    store: Arc<Mutex<Store>>,
+    s4: Arc<dyn ObjectStore>,
+    cache: Arc<Mutex<LocalCache>>,
+    control: Arc<ImportControl>,
+    now: DateTime<Utc>,
+    on_progress: F,
+) -> Result<Option<ImportRunReport>>
+where
+    F: Fn(&ImportRunReport) + Send + Sync,
+{
+    let groups = unfinished_imports(&store.lock().unwrap())?;
+    let mut last = None;
+    for (album_id, paths) in groups {
+        let rep = run_import_concurrent(
+            paths,
+            album_id.as_deref(),
+            Arc::clone(&store),
+            Arc::clone(&s4),
+            Arc::clone(&cache),
+            Arc::clone(&control),
+            now,
+            &on_progress,
+        )?;
+        let stop = rep.paused_offline || rep.stopped_space_full || control.is_cancelled();
+        last = Some(rep);
+        if stop {
+            break;
+        }
+    }
+    Ok(last)
 }
 
 fn upload_and_log_one_asset(
@@ -1201,12 +1305,7 @@ fn upload_and_log_one_asset(
     let base_delay = s4.config().retry_base_delay_ms;
 
     // Step 4b: Name clash check via S4 HEAD (spec section 4)
-    let primary_clashed = s4.head_object(&item.record.key)?.is_some();
-    let motion_clashed = match item.record.motion_key.as_deref() {
-        Some(mk) => s4.head_object(mk)?.is_some(),
-        None => false,
-    };
-    item.apply_name_clash(primary_clashed, motion_clashed);
+    let (upload_primary, upload_motion) = plan_original_uploads(item, s4)?;
 
     // Step 5: Generate thumbnails & store locally
     let thumbs = item.build_thumbnails();
@@ -1225,33 +1324,39 @@ fn upload_and_log_one_asset(
         None,
     )?;
 
-    upload_file_with_resume(
-        s4,
-        &item.primary_path,
-        &item.record.key,
-        "application/octet-stream",
-        initial_uid.as_deref(),
-        initial_parts,
-        5,
-        |uid, parts_done| {
-            let _ = store.update_import_state(
-                &path_str,
-                ImportState::Uploading,
-                Some(&item.record.id),
-                uid,
-                parts_done,
-                None,
-            );
-        },
-    )?;
+    if upload_primary {
+        upload_file_with_resume(
+            s4,
+            &item.primary_path,
+            &item.record.key,
+            "application/octet-stream",
+            Some(&item.record.id),
+            initial_uid.as_deref(),
+            initial_parts,
+            5,
+            |uid, parts_done| {
+                let _ = store.update_import_state(
+                    &path_str,
+                    ImportState::Uploading,
+                    Some(&item.record.id),
+                    uid,
+                    parts_done,
+                    None,
+                );
+            },
+        )?;
+    }
 
     // Upload Live Photo motion file if present
-    if let (Some(ref mov_path), Some(ref mov_key)) = (&item.motion_path, &item.record.motion_key) {
+    if let (true, Some(mov_path), Some(mov_key)) =
+        (upload_motion, &item.motion_path, &item.record.motion_key)
+    {
         upload_file_with_resume(
             s4,
             mov_path,
             mov_key,
             "video/quicktime",
+            item.record.motion_id.as_deref(),
             None,
             0,
             5,
@@ -1290,6 +1395,7 @@ fn upload_and_log_one_asset(
         1,
         None,
     )?;
+    set_motion_import_state(store, item, ImportState::Logged);
 
     // Remember where the original lives so thumbnails and viewing stay local
     let _ = store.connection().execute(
@@ -1329,12 +1435,7 @@ where
     }
 
     // Step 4b: Name clash check via S4 HEAD (no lock held!)
-    let primary_clashed = s4.head_object(&item.record.key)?.is_some();
-    let motion_clashed = match item.record.motion_key.as_deref() {
-        Some(mk) => s4.head_object(mk)?.is_some(),
-        None => false,
-    };
-    item.apply_name_clash(primary_clashed, motion_clashed);
+    let (upload_primary, upload_motion) = plan_original_uploads(item, s4)?;
 
     // Step 5: Generate thumbnails outside the DB lock
     let thumbs = item.build_thumbnails();
@@ -1358,36 +1459,42 @@ where
     on_state_change();
 
     // Step 6: Upload original without holding the DB lock across network I/O
-    upload_file_with_resume_cancel(
-        s4,
-        &item.primary_path,
-        &item.record.key,
-        "application/octet-stream",
-        initial_uid.as_deref(),
-        initial_parts,
-        5,
-        |uid, parts_done| {
-            if let Ok(mut st) = store.lock() {
-                let _ = st.update_import_state(
-                    &path_str,
-                    ImportState::Uploading,
-                    Some(&item.record.id),
-                    uid,
-                    parts_done,
-                    None,
-                );
-            }
-            on_state_change();
-        },
-        should_cancel,
-    )?;
+    if upload_primary {
+        upload_file_with_resume_cancel(
+            s4,
+            &item.primary_path,
+            &item.record.key,
+            "application/octet-stream",
+            Some(&item.record.id),
+            initial_uid.as_deref(),
+            initial_parts,
+            5,
+            |uid, parts_done| {
+                if let Ok(mut st) = store.lock() {
+                    let _ = st.update_import_state(
+                        &path_str,
+                        ImportState::Uploading,
+                        Some(&item.record.id),
+                        uid,
+                        parts_done,
+                        None,
+                    );
+                }
+                on_state_change();
+            },
+            should_cancel,
+        )?;
+    }
 
-    if let (Some(ref mov_path), Some(ref mov_key)) = (&item.motion_path, &item.record.motion_key) {
+    if let (true, Some(mov_path), Some(mov_key)) =
+        (upload_motion, &item.motion_path, &item.record.motion_key)
+    {
         upload_file_with_resume_cancel(
             s4,
             mov_path,
             mov_key,
             "video/quicktime",
+            item.record.motion_id.as_deref(),
             None,
             0,
             5,
@@ -1432,6 +1539,7 @@ where
             1,
             None,
         )?;
+        set_motion_import_state(&mut st, item, ImportState::Logged);
 
         // Remember where the original lives so thumbnails and viewing stay local
         let _ = st.connection().execute(
@@ -1513,6 +1621,7 @@ pub fn export_originals(
 mod tests {
     use super::*;
     use crate::cache::DEFAULT_CACHE_LIMIT_BYTES;
+    use crate::keys::original_key;
     use crate::media::sha256_bytes;
     use crate::ops::AssetKind;
     use crate::s4::{InMemoryObjectStore, S4Config};
@@ -1767,5 +1876,177 @@ mod tests {
         assert_eq!(rep.imported_count, 6);
         assert!(!control.is_running());
         assert_eq!(store.lock().unwrap().list_timeline(None, None).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn resume_continues_an_interrupted_import_without_duplicate_uploads() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        let names = [
+            "IMG_20240512_100000.JPG",
+            "IMG_20240512_100001.JPG",
+            "IMG_20240512_100002.JPG",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            fs::write(src_dir.0.join(name), format!("photo-{i}").as_bytes()).unwrap();
+        }
+
+        let mem = InMemoryObjectStore::new(S4Config::default());
+        let s4: Arc<dyn ObjectStore> = Arc::new(mem.clone());
+        let store = Arc::new(Mutex::new(Store::open_in_memory("mac-1").unwrap()));
+        let cache = Arc::new(Mutex::new(
+            LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap(),
+        ));
+        let control = Arc::new(ImportControl::new());
+        let run = |roots: Vec<PathBuf>| {
+            run_import_concurrent(
+                roots,
+                None,
+                Arc::clone(&store),
+                Arc::clone(&s4),
+                Arc::clone(&cache),
+                Arc::clone(&control),
+                t(10),
+                |_| {},
+            )
+            .unwrap()
+        };
+
+        // The network drops: everything is hashed, nothing is logged.
+        mem.set_offline(true);
+        assert!(run(vec![src_dir.0.clone()]).paused_offline);
+        let pending = unfinished_imports(&store.lock().unwrap()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.len(), 3);
+        mem.set_offline(false);
+
+        // Photo 0 had finished uploading just before the drop (tagged as itself);
+        // photo 1's name is taken by a different file.
+        let key0 = original_key(2024, 5, names[0]);
+        let photo0 = src_dir.0.join(names[0]);
+        mem.put_object_from_file(&key0, &photo0, "image/jpeg", Some(&sha256_file(&photo0).unwrap()))
+            .unwrap();
+        mem.put_object(&original_key(2024, 5, names[1]), b"someone else", "image/jpeg")
+            .unwrap();
+        // Photo 2 finished uploading before content tags existed.
+        mem.put_object(&original_key(2024, 5, names[2]), b"photo-2", "image/jpeg")
+            .unwrap();
+
+        let rep = resume_unfinished_imports(
+            Arc::clone(&store),
+            Arc::clone(&s4),
+            Arc::clone(&cache),
+            Arc::clone(&control),
+            t(20),
+            |_| {},
+        )
+        .unwrap()
+        .expect("there was work to resume");
+        assert_eq!(rep.imported_count, 3);
+        assert!(unfinished_imports(&store.lock().unwrap()).unwrap().is_empty());
+        assert_eq!(store.lock().unwrap().list_timeline(None, None).unwrap().len(), 3);
+
+        // Photos 0 and 2 were not uploaded a second time; photo 1 moved aside.
+        let originals: Vec<String> = mem
+            .list_objects("originals/")
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        assert_eq!(originals.len(), 4, "{originals:?}");
+        assert!(originals.contains(&key0));
+        assert_eq!(originals.iter().filter(|k| k.contains("IMG_20240512_100001")).count(), 2);
+
+        // Nothing left: a second resume is a no-op.
+        let again = resume_unfinished_imports(store, s4, cache, control, t(30), |_| {}).unwrap();
+        assert!(again.is_none());
+    }
+
+    #[test]
+    fn live_photo_pair_resumes_as_a_pair() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        let photo = src_dir.0.join("IMG_20240512_120000.HEIC");
+        let motion = src_dir.0.join("IMG_20240512_120000.MOV");
+        fs::write(&photo, b"still-bytes").unwrap();
+        fs::write(&motion, b"motion-bytes").unwrap();
+
+        let mem = InMemoryObjectStore::new(S4Config::default());
+        let s4: Arc<dyn ObjectStore> = Arc::new(mem.clone());
+        let store = Arc::new(Mutex::new(Store::open_in_memory("mac-1").unwrap()));
+        let cache = Arc::new(Mutex::new(
+            LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap(),
+        ));
+        let control = Arc::new(ImportControl::new());
+
+        mem.set_offline(true);
+        let rep = run_import_concurrent(
+            [&src_dir.0],
+            None,
+            Arc::clone(&store),
+            Arc::clone(&s4),
+            Arc::clone(&cache),
+            Arc::clone(&control),
+            t(10),
+            |_| {},
+        )
+        .unwrap();
+        assert!(rep.paused_offline);
+        // Both halves are still queued; the MOV was not written off as skipped.
+        let pending = unfinished_imports(&store.lock().unwrap()).unwrap();
+        assert_eq!(pending[0].1, vec![photo.clone(), motion.clone()]);
+
+        mem.set_offline(false);
+        resume_unfinished_imports(Arc::clone(&store), s4, cache, control, t(20), |_| {})
+            .unwrap();
+
+        let st = store.lock().unwrap();
+        let assets = st.list_timeline(None, None).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].kind, AssetKind::Live);
+        let queue = st.list_import_queue().unwrap();
+        assert!(queue.iter().all(|row| row.state == ImportState::Logged), "{queue:?}");
+    }
+
+    #[test]
+    fn cancelled_import_is_not_resumed_automatically() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        for i in 0..4 {
+            fs::write(
+                src_dir.0.join(format!("IMG_20240512_11000{i}.JPG")),
+                format!("cancel-{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        let s4: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new(S4Config::default()));
+        let store = Arc::new(Mutex::new(Store::open_in_memory("mac-1").unwrap()));
+        let cache = Arc::new(Mutex::new(
+            LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap(),
+        ));
+        let control = Arc::new(ImportControl::new());
+
+        // The user presses Cancel as soon as the run reports progress.
+        let canceller = Arc::clone(&control);
+        run_import_concurrent(
+            [&src_dir.0],
+            None,
+            Arc::clone(&store),
+            s4,
+            cache,
+            Arc::clone(&control),
+            t(10),
+            move |_| canceller.cancel(),
+        )
+        .unwrap();
+
+        let st = store.lock().unwrap();
+        assert!(unfinished_imports(&st).unwrap().is_empty());
+        let queue = st.list_import_queue().unwrap();
+        assert!(queue
+            .iter()
+            .filter(|row| row.state != ImportState::Logged)
+            .all(|row| row.state == ImportState::Failed
+                && row.error.as_deref().is_some_and(|e| e.starts_with("Cancelled"))));
     }
 }

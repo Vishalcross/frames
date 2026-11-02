@@ -49,9 +49,6 @@ pub struct S4Config {
     /// Base delay in milliseconds for exponential backoff retries (default 1,000 ms).
     #[serde(default = "default_retry_base_delay_ms")]
     pub retry_base_delay_ms: u64,
-    /// Optional Unix domain socket path for local S3/MinIO transport testing (`curl --unix-socket`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unix_socket_path: Option<String>,
 }
 
 impl Default for S4Config {
@@ -66,7 +63,6 @@ impl Default for S4Config {
             multipart_threshold_bytes: DEFAULT_MULTIPART_THRESHOLD_BYTES,
             multipart_part_size_bytes: DEFAULT_MULTIPART_PART_SIZE_BYTES,
             retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
-            unix_socket_path: None,
         }
     }
 }
@@ -112,7 +108,16 @@ pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
     pub etag: Option<String>,
+    /// SHA-256 tag written with the upload ([`CONTENT_SHA256_HEADER`]); only
+    /// `head_object` reports it.
+    #[serde(default)]
+    pub content_sha256: Option<String>,
 }
+
+/// User metadata naming an original's SHA-256 (its asset id). A HEAD that
+/// finds it tells "this file, uploaded by an interrupted run" apart from
+/// "another file with the same name" (spec section 4 name clash).
+pub const CONTENT_SHA256_HEADER: &str = "x-amz-meta-sha256";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncompleteMultipartUpload {
@@ -392,13 +397,22 @@ pub trait ObjectStore: Send + Sync {
     }
 
     /// Stream a local file directly into a single `PUT` object request without
-    /// buffering the entire file in RAM.
-    fn put_object_from_file(&self, key: &str, path: &Path, content_type: &str) -> Result<String> {
-        let bytes = std::fs::read(path)?;
-        self.put_object(key, &bytes, content_type)
-    }
+    /// buffering the entire file in RAM, tagged with `content_sha256` if given.
+    fn put_object_from_file(
+        &self,
+        key: &str,
+        path: &Path,
+        content_type: &str,
+        content_sha256: Option<&str>,
+    ) -> Result<String>;
 
-    fn create_multipart_upload(&self, key: &str, content_type: &str) -> Result<String>;
+    /// Start a multipart upload; the finished object carries `content_sha256`.
+    fn create_multipart_upload(
+        &self,
+        key: &str,
+        content_type: &str,
+        content_sha256: Option<&str>,
+    ) -> Result<String>;
     fn upload_part(
         &self,
         key: &str,
@@ -432,6 +446,7 @@ pub fn upload_file_with_resume<F>(
     path: &Path,
     key: &str,
     content_type: &str,
+    content_sha256: Option<&str>,
     existing_upload_id: Option<&str>,
     parts_already_done: u32,
     max_retries: u32,
@@ -445,6 +460,7 @@ where
         path,
         key,
         content_type,
+        content_sha256,
         existing_upload_id,
         parts_already_done,
         max_retries,
@@ -461,6 +477,7 @@ pub fn upload_file_with_resume_cancel<F, C>(
     path: &Path,
     key: &str,
     content_type: &str,
+    content_sha256: Option<&str>,
     existing_upload_id: Option<&str>,
     parts_already_done: u32,
     max_retries: u32,
@@ -485,7 +502,9 @@ where
             if should_cancel() {
                 return Err(S4Error::Cancelled);
             }
-            store.put_object_from_file(key, path, content_type).map(|_| ())
+            store
+                .put_object_from_file(key, path, content_type, content_sha256)
+                .map(|_| ())
         })?;
         on_progress(None, 1);
         return Ok(());
@@ -514,7 +533,7 @@ where
                         if should_cancel() {
                             return Err(S4Error::Cancelled);
                         }
-                        store.create_multipart_upload(key, content_type)
+                        store.create_multipart_upload(key, content_type, content_sha256)
                     })?;
                     (new_id, BTreeMap::new())
                 }
@@ -526,7 +545,7 @@ where
                 if should_cancel() {
                     return Err(S4Error::Cancelled);
                 }
-                store.create_multipart_upload(key, content_type)
+                store.create_multipart_upload(key, content_type, content_sha256)
             })?;
             (new_id, BTreeMap::new())
         }
@@ -625,6 +644,10 @@ type InMemoryPartMap = BTreeMap<u32, (String, Vec<u8>)>;
 #[derive(Default)]
 struct InMemoryBucketState {
     objects: BTreeMap<String, Vec<u8>>,
+    /// key -> `CONTENT_SHA256_HEADER` value
+    tags: BTreeMap<String, String>,
+    /// upload_id -> tag for the object the upload will complete
+    pending_tags: BTreeMap<String, String>,
     multiparts: BTreeMap<String, (String, InMemoryPartMap)>, // upload_id -> (key, part_num -> (etag, bytes))
     next_upload_seq: u64,
     upload_part_calls: u64,
@@ -678,6 +701,19 @@ impl InMemoryObjectStore {
         Ok(())
     }
 
+    /// Record (or clear) the content tag of an existing object.
+    pub fn set_tag(&self, key: &str, content_sha256: Option<&str>) {
+        let mut st = self.state.lock().unwrap();
+        match content_sha256 {
+            Some(tag) if st.objects.contains_key(key) => {
+                st.tags.insert(key.to_string(), tag.to_string());
+            }
+            _ => {
+                st.tags.remove(key);
+            }
+        }
+    }
+
     pub fn total_used_bytes(&self) -> u64 {
         let st = self.state.lock().unwrap();
         st.objects.values().map(|v| v.len() as u64).sum()
@@ -692,6 +728,7 @@ impl ObjectStore for InMemoryObjectStore {
             key: key.to_string(),
             size: bytes.len() as u64,
             etag: Some(format!("\"{}\"", sha256_hex(bytes))),
+            content_sha256: st.tags.get(key).cloned(),
         }))
     }
 
@@ -741,6 +778,20 @@ impl ObjectStore for InMemoryObjectStore {
         }
         let etag = format!("\"{}\"", sha256_hex(body));
         st.objects.insert(key.to_string(), body.to_vec());
+        st.tags.remove(key);
+        Ok(etag)
+    }
+
+    fn put_object_from_file(
+        &self,
+        key: &str,
+        path: &Path,
+        content_type: &str,
+        content_sha256: Option<&str>,
+    ) -> Result<String> {
+        let bytes = std::fs::read(path)?;
+        let etag = self.put_object(key, &bytes, content_type)?;
+        self.set_tag(key, content_sha256);
         Ok(etag)
     }
 
@@ -748,6 +799,7 @@ impl ObjectStore for InMemoryObjectStore {
         let mut st = self.state.lock().unwrap();
         self.check_faults(&mut st)?;
         st.objects.remove(key);
+        st.tags.remove(key);
         Ok(())
     }
 
@@ -762,16 +814,25 @@ impl ObjectStore for InMemoryObjectStore {
                 key: k.clone(),
                 size: v.len() as u64,
                 etag: Some(format!("\"{}\"", sha256_hex(v))),
+                content_sha256: None,
             })
             .collect();
         Ok(items)
     }
 
-    fn create_multipart_upload(&self, key: &str, _content_type: &str) -> Result<String> {
+    fn create_multipart_upload(
+        &self,
+        key: &str,
+        _content_type: &str,
+        content_sha256: Option<&str>,
+    ) -> Result<String> {
         let mut st = self.state.lock().unwrap();
         self.check_faults(&mut st)?;
         st.next_upload_seq += 1;
         let upload_id = format!("mp-{}", st.next_upload_seq);
+        if let Some(tag) = content_sha256 {
+            st.pending_tags.insert(upload_id.clone(), tag.to_string());
+        }
         st.multiparts
             .insert(upload_id.clone(), (key.to_string(), BTreeMap::new()));
         Ok(upload_id)
@@ -865,6 +926,10 @@ impl ObjectStore for InMemoryObjectStore {
             combined.extend_from_slice(&bytes);
         }
         st.objects.insert(key.to_string(), combined);
+        match st.pending_tags.remove(upload_id) {
+            Some(tag) => st.tags.insert(key.to_string(), tag),
+            None => st.tags.remove(key),
+        };
         Ok(())
     }
 
@@ -898,78 +963,100 @@ impl ObjectStore for InMemoryObjectStore {
 }
 
 // =============================================================================
-// Production S4 HTTP Client (SigV4 + Native OS curl HTTPS Transport)
+// Production S4 HTTP Client (SigV4 over a pooled HTTPS agent)
 // =============================================================================
+
+/// Connection setup budget. Past it the bucket counts as unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Time allowed for the server to start answering once the request is sent.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// A transfer that moves no bytes for this long has stalled and is retried.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct S4Client {
     config: S4Config,
+    agent: ureq::Agent,
 }
 
-/// Build the `curl` CLI arguments for an HTTP request so tests can inspect
-/// exact flags (`-I` for HEAD, timeouts, and body streaming).
-pub fn build_curl_args(
-    method: &str,
-    url: &str,
-    signed_headers: &BTreeMap<String, String>,
-    has_body: bool,
-) -> Vec<String> {
-    let mut args = vec![
-        "-sS".to_string(),
-        "-i".to_string(),
-        "--connect-timeout".to_string(),
-        "15".to_string(),
-        "--max-time".to_string(),
-        "300".to_string(),
-        "--speed-time".to_string(),
-        "30".to_string(),
-        "--speed-limit".to_string(),
-        "1024".to_string(),
-    ];
-    if method == "HEAD" {
-        args.push("-I".to_string());
-    } else {
-        args.push("-X".to_string());
-        args.push(method.to_string());
-    }
-    for (k, v) in signed_headers {
-        args.push("-H".to_string());
-        args.push(format!("{k}: {v}"));
-    }
-    if has_body && method != "HEAD" {
-        args.push("--data-binary".to_string());
-        args.push("@-".to_string());
-    }
-    args.push(url.to_string());
-    args
+/// A request body: nothing, bytes in memory, or a file streamed from disk.
+enum RequestBody<'a> {
+    Empty,
+    Bytes(&'a [u8]),
+    File(&'a std::fs::File),
 }
 
-/// Classify a non-zero `curl` exit code so only true network unreachability
-/// (`CURLE_COULDNT_RESOLVE_HOST = 6`, `CURLE_COULDNT_CONNECT = 7`) reports as
-/// `S4Error::Offline`, while transient transfer drops/timeouts (`18`, `28`, `52`,
-/// `55`, `56`) report as `S4Error::TransientTransport` (retryable without
-/// marking the app offline), and TLS/URL/configuration failures report as
-/// `S4Error::Transport` (non-retryable).
-pub fn classify_curl_exit_code(exit_code: Option<i32>, stderr: &str) -> S4Error {
-    let trimmed = stderr.trim();
-    let detail = if trimmed.is_empty() {
-        format!("curl exit code {:?}", exit_code)
-    } else {
-        format!("{trimmed} (curl exit {:?})", exit_code)
-    };
-    match exit_code {
-        Some(6) | Some(7) => S4Error::Offline(detail),
-        Some(18) | Some(28) | Some(52) | Some(55) | Some(56) => {
-            S4Error::TransientTransport(detail)
-        }
+/// Map a transport failure onto the spec's error classes (section 11): only
+/// DNS or connect failures mean "offline"; drops and stalls are retried
+/// without flagging the app offline; TLS and protocol errors are not retried.
+pub fn classify_transport_error(err: ureq::Error) -> S4Error {
+    use std::io::ErrorKind;
+    let detail = err.to_string();
+    match err {
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => S4Error::Offline(detail),
+        ureq::Error::Timeout(_) => S4Error::TransientTransport(detail),
+        ureq::Error::Io(e) => match e.kind() {
+            ErrorKind::ConnectionRefused
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::AddrNotAvailable => S4Error::Offline(detail),
+            _ => S4Error::TransientTransport(detail),
+        },
         _ => S4Error::Transport(detail),
     }
 }
 
 impl S4Client {
     pub fn new(config: S4Config) -> Self {
-        Self { config }
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+            .timeout_per_read(Some(STALL_TIMEOUT))
+            .timeout_per_write(Some(STALL_TIMEOUT))
+            .max_idle_connections_per_host(16)
+            .build()
+            .into();
+        Self { config, agent }
     }
 
+    /// Sign and send one request; the response body is left unread.
+    fn send(
+        &self,
+        method: &str,
+        key: &str,
+        query: &BTreeMap<String, String>,
+        extra_headers: &BTreeMap<String, String>,
+        payload_hash: &str,
+        body: RequestBody<'_>,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        let (url, signed_headers) = sign_s4_request(
+            &self.config,
+            method,
+            key,
+            query,
+            extra_headers,
+            payload_hash,
+            Utc::now(),
+        );
+        let mut req = ureq::http::Request::builder().method(method).uri(&url);
+        for (k, v) in &signed_headers {
+            // The agent writes Host and Content-Length from the URL and body.
+            if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let bad_request = |e: ureq::http::Error| S4Error::Transport(e.to_string());
+        let sent = match body {
+            RequestBody::Empty => self.agent.run(req.body(()).map_err(bad_request)?),
+            RequestBody::Bytes(b) => self.agent.run(req.body(b).map_err(bad_request)?),
+            RequestBody::File(f) => self.agent.run(req.body(f).map_err(bad_request)?),
+        };
+        sent.map_err(classify_transport_error)
+    }
+
+    /// Send a request with an in-memory body and read the whole response.
     fn execute(
         &self,
         method: &str,
@@ -978,85 +1065,38 @@ impl S4Client {
         extra_headers: &BTreeMap<String, String>,
         body: &[u8],
     ) -> Result<(u16, BTreeMap<String, String>, Vec<u8>)> {
-        let payload_hash = sha256_hex(body);
-        let (url, signed_headers) = sign_s4_request(
-            &self.config,
-            method,
-            key,
-            query,
-            extra_headers,
-            &payload_hash,
-            Utc::now(),
-        );
-
-        let send_body = !body.is_empty() || matches!(method, "PUT" | "POST");
-        let args = build_curl_args(method, &url, &signed_headers, send_body);
-
-        let mut cmd = crate::media::spawn_hidden_command("curl");
-        if let Some(ref sock) = self.config.unix_socket_path {
-            cmd.arg("--unix-socket").arg(sock);
-        }
-        cmd.args(&args);
-
-        let mut child = cmd
-            .stdin(if send_body && method != "HEAD" {
-                std::process::Stdio::piped()
-            } else {
-                std::process::Stdio::null()
-            })
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| S4Error::Transport(format!("failed to launch curl: {e}")))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(body);
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| S4Error::Transport(format!("failed waiting on curl: {e}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(classify_curl_exit_code(output.status.code(), &stderr));
-        }
-
-        parse_raw_http_response(&output.stdout)
+        // PUT and POST always carry a Content-Length, even when empty.
+        let request_body = if body.is_empty() && !matches!(method, "PUT" | "POST") {
+            RequestBody::Empty
+        } else {
+            RequestBody::Bytes(body)
+        };
+        let resp = self.send(method, key, query, extra_headers, &sha256_hex(body), request_body)?;
+        read_response(resp)
     }
 }
 
-fn parse_raw_http_response(raw: &[u8]) -> Result<(u16, BTreeMap<String, String>, Vec<u8>)> {
-    // Skip any 100 Continue headers if present
-    let mut slice = raw;
-    loop {
-        let Some(sep) = slice.windows(4).position(|w| w == b"\r\n\r\n") else {
-            return Err(S4Error::Http {
-                status: 0,
-                message: "malformed HTTP response".into(),
-            });
-        };
-        let header_block = String::from_utf8_lossy(&slice[..sep]);
-        let body = &slice[sep + 4..];
-        let mut lines = header_block.lines();
-        let status_line = lines.next().unwrap_or("");
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if status == 100 {
-            slice = body;
-            continue;
-        }
-        let mut headers = BTreeMap::new();
-        for line in lines {
-            if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-            }
-        }
-        return Ok((status, headers, body.to_vec()));
-    }
+fn read_response(
+    mut resp: ureq::http::Response<ureq::Body>,
+) -> Result<(u16, BTreeMap<String, String>, Vec<u8>)> {
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_ascii_lowercase(),
+                v.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let body = resp
+        .body_mut()
+        .with_config()
+        .limit(u64::MAX)
+        .read_to_vec()
+        .map_err(classify_transport_error)?;
+    Ok((status, headers, body))
 }
 
 fn check_s3_status(status: u16, body: &[u8]) -> Result<()> {
@@ -1096,6 +1136,7 @@ impl ObjectStore for S4Client {
             key: key.to_string(),
             size,
             etag,
+            content_sha256: headers.get(CONTENT_SHA256_HEADER).cloned(),
         }))
     }
 
@@ -1109,124 +1150,83 @@ impl ObjectStore for S4Client {
         Ok(Some(body))
     }
 
+    /// Stream straight to disk through a temp file, so a multi-GB original
+    /// never sits in memory and a failed download never leaves a partial file.
     fn get_object_to_file(&self, key: &str, dest: &Path) -> Result<bool> {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_dest = dest.with_extension(format!("part-{}", fastrand::u64(..)));
-        let empty_hash = sha256_hex(&[]);
-        let (url, signed_headers) = sign_s4_request(
-            &self.config,
+        use std::io::{Read, Write};
+
+        let mut resp = self.send(
             "GET",
             key,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &empty_hash,
-            Utc::now(),
-        );
-
-        let mut cmd = crate::media::spawn_hidden_command("curl");
-        if let Some(ref sock) = self.config.unix_socket_path {
-            cmd.arg("--unix-socket").arg(sock);
-        }
-        cmd.args([
-            "-sS",
-            "--connect-timeout",
-            "15",
-            "--max-time",
-            "3600",
-            "--speed-time",
-            "30",
-            "--speed-limit",
-            "1024",
-            "-D",
-            "-",
-            "-o",
-        ]);
-        cmd.arg(&tmp_dest);
-        for (k, v) in &signed_headers {
-            cmd.arg("-H").arg(format!("{k}: {v}"));
-        }
-        cmd.arg(&url);
-
-        let output = cmd
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| S4Error::Transport(format!("failed to launch curl: {e}")))?;
-
-        if !output.status.success() {
-            let _ = std::fs::remove_file(&tmp_dest);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(classify_curl_exit_code(output.status.code(), &stderr));
-        }
-
-        let (status, _, _) = parse_raw_http_response(&output.stdout)?;
+            &sha256_hex(&[]),
+            RequestBody::Empty,
+        )?;
+        let status = resp.status().as_u16();
         if status == 404 {
-            let _ = std::fs::remove_file(&tmp_dest);
             return Ok(false);
         }
         if !(200..300).contains(&status) {
-            let err_body = std::fs::read(&tmp_dest).unwrap_or_default();
-            let _ = std::fs::remove_file(&tmp_dest);
-            check_s3_status(status, &err_body)?;
+            let (_, _, body) = read_response(resp)?;
+            check_s3_status(status, &body)?;
+            return Ok(false);
         }
 
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_dest = dest.with_extension(format!("part-{}", fastrand::u64(..)));
+        let copied = (|| -> Result<()> {
+            let mut out = std::fs::File::create(&tmp_dest)?;
+            let mut reader = resp.body_mut().as_reader();
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| S4Error::TransientTransport(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])?;
+            }
+            out.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = copied {
+            let _ = std::fs::remove_file(&tmp_dest);
+            return Err(err);
+        }
         std::fs::rename(&tmp_dest, dest)?;
         Ok(true)
     }
 
-    fn put_object_from_file(&self, key: &str, path: &Path, content_type: &str) -> Result<String> {
+    /// Single PUT streamed from disk (files above the multipart threshold go
+    /// through [`upload_file_with_resume`] instead).
+    fn put_object_from_file(
+        &self,
+        key: &str,
+        path: &Path,
+        content_type: &str,
+        content_sha256: Option<&str>,
+    ) -> Result<String> {
         let payload_hash = crate::media::sha256_file(path)?;
-        let file_size = std::fs::metadata(path)?.len();
+        let file = std::fs::File::open(path)?;
         let mut extra = BTreeMap::new();
         extra.insert("Content-Type".to_string(), content_type.to_string());
-        extra.insert("Content-Length".to_string(), file_size.to_string());
-
-        let (url, signed_headers) = sign_s4_request(
-            &self.config,
+        if let Some(tag) = content_sha256 {
+            extra.insert(CONTENT_SHA256_HEADER.to_string(), tag.to_string());
+        }
+        let resp = self.send(
             "PUT",
             key,
             &BTreeMap::new(),
             &extra,
             &payload_hash,
-            Utc::now(),
-        );
-
-        let mut cmd = crate::media::spawn_hidden_command("curl");
-        if let Some(ref sock) = self.config.unix_socket_path {
-            cmd.arg("--unix-socket").arg(sock);
-        }
-        cmd.args([
-            "-sS",
-            "-i",
-            "--connect-timeout",
-            "15",
-            "--max-time",
-            "3600",
-            "--speed-time",
-            "30",
-            "--speed-limit",
-            "1024",
-            "-T",
-        ]);
-        cmd.arg(path);
-        for (k, v) in &signed_headers {
-            cmd.arg("-H").arg(format!("{k}: {v}"));
-        }
-        cmd.arg(&url);
-
-        let output = cmd
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| S4Error::Transport(format!("failed to launch curl: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(classify_curl_exit_code(output.status.code(), &stderr));
-        }
-
-        let (status, headers, resp_body) = parse_raw_http_response(&output.stdout)?;
-        check_s3_status(status, &resp_body)?;
+            RequestBody::File(&file),
+        )?;
+        let (status, headers, body) = read_response(resp)?;
+        check_s3_status(status, &body)?;
         Ok(headers.get("etag").cloned().unwrap_or_default())
     }
 
@@ -1296,11 +1296,19 @@ impl ObjectStore for S4Client {
         Ok(all)
     }
 
-    fn create_multipart_upload(&self, key: &str, content_type: &str) -> Result<String> {
+    fn create_multipart_upload(
+        &self,
+        key: &str,
+        content_type: &str,
+        content_sha256: Option<&str>,
+    ) -> Result<String> {
         let mut query = BTreeMap::new();
         query.insert("uploads".to_string(), String::new());
         let mut extra = BTreeMap::new();
         extra.insert("Content-Type".to_string(), content_type.to_string());
+        if let Some(tag) = content_sha256 {
+            extra.insert(CONTENT_SHA256_HEADER.to_string(), tag.to_string());
+        }
         let (status, _, body) = self.execute("POST", key, &query, &extra, &[])?;
         check_s3_status(status, &body)?;
         let xml = String::from_utf8_lossy(&body);
@@ -1418,7 +1426,12 @@ pub fn parse_list_objects_v2_xml(xml: &str) -> (Vec<ObjectMeta>, Option<String>)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             let etag = extract_xml_tag(block, "ETag");
-            items.push(ObjectMeta { key, size, etag });
+            items.push(ObjectMeta {
+                key,
+                size,
+                etag,
+                content_sha256: None,
+            });
         }
         rest = &after[end + 11..];
     }
@@ -1762,7 +1775,7 @@ mod tests {
 
         // Pre-create a multipart upload and upload part 1 (5 MB) before an "interruption"
         let key = "originals/2024/05/CLIP.MOV";
-        let uid = store.create_multipart_upload(key, "video/quicktime").unwrap();
+        let uid = store.create_multipart_upload(key, "video/quicktime", None).unwrap();
         let part1 = vec![b'A'; 5 * 1024 * 1024];
         let part2 = vec![b'B'; 1024];
         let _etag1 = store.upload_part(key, &uid, 1, &part1).unwrap();
@@ -1785,6 +1798,7 @@ mod tests {
             &temp_path,
             key,
             "video/quicktime",
+            None,
             Some(&uid),
             1,
             4,
@@ -1801,16 +1815,6 @@ mod tests {
         assert_eq!(&fetched[..16], &full_data[..16]);
         assert_eq!(&fetched[fetched.len() - 16..], &full_data[full_data.len() - 16..]);
         assert!(store.list_multipart_uploads().unwrap().is_empty());
-    }
-
-    #[test]
-    fn head_curl_args_use_dash_cap_i_and_timeouts() {
-        let headers = BTreeMap::new();
-        let head_args = build_curl_args("HEAD", "https://s4.example/bucket/key", &headers, false);
-        assert!(head_args.contains(&"-I".to_string()));
-        assert!(!head_args.contains(&"--data-binary".to_string()));
-        assert!(head_args.contains(&"--connect-timeout".to_string()));
-        assert!(head_args.contains(&"--max-time".to_string()));
     }
 
     #[test]
@@ -1842,22 +1846,40 @@ mod tests {
     }
 
     #[test]
-    fn curl_exit_codes_distinguish_offline_timeout_and_tls_errors() {
-        let dns_err = classify_curl_exit_code(Some(6), "Could not resolve host");
-        assert!(matches!(dns_err, S4Error::Offline(_)));
-        assert!(dns_err.is_retryable());
+    fn transport_errors_distinguish_offline_transient_and_fatal() {
+        use std::io::{Error as IoError, ErrorKind};
 
-        let conn_err = classify_curl_exit_code(Some(7), "Failed to connect");
-        assert!(matches!(conn_err, S4Error::Offline(_)));
-        assert!(conn_err.is_retryable());
+        for offline in [
+            ureq::Error::HostNotFound,
+            ureq::Error::ConnectionFailed,
+            ureq::Error::Io(IoError::from(ErrorKind::ConnectionRefused)),
+        ] {
+            let err = classify_transport_error(offline);
+            assert!(matches!(err, S4Error::Offline(_)), "{err}");
+            assert!(err.is_retryable());
+        }
+        for transient in [
+            ureq::Error::Timeout(ureq::Timeout::RecvBody),
+            ureq::Error::Io(IoError::from(ErrorKind::ConnectionReset)),
+        ] {
+            let err = classify_transport_error(transient);
+            assert!(matches!(err, S4Error::TransientTransport(_)), "{err}");
+            assert!(err.is_retryable());
+        }
+        let fatal = classify_transport_error(ureq::Error::BadUri("no scheme".into()));
+        assert!(matches!(fatal, S4Error::Transport(_)));
+        assert!(!fatal.is_retryable());
+    }
 
-        let timeout_err = classify_curl_exit_code(Some(28), "Operation timed out");
-        assert!(matches!(timeout_err, S4Error::TransientTransport(_)));
-        assert!(timeout_err.is_retryable());
-
-        let tls_err = classify_curl_exit_code(Some(60), "SSL peer certificate was not OK");
-        assert!(matches!(tls_err, S4Error::Transport(_)));
-        assert!(!tls_err.is_retryable());
+    #[test]
+    fn unreachable_endpoint_reports_offline() {
+        // Nothing listens on port 1; the connect is refused at once.
+        let client = S4Client::new(S4Config {
+            endpoint: "http://127.0.0.1:1".into(),
+            ..Default::default()
+        });
+        let err = client.head_object("thumbs/x/s.webp").unwrap_err();
+        assert!(matches!(err, S4Error::Offline(_)), "{err}");
     }
 
     #[test]
@@ -1889,6 +1911,7 @@ mod tests {
             key,
             "video/quicktime",
             None,
+            None,
             0,
             3,
             |uid, parts_done| {
@@ -1909,6 +1932,37 @@ mod tests {
         let uid = recorded_upload_id.expect("upload_id should be recorded before cancel");
         let parts = store.list_parts(key, &uid).unwrap();
         assert_eq!(parts.len(), 1);
+    }
+
+    /// Split a raw HTTP/1.1 response (as written by the fake server below)
+    /// into status, lowercase headers and body, skipping `100 Continue`.
+    fn parse_raw_http_response(raw: &[u8]) -> Result<(u16, BTreeMap<String, String>, Vec<u8>)> {
+        let mut slice = raw;
+        loop {
+            let Some(sep) = slice.windows(4).position(|w| w == b"\r\n\r\n") else {
+                return Err(S4Error::Http {
+                    status: 0,
+                    message: "malformed HTTP response".into(),
+                });
+            };
+            let header_block = String::from_utf8_lossy(&slice[..sep]);
+            let body = &slice[sep + 4..];
+            let mut lines = header_block.lines();
+            let status: u16 = lines
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if status == 100 {
+                slice = body;
+                continue;
+            }
+            let headers = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            return Ok((status, headers, body.to_vec()));
+        }
     }
 
     fn serve_one_s3_http_conn<S: std::io::Read + std::io::Write>(
@@ -2021,6 +2075,9 @@ mod tests {
                     if let Some(etag) = meta.etag {
                         h.push(("ETag", etag));
                     }
+                    if let Some(tag) = meta.content_sha256 {
+                        h.push((CONTENT_SHA256_HEADER, tag));
+                    }
                     let dummy = vec![0u8; meta.size as usize];
                     write_resp(&mut stream, 200, "OK", &h, &dummy, true);
                 }
@@ -2107,11 +2164,18 @@ mod tests {
                 }
             }
             "PUT" => match backing_srv.put_object(&key, &body, "application/octet-stream") {
-                Ok(etag) => write_resp(&mut stream, 200, "OK", &[("ETag", etag)], b"", false),
+                Ok(etag) => {
+                    backing_srv.set_tag(&key, headers.get(CONTENT_SHA256_HEADER).map(String::as_str));
+                    write_resp(&mut stream, 200, "OK", &[("ETag", etag)], b"", false)
+                }
                 Err(_) => write_resp(&mut stream, 503, "SlowDown", &[], b"busy", false),
             },
             "POST" if qmap.contains_key("uploads") => {
-                match backing_srv.create_multipart_upload(&key, "application/octet-stream") {
+                match backing_srv.create_multipart_upload(
+                    &key,
+                    "application/octet-stream",
+                    headers.get(CONTENT_SHA256_HEADER).map(String::as_str),
+                ) {
                     Ok(uid) => {
                         let xml = format!(
                             "<InitiateMultipartUploadResult><UploadId>{uid}</UploadId></InitiateMultipartUploadResult>"
@@ -2277,26 +2341,27 @@ mod tests {
         // 1. Single-PUT file upload & get_object_to_file + Range + HEAD + ListObjectsV2
         let small_src = std::env::temp_dir().join(format!("frames-s3-small-{}", fastrand::u64(..)));
         let small_dst = std::env::temp_dir().join(format!("frames-s3-dst-{}", fastrand::u64(..)));
-        std::fs::write(&small_src, b"hello real curl s4 transport").unwrap();
+        std::fs::write(&small_src, b"hello real http s4 transport").unwrap();
 
         client
-            .put_object_from_file("thumbs/abc/s.webp", &small_src, "image/webp")
+            .put_object_from_file("thumbs/abc/s.webp", &small_src, "image/webp", Some("abc123"))
             .unwrap();
         let head = client.head_object("thumbs/abc/s.webp").unwrap().unwrap();
         assert_eq!(head.size, 28);
+        assert_eq!(head.content_sha256.as_deref(), Some("abc123"));
 
         let range_bytes = client
             .get_object_range("thumbs/abc/s.webp", 6, Some(14))
             .unwrap()
             .unwrap();
-        assert_eq!(&range_bytes, b"real curl");
+        assert_eq!(&range_bytes, b"real http");
 
         assert!(client
             .get_object_to_file("thumbs/abc/s.webp", &small_dst)
             .unwrap());
         assert_eq!(
             std::fs::read(&small_dst).unwrap(),
-            b"hello real curl s4 transport"
+            b"hello real http s4 transport"
         );
         let _ = std::fs::remove_file(&small_src);
         let _ = std::fs::remove_file(&small_dst);
@@ -2305,10 +2370,10 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].key, "thumbs/abc/s.webp");
 
-        // 2. Resumable multipart upload over real HTTP curl with 503 retry + ListParts
+        // 2. Resumable multipart upload over real HTTP with 503 retry + ListParts
         let mp_key = "originals/2026/10/CLIP 01.MOV";
         let uid = client
-            .create_multipart_upload(mp_key, "video/quicktime")
+            .create_multipart_upload(mp_key, "video/quicktime", Some("mp-sha"))
             .unwrap();
         let part1 = vec![b'M'; 5 * 1024 * 1024];
         let part2 = vec![b'N'; 4096];
@@ -2327,6 +2392,7 @@ mod tests {
             &mp_path,
             mp_key,
             "video/quicktime",
+            Some("mp-sha"),
             Some(&uid),
             1,
             3,
@@ -2334,6 +2400,8 @@ mod tests {
         )
         .unwrap();
         let _ = std::fs::remove_file(&mp_path);
+        let head = client.head_object(mp_key).unwrap().unwrap();
+        assert_eq!(head.content_sha256.as_deref(), Some("mp-sha"));
 
         let assembled = client.get_object(mp_key).unwrap().unwrap();
         assert_eq!(assembled.len(), full_mp.len());
@@ -2381,5 +2449,17 @@ mod tests {
             .unwrap();
         assert_eq!(&range, b"live");
         client.delete_object(&smoke_key).unwrap();
+
+        // Resume relies on S4 returning the content tag written with an upload.
+        let tagged_key = format!("_smoke_test/tagged-{}.txt", fastrand::u64(..));
+        let tmp = std::env::temp_dir().join(format!("frames-smoke-{}", fastrand::u64(..)));
+        std::fs::write(&tmp, payload).unwrap();
+        client
+            .put_object_from_file(&tagged_key, &tmp, "text/plain", Some("smoke-sha"))
+            .unwrap();
+        let head = client.head_object(&tagged_key).unwrap().unwrap();
+        client.delete_object(&tagged_key).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(head.content_sha256.as_deref(), Some("smoke-sha"));
     }
 }

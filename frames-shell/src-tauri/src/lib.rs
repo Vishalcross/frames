@@ -31,8 +31,8 @@ use frames_core::store::{
 };
 use frames_core::sync::{
     check_library, export_originals, import_unknown_s4_keys, rebuild_from_s4,
-    run_import_concurrent, sync_once, ImportControl, ImportRunReport, LibraryCheckReport,
-    SyncReport,
+    resume_unfinished_imports, run_import_concurrent, sync_once, unfinished_imports,
+    ImportControl, ImportRunReport, LibraryCheckReport, SyncReport,
 };
 use frames_core::thumbnails::ThumbService;
 use frames_core::trash::{
@@ -374,6 +374,42 @@ impl AppState {
             let _ = app.emit("thumb-ready", serde_json::json!({ "asset_id": id }));
         })));
     }
+}
+
+/// How often unfinished imports are retried, so an import cut off by a lost
+/// connection carries on once the network is back (spec sections 7 and 11).
+const IMPORT_RESUME_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Carry on with imports an earlier run left unfinished, if S4 is usable and
+/// no import is running. Reports through the usual `frames://import-progress`
+/// events, so the Imports view and sidebar show it like any other import.
+fn resume_imports_in_background(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.import_control.is_running() {
+        return;
+    }
+    let Ok(s4) = state.require_s4() else {
+        return;
+    };
+    let has_work = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|st| unfinished_imports(&st).ok())
+        .is_some_and(|groups| !groups.is_empty());
+    if !has_work {
+        return;
+    }
+    let store = Arc::clone(&state.store);
+    let cache = Arc::clone(&state.cache);
+    let control = Arc::clone(&state.import_control);
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter = app.clone();
+        let _ = resume_unfinished_imports(store, s4, cache, control, Utc::now(), move |rep| {
+            let _ = emitter.emit("frames://import-progress", rep);
+        });
+    });
 }
 
 #[derive(Serialize)]
@@ -1280,6 +1316,7 @@ fn save_settings(
     *state.settings.lock().unwrap() = new_settings;
     state.reset_s4();
     state.start_thumb_backfill(&app);
+    resume_imports_in_background(&app);
 
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let dev_id = store.device_id().map_err(|e| e.to_string())?;
@@ -1396,6 +1433,18 @@ pub fn run() {
                 .ok();
 
             app.state::<AppState>().start_thumb_backfill(app.handle());
+
+            let handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("frames-import-resume".into())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_secs(5));
+                    loop {
+                        resume_imports_in_background(&handle);
+                        std::thread::sleep(IMPORT_RESUME_INTERVAL);
+                    }
+                })
+                .ok();
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())

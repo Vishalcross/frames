@@ -1745,6 +1745,20 @@ impl Store {
         Ok(out)
     }
 
+    /// `(path, album_id)` of every row an import run left unfinished: quit,
+    /// offline or unplugged before the asset was logged. Failed rows are
+    /// excluded; they wait for the user to import again.
+    pub fn unfinished_import_rows(&self) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, album_id FROM import_queue
+             WHERE state IN ('pending', 'hashed', 'uploading', 'uploaded')
+             ORDER BY path ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn list_import_queue(&self) -> Result<Vec<ImportQueueRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, size, mtime, state, asset_id, upload_id, parts_done, album_id, error
@@ -1815,6 +1829,18 @@ impl Store {
             }
         }
         Ok(prog)
+    }
+
+    /// After the user cancels, park every unfinished row as failed so the
+    /// automatic resume leaves it alone. Importing the folder again picks the
+    /// files up, and anything already in S4 is recognised and not re-uploaded.
+    pub fn cancel_unfinished_imports(&mut self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE import_queue
+             SET state = 'failed', error = 'Cancelled. Import the folder again to continue.'
+             WHERE state IN ('pending', 'hashed', 'uploading', 'uploaded')",
+            [],
+        )?)
     }
 
     pub fn clear_finished_imports(&mut self) -> Result<()> {

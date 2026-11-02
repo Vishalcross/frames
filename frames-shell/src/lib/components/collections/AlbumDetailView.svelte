@@ -1,6 +1,6 @@
 <script lang="ts">
   import VirtualGrid from '$lib/components/grid/VirtualGrid.svelte';
-  import type { AlbumItem, Asset, Query, AssetRepo } from '$lib/types';
+  import type { AlbumItem, Query, AssetRepo, OpenPhoto } from '$lib/types';
   import { tauriRepo, getAssetUrl, isTauriAvailable } from '$lib/services/tauriRepo';
   import { focusAsset } from '$lib/theme/engine.svelte';
 
@@ -20,7 +20,7 @@
     zoomLevelIndex?: number;
     isFill?: boolean;
     selectedIds?: Set<string>;
-    onopenphoto?: (asset: Asset) => void;
+    onopenphoto?: OpenPhoto;
     onselectionchange?: (ids: Set<string>) => void;
     /** Asks the page to confirm and delete this album. */
     ondelete?: (album: AlbumItem) => void;

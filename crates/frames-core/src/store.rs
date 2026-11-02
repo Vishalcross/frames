@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use chrono::{DateTime, Datelike, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -22,7 +22,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::dates::{ shift_utc_minutes, folder_year_month, DateSource, Taken };
+use crate::dates::{ folder_year_month, DateSource, Taken };
 use crate::keys::{is_valid_device_id, snapshot_key};
 use crate::ops::{AssetKind, AssetRecord, Batch, Op};
 use crate::SCHEMA_SQL;
@@ -1527,111 +1527,51 @@ impl Store {
 
     /// Search active assets combining FTS5 text tokens and structured filter chips.
     pub fn search_assets(&self, filter: &SearchFilter) -> Result<Vec<AssetSummary>> {
-        let fts_match = filter
-            .text
-            .as_deref()
-            .and_then(build_fts_prefix_query);
+        self.query_assets(filter, 0, usize::MAX)
+    }
 
-        let mut stmt = if fts_match.is_some() {
-            self.conn.prepare(
-                "SELECT s.id, s.kind, s.key, s.filename, s.size, s.taken_at, s.tz_offset,
-                        s.date_guessed, s.width, s.height, s.duration_ms, s.thumb_failed,
-                        s.camera_make, s.camera_model
-                 FROM search_fts f
-                 JOIN assets s ON s.id = f.asset_id
-                 WHERE f.search_fts MATCH ?1
-                   AND s.trashed_at IS NULL AND s.purged_at IS NULL
-                 ORDER BY s.taken_at DESC, s.id ASC",
-            )?
-        } else {
-            self.conn.prepare(
-                "SELECT s.id, s.kind, s.key, s.filename, s.size, s.taken_at, s.tz_offset,
-                        s.date_guessed, s.width, s.height, s.duration_ms, s.thumb_failed,
-                        s.camera_make, s.camera_model
-                 FROM assets s
-                 WHERE s.trashed_at IS NULL AND s.purged_at IS NULL
-                 ORDER BY s.taken_at DESC, s.id ASC",
-            )?
-        };
-
-        let album_members: Option<std::collections::HashSet<String>> =
-            if let Some(alb_id) = &filter.album_id {
-                let mut a_stmt = self.conn.prepare(
-                    "SELECT ai.asset_id
-                     FROM album_items ai
-                     JOIN albums a ON a.id = ai.album_id
-                     WHERE ai.album_id = ?1 AND ai.in_album = 1 AND a.deleted_at IS NULL",
-                )?;
-                let ids = a_stmt
-                    .query_map([alb_id], |r| r.get::<_, String>(0))?
-                    .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
-                Some(ids)
-            } else {
-                None
-            };
-
-        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(AssetSummary, Option<String>, Option<String>)> {
-            Ok((row_to_summary(r)?, r.get(12)?, r.get(13)?))
-        };
-
-        let rows: Vec<(AssetSummary, Option<String>, Option<String>)> = if let Some(ref q) = fts_match {
-            stmt.query_map([q], map_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map([], map_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-
-        let mut results = Vec::new();
-        for (summary, cam_make, cam_model) in rows {
-            if let Some(ref members) = album_members {
-                if !members.contains(&summary.id) {
-                    continue;
-                }
-            }
-            if let Some(kind) = filter.kind {
-                if summary.kind != kind {
-                    continue;
-                }
-            }
-            if let Some(ref ext) = filter.file_ext {
-                let want = ext.trim_start_matches('.').to_lowercase();
-                let actual = file_extension_lower(&summary.filename);
-                if actual != want {
-                    continue;
-                }
-            }
-            if let Some(ref want_cam) = filter.camera {
-                let full_cam = format!(
-                    "{} {}",
-                    cam_make.as_deref().unwrap_or(""),
-                    cam_model.as_deref().unwrap_or("")
-                )
-                .to_lowercase();
-                if !full_cam.contains(&want_cam.to_lowercase()) {
-                    continue;
-                }
-            }
-            if filter.year.is_some() || filter.month.is_some() {
-                let local_dt = match summary.tz_offset {
-                    Some(m) => shift_utc_minutes(summary.taken_at, m),
-                    None => summary.taken_at,
-                };
-                if let Some(y) = filter.year {
-                    if local_dt.year() != y {
-                        continue;
-                    }
-                }
-                if let Some(mo) = filter.month {
-                    if local_dt.month() != mo {
-                        continue;
-                    }
-                }
-            }
-            results.push(summary);
+    /// One page of visible assets matching `filter`, newest first. All
+    /// filtering happens in SQL, so a page deep into a 100k library costs a
+    /// few milliseconds and the UI never needs the whole list.
+    pub fn query_assets(
+        &self,
+        filter: &SearchFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<AssetSummary>> {
+        let (where_sql, mut args) = filter_sql(filter);
+        if where_sql.is_none() {
+            // Nothing could match (e.g. search text without any words).
+            return Ok(Vec::new());
         }
+        let where_sql = where_sql.unwrap_or_default();
+        args.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+        args.push(Box::new(offset as i64));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.id, s.kind, s.key, s.filename, s.size, s.taken_at, s.tz_offset,
+                    s.date_guessed, s.width, s.height, s.duration_ms, s.thumb_failed
+             FROM assets s
+             WHERE {where_sql}
+             ORDER BY s.taken_at DESC, s.id ASC
+             LIMIT ? OFFSET ?"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_summary)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 
-        Ok(results)
+    /// How many visible assets match `filter`; the grid sizes its scrollbar from this.
+    pub fn count_assets(&self, filter: &SearchFilter) -> Result<usize> {
+        let (where_sql, args) = filter_sql(filter);
+        let Some(where_sql) = where_sql else {
+            return Ok(0);
+        };
+        let n: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM assets s WHERE {where_sql}"),
+            rusqlite::params_from_iter(args.iter()),
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     // =========================================================================
@@ -2349,6 +2289,76 @@ fn file_extension_lower(filename: &str) -> String {
     }
 }
 
+/// SQL `WHERE` clause (over `assets s`) and its parameters for a search
+/// filter. `None` means nothing can match. Year and month are local
+/// wall-clock time (`taken_at` + `tz_offset`), like the timeline's months.
+fn filter_sql(filter: &SearchFilter) -> (Option<String>, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut clauses = vec!["s.trashed_at IS NULL AND s.purged_at IS NULL".to_string()];
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    const LOCAL_TIME: &str = "s.taken_at, coalesce(s.tz_offset, 0) || ' minutes'";
+
+    if let Some(text) = filter.text.as_deref().filter(|t| !t.trim().is_empty()) {
+        let Some(fts) = build_fts_prefix_query(text) else {
+            return (None, args);
+        };
+        clauses.push("s.id IN (SELECT asset_id FROM search_fts WHERE search_fts MATCH ?)".into());
+        args.push(Box::new(fts));
+    }
+    if let Some(album_id) = &filter.album_id {
+        clauses.push(
+            "s.id IN (SELECT ai.asset_id FROM album_items ai
+                      JOIN albums a ON a.id = ai.album_id
+                      WHERE ai.album_id = ? AND ai.in_album = 1 AND a.deleted_at IS NULL)"
+                .into(),
+        );
+        args.push(Box::new(album_id.clone()));
+    }
+    if let Some(kind) = filter.kind {
+        clauses.push("s.kind = ?".into());
+        args.push(Box::new(kind_to_str(kind)));
+    }
+    if let Some(ext) = &filter.file_ext {
+        clauses.push("lower(s.filename) LIKE ?".into());
+        args.push(Box::new(format!("%.{}", ext.trim_start_matches('.').to_lowercase())));
+    }
+    if let Some(camera) = &filter.camera {
+        clauses.push(
+            "lower(coalesce(s.camera_make, '') || ' ' || coalesce(s.camera_model, '')) LIKE ?".into(),
+        );
+        args.push(Box::new(format!("%{}%", camera.to_lowercase())));
+    }
+    if let Some(year) = filter.year {
+        // Local time is within 14 h of UTC, so an indexable UTC window narrows
+        // the rows before the exact local-time test.
+        if let Some((from, to)) = utc_window(year, filter.month) {
+            clauses.push("s.taken_at >= ? AND s.taken_at < ?".into());
+            args.push(Box::new(format_utc(from - Duration::hours(14))));
+            args.push(Box::new(format_utc(to + Duration::hours(14))));
+        }
+        clauses.push(format!("CAST(strftime('%Y', {LOCAL_TIME}) AS INTEGER) = ?"));
+        args.push(Box::new(year));
+    }
+    if let Some(month) = filter.month {
+        clauses.push(format!("CAST(strftime('%m', {LOCAL_TIME}) AS INTEGER) = ?"));
+        args.push(Box::new(month));
+    }
+    (Some(clauses.join(" AND ")), args)
+}
+
+/// UTC start of `year` (or of `month` in it) and the start of the next one.
+fn utc_window(year: i32, month: Option<u32>) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let start = |y: i32, m: u32| {
+        chrono::NaiveDate::from_ymd_opt(y, m, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|d| d.and_utc())
+    };
+    match month {
+        Some(12) => Some((start(year, 12)?, start(year + 1, 1)?)),
+        Some(m) => Some((start(year, m)?, start(year, m + 1)?)),
+        None => Some((start(year, 1)?, start(year + 1, 1)?)),
+    }
+}
+
 fn build_fts_prefix_query(text: &str) -> Option<String> {
     let tokens: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric())
@@ -2830,5 +2840,40 @@ mod tests {
             .map(|g| (g.month, g.count, g.key_asset_id.as_str()))
             .collect();
         assert_eq!(summary, vec![(5, 2, "may-late"), (4, 1, "april")]);
+    }
+
+    #[test]
+    fn query_assets_pages_and_filters_in_sql_by_local_month() {
+        let store = Store::open_in_memory("mac-1").unwrap();
+        // 20:00 UTC on 31 May is 1 June in India (+05:30).
+        for (id, kind, taken, tz) in [
+            ("a-june-ist", "photo", "2024-05-31T20:00:00.000Z", Some(330)),
+            ("b-may", "video", "2024-05-20T10:00:00.000Z", None),
+            ("c-may", "photo", "2024-05-10T10:00:00.000Z", Some(0)),
+            ("d-april", "photo", "2024-04-01T10:00:00.000Z", None),
+        ] {
+            store.connection().execute(
+                "INSERT INTO assets (id, kind, filename, size, taken_at, tz_offset, date_at, state_at)
+                 VALUES (?1, ?2, 'p.jpg', 1, ?3, ?4, 'now', 'now')",
+                params![id, kind, taken, tz],
+            ).unwrap();
+        }
+        let ids = |f: &SearchFilter, off: usize, lim: usize| -> Vec<String> {
+            store.query_assets(f, off, lim).unwrap().into_iter().map(|a| a.id).collect()
+        };
+        let all = SearchFilter::default();
+        assert_eq!(store.count_assets(&all).unwrap(), 4);
+        assert_eq!(ids(&all, 1, 2), vec!["b-may", "c-may"]);
+
+        let may = SearchFilter { year: Some(2024), month: Some(5), ..Default::default() };
+        assert_eq!(ids(&may, 0, 10), vec!["b-may", "c-may"]);
+        assert_eq!(store.count_assets(&may).unwrap(), 2);
+        let june = SearchFilter { year: Some(2024), month: Some(6), ..Default::default() };
+        assert_eq!(ids(&june, 0, 10), vec!["a-june-ist"]);
+
+        let videos = SearchFilter { kind: Some(AssetKind::Video), ..Default::default() };
+        assert_eq!(ids(&videos, 0, 10), vec!["b-may"]);
+        let no_words = SearchFilter { text: Some("--".into()), ..Default::default() };
+        assert_eq!(store.count_assets(&no_words).unwrap(), 0);
     }
 }

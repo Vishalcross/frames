@@ -78,6 +78,9 @@ export interface Query {
   filter?: 'all' | 'favorites' | 'videos' | 'photos';
 }
 
+/** Open the viewer on `asset`; `at` places it in the grid query it came from. */
+export type OpenPhoto = (asset: Asset, at?: { query: Query; index: number }) => void;
+
 export interface AssetRepo {
   count(q: Query): Promise<number>;
   range(q: Query, from: number, n: number): Promise<Asset[]>;

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
   import Tile from './Tile.svelte';
-  import type { Asset, AssetRepo, Query } from '$lib/types';
+  import type { Asset, AssetRepo, OpenPhoto, Query } from '$lib/types';
   import { tauriRepo } from '$lib/services/tauriRepo';
   import { focusAsset } from '$lib/theme/engine.svelte';
 
@@ -22,7 +22,7 @@
     zoomLevelIndex?: number;
     isFill?: boolean;
     selectedIds?: Set<string>;
-    onopenphoto?: (asset: Asset) => void;
+    onopenphoto?: OpenPhoto;
     onselectionchange?: (ids: Set<string>) => void;
     /** Bump to refetch the current query in place, keeping the scroll position. */
     version?: number;
@@ -293,8 +293,8 @@
     onselectionchange?.(newSelection);
   }
 
-  function handleTileDoubleClick(asset: Asset) {
-    onopenphoto?.(asset);
+  function handleTileDoubleClick(index: number, asset: Asset) {
+    onopenphoto?.(asset, { query, index });
   }
 
   // Hover dwell adaptive focus (§7.6 #3)
@@ -395,7 +395,7 @@
                 {isFill}
                 isSelected={selectedIds.has(asset.id)}
                 onclick={(e) => handleTileClick(itemIndex, asset, e)}
-                ondblclick={() => handleTileDoubleClick(asset)}
+                ondblclick={() => handleTileDoubleClick(itemIndex, asset)}
                 onpointerenter={() => handleTileHover(asset)}
               />
             {:else}

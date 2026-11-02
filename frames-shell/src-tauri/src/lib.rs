@@ -109,6 +109,15 @@ pub struct TimelinePayload {
     pub month_groups: Vec<MonthGroup>,
 }
 
+/// The timeline at startup: its size and months, not its assets. Grids fetch
+/// assets a page at a time (`query_assets`), so startup and every refresh
+/// stay small however large the library grows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineSummary {
+    pub total_assets: usize,
+    pub month_groups: Vec<MonthGroup>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrashPayload {
     pub items: Vec<TrashItem>,
@@ -127,7 +136,7 @@ pub struct ImportStatusView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapPayload {
     pub device_id: String,
-    pub timeline: TimelinePayload,
+    pub timeline: TimelineSummary,
     pub albums: Vec<AlbumSummary>,
     pub trash: TrashPayload,
     pub import_progress: ImportProgress,
@@ -456,7 +465,6 @@ fn get_app_bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Boots
         let cache = state.cache.lock().map_err(|e| e.to_string())?;
 
         let device_id = store.device_id().map_err(|e| e.to_string())?;
-        let assets = store.list_timeline(None, None).map_err(|e| e.to_string())?;
         let month_groups = store.timeline_month_groups().map_err(|e| e.to_string())?;
         let albums = store.list_albums().map_err(|e| e.to_string())?;
         let trash_items = store.list_trash(now).map_err(|e| e.to_string())?;
@@ -478,8 +486,8 @@ fn get_app_bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Boots
 
         BootstrapPayload {
             device_id,
-            timeline: TimelinePayload {
-                assets,
+            timeline: TimelineSummary {
+                total_assets: month_groups.iter().map(|g| g.count).sum(),
                 month_groups,
             },
             albums,
@@ -843,6 +851,26 @@ fn get_search_suggestions(
 ) -> Result<SearchSuggestions, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.search_suggestions(&query).map_err(|e| e.to_string())
+}
+
+/// One page of the assets matching `filter`, newest first.
+#[tauri::command(async)]
+fn query_assets(
+    filter: SearchFilter,
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<AssetSummary>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .query_assets(&filter, offset, limit.min(1000))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn count_assets(filter: SearchFilter, state: State<'_, AppState>) -> Result<usize, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.count_assets(&filter).map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
@@ -1494,6 +1522,8 @@ pub fn run() {
             move_to_album,
             get_search_suggestions,
             search_assets,
+            query_assets,
+            count_assets,
             get_trash,
             trash_assets,
             restore_assets,

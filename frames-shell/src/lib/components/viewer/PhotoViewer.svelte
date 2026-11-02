@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { Asset } from '$lib/types';
+  import type { Asset, Query } from '$lib/types';
   import Surface from '$lib/components/surface/Surface.svelte';
   import Button from '$lib/components/surface/Button.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
@@ -14,6 +14,8 @@
     asset = $bindable(),
     open = $bindable(false),
     albumId = null,
+    query = null,
+    index = $bindable(0),
     onclose,
     onedit,
     oninfo
@@ -21,6 +23,10 @@
     asset: Asset;
     open: boolean;
     albumId?: string | null;
+    /** The grid query the photo was opened from; the arrows walk through it. */
+    query?: Query | null;
+    /** Position of `asset` in `query`. */
+    index?: number;
     onclose?: () => void;
     onedit?: (asset: Asset) => void;
     oninfo?: (asset: Asset) => void;
@@ -53,18 +59,52 @@
   // Rotation
   let rotationDeg = $state(0);
 
-  const allAssets = $derived(tauriRepo.getAssets());
-  const currentAssetIndex = $derived.by(() => {
-    return allAssets.findIndex((a) => a.id === asset.id);
+  // Neighbours come from the grid's own query a window at a time, so the
+  // viewer never needs the whole library and stays inside an album or search.
+  const WINDOW = 10;
+  let total = $state(1);
+  let windowStart = $state(0);
+  let windowAssets = $state<Asset[]>([]);
+
+  $effect(() => {
+    const q = query;
+    if (!q) return;
+    tauriRepo.count(q).then((n) => {
+      if (query === q) total = n;
+    });
   });
 
-  const neighbours = $derived.by(() => {
-    if (allAssets.length === 0) return [asset];
-    if (currentAssetIndex < 0) return [asset];
-    const start = Math.max(0, currentAssetIndex - 10);
-    const end = Math.min(allAssets.length, currentAssetIndex + 11);
-    return allAssets.slice(start, end);
+  $effect(() => {
+    const q = query;
+    const i = index;
+    if (!q) return;
+    const start = Math.max(0, i - WINDOW);
+    tauriRepo.range(q, start, WINDOW * 2 + 1).then((list) => {
+      if (query === q && index === i) {
+        windowStart = start;
+        windowAssets = list;
+      }
+    });
   });
+
+  const neighbours = $derived(query && windowAssets.length > 0 ? windowAssets : [asset]);
+
+  function showAt(i: number) {
+    const q = query;
+    if (!q || i < 0 || i >= total || i === index) return;
+    const inWindow = windowAssets[i - windowStart];
+    if (inWindow) {
+      index = i;
+      asset = inWindow;
+      return;
+    }
+    tauriRepo.range(q, i, 1).then(([found]) => {
+      if (found && query === q) {
+        index = i;
+        asset = found;
+      }
+    });
+  }
 
   $effect(() => {
     if (asset) {
@@ -93,11 +133,7 @@
   }
 
   function navigate(direction: -1 | 1) {
-    if (currentAssetIndex < 0) return;
-    const nextIdx = currentAssetIndex + direction;
-    if (nextIdx >= 0 && nextIdx < allAssets.length) {
-      asset = allAssets[nextIdx];
-    }
+    showAt(index + direction);
   }
 
   function toggleZoom() {
@@ -436,12 +472,12 @@
     <div class="viewer-filmstrip {isIdle && theme.appearance !== 'standard' ? 'is-hidden' : ''}">
       <Surface kind="floating" class="filmstrip-surface">
         <div class="filmstrip-scroll">
-          {#each neighbours as neighbour}
+          {#each neighbours as neighbour, k}
             {@const isCurrent = neighbour.id === asset.id}
             <button
               type="button"
               class="filmstrip-thumb {isCurrent ? 'is-current' : ''}"
-              onclick={() => (asset = neighbour)}
+              onclick={() => showAt(windowStart + k)}
             >
               <img
                 src={isTauriAvailable() ? thumbUrl(neighbour.id) : getThumbnailDataUrl(neighbour, 'thumb')}

@@ -154,7 +154,7 @@
     if (viewerOpen && activeViewerAsset) return activeViewerAsset.favorite;
     if (selectedIds.size === 1) {
       const firstId = Array.from(selectedIds)[0];
-      const found = tauriRepo.getAssets().find((a) => a.id === firstId);
+      const found = tauriRepo.getAsset(firstId);
       return found ? found.favorite : false;
     }
     return false;
@@ -293,8 +293,14 @@
   }
 
   // Photo viewer open/close
-  function openPhoto(asset: Asset) {
+  // Where the open photo sits, so the viewer's arrows walk the same grid.
+  let viewerQuery = $state<Query | null>(null);
+  let viewerIndex = $state(0);
+
+  function openPhoto(asset: Asset, at?: { query: Query; index: number }) {
     activeViewerAsset = asset;
+    viewerQuery = at?.query ?? null;
+    viewerIndex = at?.index ?? 0;
     viewerOpen = true;
   }
 
@@ -544,7 +550,7 @@
             <MonthsView year={selectedYear} ondrillmonth={handleDrillMonth} />
           {:else}
             <!-- All Continuous Virtualized Grid (§4.3, §4.4) -->
-            {#if activeRepo.getAssets().length === 0}
+            {#if activeRepo.totalAssets === 0}
               <EmptyLibraryView
                 {isTauri}
                 onimport={handlePickFolderAndImport}
@@ -630,7 +636,9 @@
 
     <!-- Info Panel (320px, pushes in Standard/Adaptive, floats in Glass, §4.7) -->
     {#if infoPanelOpen}
-      {@const sampleAsset = activeViewerAsset || tauriRepo.getAssets()[0]}
+      {@const sampleAsset =
+        activeViewerAsset ||
+        (selectedIds.size === 1 ? tauriRepo.getAsset(Array.from(selectedIds)[0]) : undefined)}
       {#if sampleAsset}
         <InfoPanel
           asset={sampleAsset}
@@ -646,6 +654,8 @@
     <PhotoViewer
       bind:asset={activeViewerAsset}
       bind:open={viewerOpen}
+      bind:index={viewerIndex}
+      query={viewerQuery}
       albumId={currentRoute === 'album-detail' ? currentAlbumId : null}
       onclose={closePhoto}
       onedit={(a) => openEdit(a)}

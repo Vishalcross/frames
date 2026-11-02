@@ -56,8 +56,9 @@ export interface BackendTrashItem {
 
 export interface BackendBootstrap {
   device_id: string;
+  /** Size and months only; grids fetch assets a page at a time. */
   timeline: {
-    assets: BackendAssetSummary[];
+    total_assets: number;
     month_groups: BackendMonthGroup[];
   };
   albums: BackendAlbumSummary[];
@@ -198,9 +199,44 @@ export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
   };
 }
 
+/** Backend `SearchFilter` (all fields optional). */
+interface BackendFilter {
+  text?: string | null;
+  album_id?: string | null;
+  year?: number | null;
+  month?: number | null;
+  kind?: 'photo' | 'video' | 'live' | null;
+}
+
+/**
+ * The backend filter for a grid query, or `null` when nothing can match:
+ * favourites and hidden items are not part of the library model (spec v1).
+ */
+function toBackendFilter(q: Query): BackendFilter | null {
+  if (q.scope === 'favorites' || q.scope === 'hidden' || q.filter === 'favorites') return null;
+  const kind =
+    q.scope === 'videos' || q.filter === 'videos' ? 'video' : q.filter === 'photos' ? 'photo' : null;
+  return {
+    text: q.search?.trim() || null,
+    album_id: q.scope === 'album' ? (q.albumId ?? null) : null,
+    year: q.year ?? null,
+    month: q.year ? (q.month ?? null) : null,
+    kind
+  };
+}
+
+function isWholeLibrary(f: BackendFilter): boolean {
+  return !f.text && !f.album_id && !f.year && !f.kind;
+}
+
+/** Assets seen in recent pages, by id, for lookups outside a grid. */
+const SEEN_LIMIT = 20_000;
+
 export class TauriAssetRepo implements AssetRepo {
-  private cachedAssets: Asset[] = [];
+  private seenAssets = new Map<string, Asset>();
   private cachedAlbums: AlbumItem[] = [];
+  /** Visible assets in the whole library, from the startup summary. */
+  public totalAssets = 0;
   private monthGroups: BackendMonthGroup[] = [];
   private trashItems: BackendTrashItem[] = [];
   private thumbDataUrlCache = new Map<string, string>();
@@ -240,7 +276,7 @@ export class TauriAssetRepo implements AssetRepo {
       const data = await invoke<BackendBootstrap>('get_app_bootstrap');
       this.deviceId = data.device_id;
       this.settings = data.settings as BackendSettingsView;
-      this.cachedAssets = (data.timeline.assets || []).map(backendSummaryToAsset);
+      this.totalAssets = data.timeline.total_assets ?? 0;
       this.cachedAlbums = (data.albums || []).map(backendAlbumToItem);
       this.monthGroups = data.timeline.month_groups || [];
       this.trashItems = data.trash?.items || [];
@@ -254,8 +290,15 @@ export class TauriAssetRepo implements AssetRepo {
     }
   }
 
-  getAssets(): Asset[] {
-    return this.cachedAssets;
+  /** An asset from a page loaded recently, if any. */
+  getAsset(id: string): Asset | undefined {
+    return this.seenAssets.get(id);
+  }
+
+  private remember(assets: Asset[]): Asset[] {
+    if (this.seenAssets.size > SEEN_LIMIT) this.seenAssets.clear();
+    for (const a of assets) this.seenAssets.set(a.id, a);
+    return assets;
   }
 
   getAlbums(): AlbumItem[] {
@@ -274,9 +317,6 @@ export class TauriAssetRepo implements AssetRepo {
     const yearsSet = new Set<number>();
     for (const mg of this.monthGroups) {
       yearsSet.add(mg.year);
-    }
-    for (const a of this.cachedAssets) {
-      if (a.year) yearsSet.add(a.year);
     }
     if (yearsSet.size === 0) return [new Date().getFullYear()];
     return Array.from(yearsSet).sort((a, b) => b - a);
@@ -318,68 +358,37 @@ export class TauriAssetRepo implements AssetRepo {
     if (!this.isLoaded) {
       await this.loadBootstrap();
     }
-    if (q.scope === 'album' && q.albumId) {
-      return await this.getAlbumAssetCount(q.albumId);
+    const filter = toBackendFilter(q);
+    if (!filter || !isTauriAvailable()) return 0;
+    if (isWholeLibrary(filter)) return this.totalAssets;
+    try {
+      return await invoke<number>('count_assets', { filter });
+    } catch (e) {
+      console.warn('Failed to count assets:', e);
+      return 0;
     }
-    if (q.search || q.filter || q.year) {
-      const items = await this.range(q, 0, 10000);
-      return items.length;
-    }
-    return this.cachedAssets.length;
   }
 
+  /** One page of a grid query, fetched from the backend (never the whole library). */
   async range(q: Query, from: number, n: number): Promise<Asset[]> {
-    if (!this.isLoaded) {
-      await this.loadBootstrap();
-    }
-
-    if (q.scope === 'album' && q.albumId) {
-      if (isTauriAvailable()) {
-        return await this.getAlbumAssets(q.albumId, from, n);
-      }
+    const filter = toBackendFilter(q);
+    if (!filter || !isTauriAvailable() || n <= 0) return [];
+    try {
+      const page = await invoke<BackendAssetSummary[]>('query_assets', {
+        filter,
+        offset: Math.max(0, from),
+        limit: n
+      });
+      return this.remember(page.map(backendSummaryToAsset));
+    } catch (e) {
+      console.warn('Failed to load assets:', e);
       return [];
     }
-
-    let list: Asset[] = this.cachedAssets;
-
-    if (q.search && q.search.trim()) {
-      try {
-        const found = await invoke<BackendAssetSummary[]>('search_assets', {
-          filter: {
-            text: q.search.trim(),
-            album_id: null,
-            year: null,
-            month: null,
-            camera: null,
-            kind: null,
-            file_ext: null
-          }
-        });
-        list = found.map(backendSummaryToAsset);
-      } catch {
-        const needle = q.search.trim().toLowerCase();
-        list = this.cachedAssets.filter((a) =>
-          (a.title || '').toLowerCase().includes(needle)
-        );
-      }
-    } else if (q.filter === 'favorites') {
-      list = this.cachedAssets.filter((a) => a.favorite);
-    } else if (q.filter === 'videos') {
-      list = this.cachedAssets.filter((a) => a.kind === 'video');
-    } else if (q.filter === 'photos') {
-      list = this.cachedAssets.filter((a) => a.kind === 'photo');
-    } else if (q.year) {
-      list = this.cachedAssets.filter(
-        (a) => a.year === q.year && (!q.month || a.month === q.month)
-      );
-    }
-
-    return list.slice(from, from + n);
   }
 
   async detail(id: string): Promise<AssetDetail> {
     if (!isTauriAvailable()) {
-      const a = this.cachedAssets.find((it) => it.id === id);
+      const a = this.seenAssets.get(id);
       return {
         record: a || {
           id,
@@ -429,7 +438,7 @@ export class TauriAssetRepo implements AssetRepo {
       // fallback
     }
     return {
-      record: this.cachedAssets.find((it) => it.id === id) || {
+      record: this.seenAssets.get(id) || {
         id,
         kind: 'photo',
         takenAt: Date.now(),
@@ -456,7 +465,7 @@ export class TauriAssetRepo implements AssetRepo {
   }
 
   async updateFavorite(id: string, favorite: boolean): Promise<void> {
-    const item = this.cachedAssets.find((a) => a.id === id);
+    const item = this.seenAssets.get(id);
     if (item) item.favorite = favorite;
   }
 
@@ -472,7 +481,7 @@ export class TauriAssetRepo implements AssetRepo {
         console.error('Failed to update trash state:', e);
       }
     }
-    this.cachedAssets = this.cachedAssets.filter((a) => a.id !== id);
+    this.seenAssets.delete(id);
   }
 
   async updateCaption(id: string, caption: string): Promise<void> {

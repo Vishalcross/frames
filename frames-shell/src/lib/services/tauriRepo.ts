@@ -22,6 +22,15 @@ export interface BackendAssetSummary {
   thumb_failed: boolean;
 }
 
+export interface BackendVideoPlaybackPlan {
+  asset_id: string;
+  decision: { mode: 'playdirect' | 'repackage' | 'convert' };
+  /** Empty for `playdirect`; otherwise the loopback stream URL. */
+  playback_url: string;
+  duration_ms: number | null;
+  can_seek_via_query: boolean;
+}
+
 export interface BackendAlbumSummary {
   id: string;
   name: string;
@@ -169,7 +178,6 @@ export function getAssetUrl(
 export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
   const takenAt = new Date(s.taken_at).getTime() || Date.now();
   const d = new Date(takenAt);
-  const isVideo = s.kind === 'video';
 
   // Seed palette deterministically from ID
   const idNum = s.id.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
@@ -177,7 +185,7 @@ export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
 
   return {
     id: s.id,
-    kind: isVideo ? 'video' : 'photo',
+    kind: s.kind,
     takenAt,
     w: s.width || 4032,
     h: s.height || 3024,
@@ -647,6 +655,32 @@ export class TauriAssetRepo implements AssetRepo {
   async clearImportQueue(all = false): Promise<BackendImportStatusView> {
     if (!isTauriAvailable()) return this.getImportStatus();
     return await invoke<BackendImportStatusView>('clear_import_queue', { all });
+  }
+
+  /**
+   * How to play a video or a Live Photo's motion: `playdirect` (load the file
+   * through `frames://`) or a loopback stream that repackages or converts it.
+   */
+  async getVideoPlayback(
+    id: string,
+    supportsHevc: boolean,
+    forceConvert = false
+  ): Promise<BackendVideoPlaybackPlan> {
+    return await invoke<BackendVideoPlaybackPlan>('get_video_playback', {
+      id,
+      supportsHevc,
+      forceConvert
+    });
+  }
+
+  /** Ask for a folder and copy the originals of `ids` into it. */
+  async exportAssets(ids: string[]): Promise<{ exported: number; cancelled?: boolean }> {
+    const destinationFolder = await invoke<string | null>('pick_folder_dialog', {
+      prompt: 'Choose a folder to export the originals to'
+    });
+    if (!destinationFolder) return { exported: 0, cancelled: true };
+    const paths = await invoke<string[]>('export_assets', { ids, destinationFolder });
+    return { exported: paths.length };
   }
 
   async getWorkerStatus(): Promise<{ uploading_count: number; thumb_generating_count: number }> {

@@ -18,8 +18,8 @@ use frames_core::media::{encode_webp_lossless, RgbImage};
 use frames_core::media::spawn_hidden_command;
 use frames_core::ops::{AssetKind, AssetRecord};
 use frames_core::player::{
-    detect_best_h264_encoder, H264Encoder, LoopbackStreamServer, PlaybackDecision,
-    PlayerCapabilities, VideoPlaybackPlan,
+    decide_playback, detect_best_h264_encoder, H264Encoder, LoopbackStreamServer,
+    PlaybackDecision, PlayerCapabilities, UrlRefresher, VideoPlaybackPlan,
 };
 use frames_core::s4::{
     load_secret_from_os_keychain, save_secret_in_os_keychain, InMemoryObjectStore, ObjectStore,
@@ -551,66 +551,100 @@ async fn get_thumbnail_data_url(
     .map_err(|e| e.to_string())
 }
 
+/// How the viewer plays a video or a Live Photo's motion (spec section 8).
+/// `PlayDirect` comes back without a URL: the web view loads the file through
+/// `frames://` (this computer first, S4 ranges otherwise). Anything else gets
+/// a loopback stream that repackages or converts, reading the local file when
+/// there is one and S4 otherwise. `force_convert` is the retry after the web
+/// view failed to play a file it said it supports.
 #[tauri::command(async)]
 fn get_video_playback(
     id: String,
     supports_hevc: bool,
+    force_convert: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<VideoPlaybackPlan, String> {
-    let detail = {
+    let rec = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         store
             .get_asset(&id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Asset not found: {id}"))?
-    };
-
-    let s4 = state.require_s4()?;
-    let target_key = if detail.record.kind == AssetKind::Live {
-        detail
             .record
-            .motion_key
-            .clone()
-            .unwrap_or_else(|| detail.record.key.clone())
-    } else {
-        detail.record.key.clone()
     };
-    let presigned = s4
-        .presign_get(&target_key, Utc::now(), 3600)
-        .map_err(|e| e.to_string())?;
+    let is_live = rec.kind == AssetKind::Live;
 
+    // A Live Photo's motion codecs are not indexed. It is an iPhone MOV, HEVC
+    // on any recent iPhone, so the Mac plays it as is and Windows without the
+    // HEVC add-on converts it.
+    let (container, video_codec, audio_codec) = if is_live {
+        (Some("mov"), Some("hevc"), Some("aac"))
+    } else {
+        (
+            rec.container.as_deref(),
+            rec.video_codec.as_deref(),
+            rec.audio_codec.as_deref(),
+        )
+    };
     let caps = PlayerCapabilities {
         supports_hevc,
         ..Default::default()
     };
-
-    let s4_for_refresher = Arc::clone(&s4);
-    let key_for_refresher = target_key.clone();
-    let refresher = Arc::new(move || {
-        s4_for_refresher
-            .presign_get(&key_for_refresher, Utc::now(), 3600)
-            .ok()
-    });
-
-    let plan = state.player_server.create_playback_plan_with_refresher(
-        &id,
-        &presigned,
-        Some(refresher),
-        detail.record.container.as_deref(),
-        detail.record.video_codec.as_deref(),
-        detail.record.audio_codec.as_deref(),
-        detail.record.duration_ms,
-        &caps,
-        state.h264_encoder,
-    );
-
-    if plan.decision != PlaybackDecision::PlayDirect {
-        if let Some(ref srv_err) = state.player_error {
-            return Err(srv_err.clone());
+    let decision = if force_convert.unwrap_or(false) {
+        PlaybackDecision::Convert {
+            copy_video: false,
+            copy_audio: false,
         }
+    } else {
+        decide_playback(container, video_codec, audio_codec, &caps)
+    };
+    if decision == PlaybackDecision::PlayDirect {
+        return Ok(VideoPlaybackPlan {
+            asset_id: id,
+            decision,
+            playback_url: String::new(),
+            duration_ms: rec.duration_ms,
+            can_seek_via_query: false,
+        });
+    }
+    if let Some(ref srv_err) = state.player_error {
+        return Err(srv_err.clone());
     }
 
-    Ok(plan)
+    let local = if is_live {
+        state.thumbs.local_motion(&id)
+    } else {
+        state.thumbs.local_original(&id)
+    };
+    let (source, refresher): (String, Option<UrlRefresher>) = match local {
+        Some(path) => (path.to_string_lossy().to_string(), None),
+        None => {
+            let key = if is_live {
+                rec.motion_key
+                    .clone()
+                    .ok_or_else(|| "This Live Photo has no motion file.".to_string())?
+            } else {
+                rec.key.clone()
+            };
+            let s4 = state.require_s4()?;
+            let url = s4
+                .presign_get(&key, Utc::now(), 3600)
+                .map_err(|e| e.to_string())?;
+            // Long sessions re-sign before each seek; links last an hour.
+            let refresher: UrlRefresher =
+                Arc::new(move || s4.presign_get(&key, Utc::now(), 3600).ok());
+            (url, Some(refresher))
+        }
+    };
+
+    Ok(state.player_server.create_stream_session(
+        &id,
+        &source,
+        refresher,
+        decision,
+        rec.duration_ms,
+        state.h264_encoder,
+    ))
 }
 
 #[tauri::command(async)]

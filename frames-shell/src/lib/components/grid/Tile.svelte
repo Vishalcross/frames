@@ -90,7 +90,7 @@
   });
 
   const accessibleLabel = $derived(
-    `${asset.kind === 'video' ? 'Video' : 'Photo'}, ${new Date(asset.takenAt).toLocaleDateString()}${asset.favorite ? ', favourite' : ''}`
+    `${asset.kind === 'video' ? 'Video' : asset.kind === 'live' ? 'Live Photo' : 'Photo'}, ${new Date(asset.takenAt).toLocaleDateString()}${asset.favorite ? ', favourite' : ''}`
   );
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -130,6 +130,13 @@
   {#if isSelected}
     <div class="selection-check-badge">
       <Icon name="check" size={14} stroke={2.4} />
+    </div>
+  {/if}
+
+  <!-- Live Photo marker top-left (the selection check takes its place) -->
+  {#if asset.kind === 'live' && !isSelected}
+    <div class="live-badge">
+      <Badge variant="pill" text="LIVE" />
     </div>
   {/if}
 
@@ -256,6 +263,14 @@
     bottom: 6px;
     right: 6px;
     z-index: 2;
+  }
+
+  .live-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    pointer-events: none;
+    letter-spacing: 0.04em;
   }
 
   .cloud-badge {

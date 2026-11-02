@@ -97,6 +97,16 @@ pub fn is_heic_extension(ext: &str) -> bool {
 /// 4. Platform-specific fallback paths (macOS `/opt/homebrew/bin`, Windows standard paths).
 /// 5. System `PATH`.
 pub fn resolve_tool_binary(tool: &str) -> std::path::PathBuf {
+    resolve_tool_binary_with_env(tool, |name| std::env::var(name).ok())
+}
+
+/// [`resolve_tool_binary`] with the environment lookup passed in, so tests can
+/// supply an override without changing the process environment that other,
+/// concurrently running tests resolve `ffmpeg` from.
+fn resolve_tool_binary_with_env(
+    tool: &str,
+    env_var: impl Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
     // If an existing file path was passed directly, return it immediately.
     let direct_path = std::path::Path::new(tool);
     if direct_path.is_file() {
@@ -112,7 +122,7 @@ pub fn resolve_tool_binary(tool: &str) -> std::path::PathBuf {
     };
 
     let env_var_name = format!("FRAMES_{}_PATH", clean_tool.to_ascii_uppercase());
-    if let Ok(val) = std::env::var(&env_var_name) {
+    if let Some(val) = env_var(&env_var_name) {
         let p = std::path::PathBuf::from(val);
         if p.is_file() {
             return p;
@@ -2264,12 +2274,13 @@ mod tests {
     fn resolve_tool_binary_respects_env_override() {
         let dummy = std::env::temp_dir().join(format!("dummy-ffmpeg-{}", fastrand::u64(..)));
         std::fs::write(&dummy, b"dummy binary").unwrap();
-        std::env::set_var("FRAMES_FFMPEG_PATH", &dummy);
+        let env = |name: &str| {
+            (name == "FRAMES_FFMPEG_PATH").then(|| dummy.to_string_lossy().to_string())
+        };
 
-        let resolved = resolve_tool_binary("ffmpeg");
+        let resolved = resolve_tool_binary_with_env("ffmpeg", env);
         assert_eq!(resolved, dummy);
 
-        std::env::remove_var("FRAMES_FFMPEG_PATH");
         let _ = std::fs::remove_file(&dummy);
     }
 

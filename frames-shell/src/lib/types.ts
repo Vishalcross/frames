@@ -34,7 +34,7 @@ export interface ThemeConfig {
 
 export interface Asset {
   id: string;
-  kind: 'photo' | 'video';
+  kind: 'photo' | 'video' | 'live';
   takenAt: number; // timestamp ms
   w: number;
   h: number;

@@ -6,7 +6,7 @@
   import Icon from '$lib/components/icons/Icon.svelte';
   import { getThumbnailDataUrl } from '$lib/mock/mockRepo';
   import { isTauriAvailable, tauriRepo, getAssetUrl } from '$lib/services/tauriRepo';
-  import { photoUrl, thumbUrl } from '$lib/media';
+  import { canPlayHevc, motionUrl, photoUrl, thumbUrl } from '$lib/media';
   import { theme, focusAsset } from '$lib/theme/engine.svelte';
   import { handleViewedPhotoChange } from '$lib/adaptive';
 
@@ -121,6 +121,119 @@
       videoProgress = 0;
     }
   });
+
+  // Video source (spec section 8): the file itself when this web view plays
+  // it, otherwise a repackaged or converted stream from the local player.
+  // Streams have no byte ranges, so seeking restarts them at the new time and
+  // the scrubber uses the duration from the index.
+  let videoSrc = $state('');
+  let streamUrl = $state('');
+  let streamOffset = $state(0);
+  let indexedDuration = $state(0);
+  let triedConversion = false;
+  let resumeAfterSeek = false;
+  let cannotPlay = $state(false);
+  let exportNote = $state('');
+
+  const streaming = $derived(streamUrl !== '');
+  const effectiveDuration = $derived(streaming ? indexedDuration : videoDuration);
+
+  // Live Photos: hover the LIVE badge, or press and hold the photo, to play
+  // the motion clip over the still.
+  let motionSrc = $state('');
+  let motionPlaying = $state(false);
+  let holdTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $effect(() => {
+    const a = asset;
+    videoSrc = '';
+    streamUrl = '';
+    streamOffset = 0;
+    indexedDuration = 0;
+    triedConversion = false;
+    cannotPlay = false;
+    exportNote = '';
+    motionSrc = '';
+    motionPlaying = false;
+    if (a.kind === 'video') loadVideo(a, false);
+    if (a.kind === 'live') loadMotion(a);
+  });
+
+  async function loadVideo(a: Asset, forceConvert: boolean) {
+    if (!isTauriAvailable()) {
+      videoSrc = photoUrl(a.id);
+      return;
+    }
+    try {
+      const plan = await tauriRepo.getVideoPlayback(a.id, canPlayHevc(), forceConvert);
+      if (asset.id !== a.id) return;
+      indexedDuration = (plan.duration_ms ?? 0) / 1000;
+      if (plan.decision.mode === 'playdirect') {
+        streamUrl = '';
+        videoSrc = photoUrl(a.id);
+      } else {
+        triedConversion = true;
+        streamUrl = plan.playback_url;
+        streamOffset = 0;
+        videoSrc = plan.playback_url;
+      }
+    } catch {
+      if (asset.id !== a.id) return;
+      if (forceConvert) {
+        cannotPlay = true;
+      } else {
+        videoSrc = photoUrl(a.id);
+      }
+    }
+  }
+
+  /** The web view refused a file it claimed to support: convert it instead, once. */
+  function handleVideoError() {
+    if (!triedConversion) {
+      triedConversion = true;
+      loadVideo(asset, true);
+      return;
+    }
+    cannotPlay = true;
+  }
+
+  function seekStream(seconds: number) {
+    if (!streamUrl) return;
+    resumeAfterSeek = !isPaused;
+    streamOffset = seconds;
+    videoSrc = `${streamUrl}&t=${seconds.toFixed(3)}`;
+  }
+
+  async function exportCurrent() {
+    try {
+      const res = await tauriRepo.exportAssets([asset.id]);
+      if (!res.cancelled) exportNote = res.exported > 0 ? 'Exported.' : 'Nothing was exported.';
+    } catch (e: any) {
+      exportNote = `Export failed: ${e?.toString?.() ?? e}`;
+    }
+  }
+
+  async function loadMotion(a: Asset) {
+    if (!isTauriAvailable()) return;
+    try {
+      const plan = await tauriRepo.getVideoPlayback(a.id, canPlayHevc());
+      if (asset.id !== a.id) return;
+      motionSrc = plan.decision.mode === 'playdirect' ? motionUrl(a.id) : plan.playback_url;
+    } catch {
+      // No motion clip available: the photo simply stays still.
+    }
+  }
+
+  function startHold() {
+    if (asset.kind !== 'live' || !motionSrc || zoomScale > 1.0) return;
+    holdTimer = setTimeout(() => (motionPlaying = true), 250);
+  }
+
+  function endHold() {
+    if (holdTimer) clearTimeout(holdTimer);
+    holdTimer = null;
+    motionPlaying = false;
+  }
 
   function resetIdle() {
     isIdle = false;
@@ -359,36 +472,84 @@
         "
       >
         {#if asset.kind === 'video'}
-          <video
-            bind:this={videoElement}
-            src={photoUrl(asset.id)}
-            class="viewer-main-image"
-            playsinline
-            loop={isLooping}
-            bind:currentTime
-            bind:duration={videoDuration}
-            bind:paused={isPaused}
-            bind:muted={isMuted}
-            bind:playbackRate={playbackSpeed}
-            onplay={() => (isPlaying = true)}
-            onpause={() => (isPlaying = false)}
-            ontimeupdate={() => {
-              if (videoDuration > 0) {
-                videoProgress = (currentTime / videoDuration) * 100;
-              }
-            }}
-          >
-            <track kind="captions" />
-          </video>
+          {#if videoSrc && !cannotPlay}
+            <video
+              bind:this={videoElement}
+              src={videoSrc}
+              class="viewer-main-image"
+              playsinline
+              loop={isLooping && !streaming}
+              bind:currentTime
+              bind:duration={videoDuration}
+              bind:paused={isPaused}
+              bind:muted={isMuted}
+              bind:playbackRate={playbackSpeed}
+              onplay={() => (isPlaying = true)}
+              onpause={() => (isPlaying = false)}
+              onerror={handleVideoError}
+              onloadeddata={() => {
+                if (resumeAfterSeek) {
+                  resumeAfterSeek = false;
+                  videoElement?.play();
+                }
+              }}
+              ontimeupdate={() => {
+                if (effectiveDuration > 0) {
+                  videoProgress = ((streamOffset + currentTime) / effectiveDuration) * 100;
+                }
+              }}
+            >
+              <track kind="captions" />
+            </video>
+          {/if}
         {:else}
           <img
             src={fullPhotoUrl}
             alt={asset.title || 'Photo'}
             class="viewer-main-image"
             onerror={handlePreviewError}
+            onpointerdown={startHold}
+            onpointerup={endHold}
+            onpointerleave={endHold}
           />
+          {#if asset.kind === 'live' && motionPlaying && motionSrc}
+            <video
+              src={motionSrc}
+              class="viewer-main-image live-motion"
+              autoplay
+              playsinline
+              onended={() => (motionPlaying = false)}
+              onerror={() => (motionPlaying = false)}
+            >
+              <track kind="captions" />
+            </video>
+          {/if}
         {/if}
       </div>
+
+      {#if asset.kind === 'live' && motionSrc}
+        <button
+          type="button"
+          class="viewer-live-badge {motionPlaying ? 'is-playing' : ''}"
+          aria-label="Play Live Photo"
+          onpointerenter={() => (motionPlaying = true)}
+          onpointerleave={() => (motionPlaying = false)}
+          onclick={(e) => {
+            e.stopPropagation();
+            motionPlaying = !motionPlaying;
+          }}
+        >
+          LIVE
+        </button>
+      {/if}
+
+      {#if asset.kind === 'video' && cannotPlay}
+        <div class="cannot-play">
+          <p>Can't play this video here.</p>
+          <Button variant="standard" onclick={exportCurrent}>Export Original…</Button>
+          {#if exportNote}<span class="cannot-play-note">{exportNote}</span>{/if}
+        </div>
+      {/if}
 
       <!-- Thin progress ring bottom-right for original loading (§4.6) -->
       {#if loadingOriginalProgress < 100}
@@ -437,8 +598,13 @@
               value={videoProgress}
               oninput={(e) => {
                 videoProgress = parseFloat(e.currentTarget.value);
-                if (videoElement && videoDuration > 0) {
+                if (!streaming && videoElement && videoDuration > 0) {
                   videoElement.currentTime = (videoProgress / 100) * videoDuration;
+                }
+              }}
+              onchange={(e) => {
+                if (streaming && indexedDuration > 0) {
+                  seekStream((parseFloat(e.currentTarget.value) / 100) * indexedDuration);
                 }
               }}
               class="video-scrubber-input"
@@ -629,6 +795,7 @@
   }
 
   .media-transform-wrap {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -643,6 +810,54 @@
     object-fit: contain;
     border-radius: 4px;
     box-shadow: 0 4px 30px rgba(0, 0, 0, 0.35);
+  }
+
+  .live-motion {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    box-shadow: none;
+  }
+
+  .viewer-live-badge {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    z-index: 12;
+    padding: 3px 9px;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: var(--r-pill);
+    background: rgba(0, 0, 0, 0.35);
+    color: #ffffff;
+    font-family: var(--font-stack);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+  }
+
+  .viewer-live-badge.is-playing {
+    background: rgba(255, 255, 255, 0.85);
+    color: #111111;
+  }
+
+  .cannot-play {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    color: #ffffff;
+    font-size: 15px;
+  }
+
+  .cannot-play-note {
+    font-size: 12px;
+    opacity: 0.75;
   }
 
   .original-progress-ring {

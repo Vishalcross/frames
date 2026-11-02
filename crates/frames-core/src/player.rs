@@ -514,7 +514,27 @@ impl LoopbackStreamServer {
                 can_seek_via_query: false,
             };
         }
+        self.create_stream_session(
+            asset_id,
+            presigned_s4_url,
+            url_refresher,
+            decision,
+            duration_ms,
+            encoder,
+        )
+    }
 
+    /// Register a repackage or convert session for `source` (a local file path
+    /// or a presigned S4 URL; ffmpeg reads either) and return its loopback URL.
+    pub fn create_stream_session(
+        &self,
+        asset_id: &str,
+        source: &str,
+        url_refresher: Option<UrlRefresher>,
+        decision: PlaybackDecision,
+        duration_ms: Option<u64>,
+        encoder: H264Encoder,
+    ) -> VideoPlaybackPlan {
         let session_id = format!("s-{:012x}", fastrand::u64(..));
         let mut st = self.state.lock().unwrap();
 
@@ -550,7 +570,7 @@ impl LoopbackStreamServer {
             StreamSession {
                 session_id: session_id.clone(),
                 session_token: session_token.clone(),
-                source_url: presigned_s4_url.to_string(),
+                source_url: source.to_string(),
                 decision,
                 encoder,
                 duration_ms,
@@ -887,5 +907,75 @@ mod tests {
             parse_and_validate_stream_request(req_target, "wrong-token"),
             Err(403)
         );
+    }
+
+    /// Fetch a loopback URL with a plain HTTP/1.1 GET and return the raw response.
+    fn http_get(url: &str) -> Vec<u8> {
+        use std::io::{Read, Write};
+        let rest = url.strip_prefix("http://").unwrap();
+        let (host, target) = rest.split_at(rest.find('/').unwrap());
+        let mut conn = std::net::TcpStream::connect(host).unwrap();
+        write!(conn, "GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        conn.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn streams_a_local_mkv_as_fragmented_mp4_and_seeks() {
+        let dir = std::env::temp_dir().join(format!("frames-player-{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clip.mkv");
+        // Two seconds of H.264 + AAC in Matroska: a container web views cannot play.
+        let made = spawn_hidden_command("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=160x120:rate=10:duration=2")
+            .args(["-f", "lavfi", "-i", "sine=duration=2"])
+            .args(["-c:v", "libx264", "-c:a", "aac", "-shortest"])
+            .arg(&src)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no usable ffmpeg on this machine
+        }
+
+        let server = LoopbackStreamServer::start().unwrap();
+        for decision in [
+            PlaybackDecision::Repackage,
+            PlaybackDecision::Convert {
+                copy_video: false,
+                copy_audio: false,
+            },
+        ] {
+            let plan = server.create_stream_session(
+                "asset",
+                src.to_str().unwrap(),
+                None,
+                decision,
+                Some(2_000),
+                H264Encoder::SoftwareX264,
+            );
+            for url in [plan.playback_url.clone(), server.build_seek_url(&plan.playback_url, 1.0)] {
+                let resp = http_get(&url);
+                let head = String::from_utf8_lossy(&resp[..resp.len().min(200)]).to_string();
+                assert!(head.starts_with("HTTP/1.1 200 OK"), "{decision:?} {url}: {head}");
+                let body_has = |tag: &[u8]| resp.windows(4).any(|w| w == tag);
+                assert!(body_has(b"ftyp") && body_has(b"moof"), "{decision:?}: not fragmented MP4");
+            }
+        }
+
+        // A wrong token never starts ffmpeg.
+        let plan = server.create_stream_session(
+            "asset",
+            src.to_str().unwrap(),
+            None,
+            PlaybackDecision::Repackage,
+            None,
+            H264Encoder::SoftwareX264,
+        );
+        let forged = plan.playback_url.split("token=").next().unwrap().to_string() + "token=nope";
+        assert!(String::from_utf8_lossy(&http_get(&forged)).starts_with("HTTP/1.1 403"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

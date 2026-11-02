@@ -7,6 +7,7 @@
 //! - `photo/<id>` (alias `original/<id>`): the original, from this computer
 //!   first, then the LRU cache, then S4. Remote photos are cached whole;
 //!   remote videos are streamed by passing the player's range requests to S4.
+//! - `motion/<id>`: a Live Photo's MOV, from this computer or S4 ranges.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -48,6 +49,7 @@ pub fn handle(app: &AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
         "thumb" => serve_thumbnail(state.thumbs.small(&id), head),
         "preview" => serve_thumbnail(state.thumbs.preview(&id), head),
         "photo" | "original" => serve_original(&state, &id, request.headers(), request.method()),
+        "motion" => serve_motion(&state, &id, request.headers(), request.method()),
         _ => empty(StatusCode::NOT_FOUND),
     }
 }
@@ -107,6 +109,19 @@ fn serve_original(state: &AppState, id: &str, headers: &HeaderMap, method: &Meth
     match download_original(state, s4.as_ref(), id, &info) {
         Some(path) => serve_local_original(state, id, &path, headers, method),
         None => serve_thumbnail(state.thumbs.preview(id), *method == Method::HEAD),
+    }
+}
+
+fn serve_motion(state: &AppState, id: &str, headers: &HeaderMap, method: &Method) -> Response<Vec<u8>> {
+    if let Some(src) = state.thumbs.local_motion(id) {
+        return serve_file_with_range(&src, headers, method);
+    }
+    let Some(info) = state.thumbs.motion_info(id) else {
+        return empty(StatusCode::NOT_FOUND);
+    };
+    match state.require_s4() {
+        Ok(s4) => serve_remote_range(s4.as_ref(), &info, headers, method),
+        Err(_) => empty(StatusCode::NOT_FOUND),
     }
 }
 

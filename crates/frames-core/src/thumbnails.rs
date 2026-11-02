@@ -176,6 +176,61 @@ impl ThumbService {
         .filter(|info| !info.key.is_empty())
     }
 
+    /// Where a Live Photo's motion file lives in S4, for streaming it when this
+    /// computer has no copy.
+    pub fn motion_info(&self, id: &str) -> Option<OriginalInfo> {
+        let (key, size) = self.motion_row(id)?.1?;
+        let filename = key.rsplit('/').next().unwrap_or("motion.MOV").to_string();
+        Some(OriginalInfo {
+            kind: AssetKind::Video,
+            key,
+            filename,
+            size,
+        })
+    }
+
+    /// A Live Photo's motion file on this computer: the MOV the importer read,
+    /// if it is still there with the recorded size.
+    pub fn local_motion(&self, id: &str) -> Option<PathBuf> {
+        let (motion_id, remote) = self.motion_row(id)?;
+        let size = remote.map(|(_, size)| size).unwrap_or(0);
+        let paths: Vec<String> = self
+            .with_reader(|c| {
+                let mut stmt = c.prepare("SELECT path FROM import_queue WHERE asset_id = ?1")?;
+                let rows = stmt.query_map([&motion_id], |r| r.get::<_, String>(0))?;
+                rows.collect()
+            })
+            .unwrap_or_default();
+        paths.into_iter().map(PathBuf::from).find(|p| {
+            fs::metadata(p)
+                .map(|m| m.is_file() && (size == 0 || m.len() == size))
+                .unwrap_or(false)
+        })
+    }
+
+    /// `(motion_id, Some((motion_key, motion_size)))` for a Live Photo.
+    #[allow(clippy::type_complexity)]
+    fn motion_row(&self, id: &str) -> Option<(String, Option<(String, u64)>)> {
+        if !is_asset_id(id) {
+            return None;
+        }
+        self.with_reader(|c| {
+            c.query_row(
+                "SELECT motion_id, motion_key, motion_size FROM assets
+                 WHERE id = ?1 AND kind = 'live' AND purged_at IS NULL AND motion_id IS NOT NULL",
+                [id],
+                |r| {
+                    let motion_id: String = r.get(0)?;
+                    let key: Option<String> = r.get(1)?;
+                    let size = r.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64;
+                    Ok((motion_id, key.filter(|k| !k.is_empty()).map(|k| (k, size))))
+                },
+            )
+            .optional()
+        })
+        .flatten()
+    }
+
     /// Assets still waiting for the background backfill.
     pub fn pending_count(&self) -> usize {
         self.backfill_pending.load(Ordering::SeqCst)
@@ -634,5 +689,43 @@ mod tests {
         assert_eq!(ready.lock().unwrap().len(), 6);
         assert!((10..16).all(|n| f.service.small_thumb_path(&id(n)).is_file()));
         assert_eq!(f.service.pending_count(), 0);
+    }
+
+    #[test]
+    fn finds_a_live_photos_motion_locally_or_in_s4() {
+        let f = fixture();
+        let mov = f.dir.join("IMG_0001.MOV");
+        fs::write(&mov, b"motion-bytes").unwrap();
+        let motion_id = id(41);
+        f.store
+            .connection()
+            .execute(
+                "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at,
+                                     motion_id, motion_key, motion_size)
+                 VALUES (?1, 'live', 'IMG_0001.HEIC', 1, '2024-05-01T00:00:00.000Z', 's', 's',
+                         ?2, 'originals/2024/05/IMG_0001.MOV', 12)",
+                rusqlite::params![id(40), motion_id],
+            )
+            .unwrap();
+        f.store
+            .connection()
+            .execute(
+                "INSERT INTO import_queue (path, size, mtime, state, asset_id)
+                 VALUES (?1, 12, 0, 'logged', ?2)",
+                rusqlite::params![mov.to_string_lossy(), motion_id],
+            )
+            .unwrap();
+
+        assert_eq!(f.service.local_motion(&id(40)), Some(mov.clone()));
+        let info = f.service.motion_info(&id(40)).unwrap();
+        assert_eq!((info.key.as_str(), info.size), ("originals/2024/05/IMG_0001.MOV", 12));
+        assert_eq!(info.filename, "IMG_0001.MOV");
+
+        // Replaced on disk by something else: not this motion clip any more.
+        fs::write(&mov, b"different length").unwrap();
+        assert!(f.service.local_motion(&id(40)).is_none());
+        // Not a Live Photo: no motion at all.
+        insert_asset(&f.store, &id(42), 10, None);
+        assert!(f.service.motion_info(&id(42)).is_none());
     }
 }

@@ -12,7 +12,8 @@
     selectedIds = $bindable<Set<string>>(new Set()),
     onopenphoto,
     onselectionchange,
-    ondelete
+    ondelete,
+    version = 0
   }: {
     album: AlbumItem;
     repo?: AssetRepo;
@@ -23,6 +24,8 @@
     onselectionchange?: (ids: Set<string>) => void;
     /** Asks the page to confirm and delete this album. */
     ondelete?: (album: AlbumItem) => void;
+    /** Bump to refresh the grid in place (see VirtualGrid). */
+    version?: number;
   } = $props();
 
   import { onMount } from 'svelte';
@@ -186,6 +189,7 @@
       bind:selectedIds
       {onopenphoto}
       {onselectionchange}
+      {version}
     />
   </div>
 

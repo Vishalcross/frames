@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -31,7 +31,7 @@ use crate::s4::{
     S4Error, SpaceUsage,
 };
 use crate::store::{
-    ImportQueueRow, ImportState, Store, StoreError, DEFAULT_OUTBOX_MAX_ASSETS,
+    ImportQueueRow, ImportState, Store, StoreAccess, StoreError, DEFAULT_OUTBOX_MAX_ASSETS,
 };
 
 #[derive(Debug, Error)]
@@ -142,42 +142,56 @@ pub struct SyncReport {
     pub snapshot_written: Option<String>,
 }
 
+/// One flush at a time: a batch's seq is read, uploaded and only then marked
+/// flushed, so two flushers must never hold the same seq at once.
+static FLUSH_LOCK: Mutex<()> = Mutex::new(());
+/// One pull at a time, so each device's batches are applied in seq order.
+static PULL_LOCK: Mutex<()> = Mutex::new(());
+
 /// Flush all pending local ops in `outbox` to `index/log/<device>/<seq:09>.json`
-/// in batches of at most `DEFAULT_OUTBOX_MAX_ASSETS` (~100 assets).
+/// in batches of at most `DEFAULT_OUTBOX_MAX_ASSETS` (~100 assets). The store
+/// is locked to read each batch and to mark it flushed, not during the upload.
 pub fn flush_outbox(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<usize> {
+    let _one_flusher = FLUSH_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let base_delay = s4.config().retry_base_delay_ms;
     let mut pushed = 0usize;
-    while let Some(pending) = store.peek_outbox_batch(DEFAULT_OUTBOX_MAX_ASSETS, now)? {
+    while let Some(pending) =
+        store.with(|st| st.peek_outbox_batch(DEFAULT_OUTBOX_MAX_ASSETS, now))?
+    {
         let key = log_key(&pending.batch.device, pending.batch.seq);
         let payload = serde_json::to_vec(&pending.batch)?;
         retry_with_backoff_cfg(5, base_delay, || {
             s4.put_object(&key, &payload, "application/json").map(|_| ())
         })?;
-        store.mark_outbox_flushed(&pending)?;
+        store.with(|st| st.mark_outbox_flushed(&pending))?;
         pushed += 1;
     }
     Ok(pushed)
 }
 
 /// Pull and apply any change-log batches in S4 (`index/log/<device>/<seq>.json`)
-/// with `seq > store.applied_seq(device)`, in `(device, seq)` order.
-pub fn pull_remote_logs(store: &mut Store, s4: &dyn ObjectStore) -> Result<usize> {
+/// with `seq > store.applied_seq(device)`, in `(device, seq)` order. Downloads
+/// happen with the store unlocked; each batch is applied under a short lock.
+pub fn pull_remote_logs(store: &mut impl StoreAccess, s4: &dyn ObjectStore) -> Result<usize> {
+    let _one_puller = PULL_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let base_delay = s4.config().retry_base_delay_ms;
     let objects = retry_with_backoff_cfg(5, base_delay, || s4.list_objects(LOG_PREFIX))?;
 
-    let mut to_fetch: Vec<(String, u64, String)> = Vec::new();
-    for obj in objects {
-        if let Some((dev, seq)) = parse_log_key(&obj.key) {
-            let applied = store.applied_seq(dev)?;
-            if seq > applied {
-                to_fetch.push((dev.to_string(), seq, obj.key));
+    let mut to_fetch = store.with(|st| -> Result<Vec<(String, u64, String)>> {
+        let mut out = Vec::new();
+        for obj in objects {
+            if let Some((dev, seq)) = parse_log_key(&obj.key) {
+                if seq > st.applied_seq(dev)? {
+                    out.push((dev.to_string(), seq, obj.key));
+                }
             }
         }
-    }
+        Ok(out)
+    })?;
     // Sort by device then seq ascending so each device's log is applied in seq order
     to_fetch.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
 
@@ -187,7 +201,7 @@ pub fn pull_remote_logs(store: &mut Store, s4: &dyn ObjectStore) -> Result<usize
             continue;
         };
         let batch: Batch = serde_json::from_slice(&bytes)?;
-        if store.apply_remote_batch(&batch)? {
+        if store.with(|st| st.apply_remote_batch(&batch))? {
             pulled += 1;
         }
     }
@@ -196,15 +210,20 @@ pub fn pull_remote_logs(store: &mut Store, s4: &dyn ObjectStore) -> Result<usize
 
 /// Write a full-state `.json.gz` snapshot to S4 if `store.needs_snapshot(now)` is true.
 pub fn write_snapshot_if_needed(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<Option<String>> {
-    if !store.needs_snapshot(now)? {
+    let snapshot = store.with(|st| -> Result<Option<(String, Vec<u8>)>> {
+        if !st.needs_snapshot(now)? {
+            return Ok(None);
+        }
+        Ok(Some(st.export_snapshot_gz(now)?))
+    })?;
+    let Some((key, gz_bytes)) = snapshot else {
         return Ok(None);
-    }
+    };
     let base_delay = s4.config().retry_base_delay_ms;
-    let (key, gz_bytes) = store.export_snapshot_gz(now)?;
     retry_with_backoff_cfg(5, base_delay, || {
         s4.put_object(&key, &gz_bytes, "application/gzip").map(|_| ())
     })?;
@@ -215,7 +234,7 @@ pub fn write_snapshot_if_needed(
 /// If S4 is unreachable (`S4Error::Offline`), returns `SyncReport { offline: true, .. }`
 /// while leaving local changes safely in `outbox` (spec section 11).
 pub fn sync_once(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<SyncReport> {
@@ -254,15 +273,15 @@ pub fn sync_once(
 /// Rebuild the local database from the newest S4 snapshot plus subsequent change
 /// logs (spec section 6 & section 11: "Rebuild deletes it and reloads from the
 /// snapshot plus logs").
-pub fn rebuild_from_s4(store: &mut Store, s4: &dyn ObjectStore) -> Result<SyncReport> {
-    store.reset_for_rebuild()?;
+pub fn rebuild_from_s4(store: &mut impl StoreAccess, s4: &dyn ObjectStore) -> Result<SyncReport> {
+    store.with(|st| st.reset_for_rebuild())?;
 
     let base_delay = s4.config().retry_base_delay_ms;
     let snap_objs = retry_with_backoff_cfg(5, base_delay, || s4.list_objects(SNAPSHOT_PREFIX))?;
     let snap_keys: Vec<&str> = snap_objs.iter().map(|o| o.key.as_str()).collect();
     if let Some(latest_key) = newest_snapshot(snap_keys) {
         if let Some(gz_bytes) = retry_with_backoff_cfg(5, base_delay, || s4.get_object(latest_key))? {
-            store.import_snapshot_gz(&gz_bytes)?;
+            store.with(|st| st.import_snapshot_gz(&gz_bytes))?;
         }
     }
 
@@ -294,7 +313,10 @@ pub struct LibraryCheckReport {
 /// multipart uploads (spec section 11: "Check library compares the S4 listing
 /// with the index: lists missing originals, offers to add unknown files, tidies
 /// uploads left over from a crash").
-pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheckReport> {
+pub fn check_library(
+    store: &mut impl StoreAccess,
+    s4: &dyn ObjectStore,
+) -> Result<LibraryCheckReport> {
     let all_objects = s4.list_objects("")?;
     let total_used: u64 = all_objects.iter().map(|o| o.size).sum();
     let space_usage = Some(SpaceUsage::compute(
@@ -308,34 +330,46 @@ pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheck
         .map(|o| o.key)
         .collect();
 
-    let mut indexed_keys: HashSet<String> = HashSet::new();
-    let mut missing_originals: Vec<String> = Vec::new();
+    let (missing_originals, indexed_keys, active_upload_ids) = store.with(
+        |st| -> Result<(Vec<String>, HashSet<String>, HashSet<String>)> {
+            let mut indexed_keys: HashSet<String> = HashSet::new();
+            let mut missing_originals: Vec<String> = Vec::new();
 
-    let mut stmt = store.connection().prepare(
-        "SELECT id, key, motion_key FROM assets WHERE purged_at IS NULL ORDER BY id ASC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Option<String>>(2)?,
-        ))
-    })?;
+            let mut stmt = st.connection().prepare(
+                "SELECT id, key, motion_key FROM assets WHERE purged_at IS NULL ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
 
-    for row in rows {
-        let (id, key, motion_key) = row?;
-        let mut missing = !s4_original_keys.contains(&key);
-        indexed_keys.insert(key);
-        if let Some(m_key) = motion_key {
-            if !s4_original_keys.contains(&m_key) {
-                missing = true;
+            for row in rows {
+                let (id, key, motion_key) = row?;
+                let mut missing = !s4_original_keys.contains(&key);
+                indexed_keys.insert(key);
+                if let Some(m_key) = motion_key {
+                    if !s4_original_keys.contains(&m_key) {
+                        missing = true;
+                    }
+                    indexed_keys.insert(m_key);
+                }
+                if missing {
+                    missing_originals.push(id);
+                }
             }
-            indexed_keys.insert(m_key);
-        }
-        if missing {
-            missing_originals.push(id);
-        }
-    }
+
+            // Incomplete multipart uploads still tracked in import_queue are live.
+            let active_upload_ids: HashSet<String> = st
+                .list_import_queue()?
+                .into_iter()
+                .filter_map(|r| r.upload_id)
+                .collect();
+            Ok((missing_originals, indexed_keys, active_upload_ids))
+        },
+    )?;
 
     let mut unknown_s4_keys: Vec<String> = s4_original_keys
         .into_iter()
@@ -344,12 +378,6 @@ pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheck
     unknown_s4_keys.sort();
 
     // Tidy incomplete multipart uploads not actively tracked in import_queue
-    let active_upload_ids: HashSet<String> = store
-        .list_import_queue()?
-        .into_iter()
-        .filter_map(|r| r.upload_id)
-        .collect();
-
     let incomplete = s4.list_multipart_uploads()?;
     let mut tidied = 0usize;
     for up in incomplete {
@@ -371,9 +399,9 @@ pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheck
 /// library by streaming each object to a temporary file, hashing it, extracting
 /// metadata and thumbnails, uploading thumbnails, and logging `asset.add` (spec §11).
 pub fn import_unknown_s4_keys(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
-    cache: &mut LocalCache,
+    cache: &Mutex<LocalCache>,
     keys: &[String],
     now: DateTime<Utc>,
 ) -> Result<usize> {
@@ -395,7 +423,7 @@ pub fn import_unknown_s4_keys(
             continue;
         }
         let hash = sha256_file(&tmp_file)?;
-        if store.has_active_or_trashed_asset(&hash)? {
+        if store.with(|st| st.has_active_or_trashed_asset(&hash))? {
             let _ = fs::remove_file(&tmp_file);
             continue;
         }
@@ -407,8 +435,10 @@ pub fn import_unknown_s4_keys(
             AssetKind::Photo
         };
         let thumbs = generate_thumbnails(&tmp_file, kind, &meta);
-        let _ = cache.put_small_thumb(&hash, &thumbs.small_webp);
-        let _ = cache.put_preview(&hash, &thumbs.preview_webp);
+        if let Ok(mut c) = cache.lock() {
+            let _ = c.put_small_thumb(&hash, &thumbs.small_webp);
+            let _ = c.put_preview(&hash, &thumbs.preview_webp);
+        }
 
         let s_key = thumb_small_key(&hash);
         let m_key = thumb_preview_key(&hash);
@@ -453,7 +483,7 @@ pub fn import_unknown_s4_keys(
             motion_size: None,
             thumb_failed: thumbs.thumb_failed,
         };
-        store.add_asset(record, None, now)?;
+        store.with(|st| st.add_asset(record, None, now))?;
         let _ = fs::remove_file(&tmp_file);
         added += 1;
     }
@@ -1150,9 +1180,7 @@ where
             report = shared_report.into_inner().unwrap();
 
             if !report.paused_offline && !control.is_cancelled() {
-                if let Ok(mut st) = store.lock() {
-                    let _ = flush_outbox(&mut st, s4.as_ref(), now);
-                }
+                let _ = flush_outbox(&mut &*store, s4.as_ref(), now);
             }
             if stop_folder_loop.load(Ordering::SeqCst) || control.is_cancelled() {
                 break 'folders;
@@ -1161,9 +1189,7 @@ where
     }
 
     if !report.paused_offline && !control.is_cancelled() {
-        if let Ok(mut st) = store.lock() {
-            let _ = flush_outbox(&mut st, s4.as_ref(), now);
-        }
+        let _ = flush_outbox(&mut &*store, s4.as_ref(), now);
     }
     if control.is_cancelled() {
         if let Ok(mut st) = store.lock() {
@@ -1555,6 +1581,32 @@ where
 // Export Originals to a Local Folder (Spec Section 2, 8, 9)
 // =============================================================================
 
+/// The LRU-cached copy of an original, downloaded first if needed. The cache
+/// is locked only to look the file up and to register it, never during the
+/// download, so thumbnails keep loading while a large export runs.
+fn cached_original(
+    cache: &Mutex<LocalCache>,
+    s4: &dyn ObjectStore,
+    id: &str,
+    filename: &str,
+    key: &str,
+) -> Result<Option<PathBuf>> {
+    let target = {
+        let mut c = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(path) = c.get_original_path(id, filename) {
+            return Ok(Some(path));
+        }
+        c.original_disk_path(id, filename)
+    };
+    if !s4.get_object_to_file(key, &target)? {
+        return Ok(None);
+    }
+    Ok(cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .register_downloaded_original(id, filename)?)
+}
+
 /// Export the original files (and Live Photo motion `.MOV` files) for `asset_ids`
 /// into `destination_dir`, reading from `cache` when available or downloading from S4.
 /// Disambiguates colliding filenames with `-<hash8>` (spec section 4) so no exported
@@ -1562,9 +1614,9 @@ where
 pub fn export_originals(
     asset_ids: &[String],
     destination_dir: impl AsRef<Path>,
-    store: &Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
-    cache: &mut LocalCache,
+    cache: &Mutex<LocalCache>,
 ) -> Result<Vec<PathBuf>> {
     let dest = destination_dir.as_ref();
     fs::create_dir_all(dest)?;
@@ -1572,13 +1624,11 @@ pub fn export_originals(
     let mut used_names: HashSet<String> = HashSet::new();
 
     for id in asset_ids {
-        let Some(detail) = store.get_asset(id)? else {
+        let Some(detail) = store.with(|st| st.get_asset(id))? else {
             continue;
         };
         let rec = &detail.record;
-        if let Some(cached_path) =
-            cache.get_or_fetch_original(s4, &rec.id, &rec.filename, &rec.key)?
-        {
+        if let Some(cached_path) = cached_original(cache, s4, &rec.id, &rec.filename, &rec.key)? {
             let chosen_name = if used_names.contains(&rec.filename)
                 || dest.join(&rec.filename).exists()
             {
@@ -1597,9 +1647,7 @@ pub fn export_originals(
                 .next()
                 .unwrap_or("motion.MOV")
                 .to_string();
-            if let Some(cached_mov) =
-                cache.get_or_fetch_original(s4, m_id, &mov_name, m_key)?
-            {
+            if let Some(cached_mov) = cached_original(cache, s4, m_id, &mov_name, m_key)? {
                 let chosen_mov = if used_names.contains(&mov_name)
                     || dest.join(&mov_name).exists()
                 {
@@ -1686,7 +1734,7 @@ mod tests {
 
         // Windows PC syncs from the same S4 bucket
         let mut win_store = Store::open_in_memory("win-1").unwrap();
-        let mut win_cache = LocalCache::open(&cache_dir_win.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+        let win_cache = LocalCache::open(&cache_dir_win.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
         let sync_rep = sync_once(&mut win_store, &s4, t(20)).unwrap();
         assert!(!sync_rep.offline);
         assert_eq!(sync_rep.batches_pulled, 1);
@@ -1698,7 +1746,8 @@ mod tests {
         // Windows downloads missing small thumbs in background & exports original + MOV
         let ids = vec![win_timeline[0].id.clone()];
         assert_eq!(win_cache.download_missing_small_thumbs(&s4, &ids).unwrap(), 1);
-        let exported = export_originals(&ids, &export_dir.0, &win_store, &s4, &mut win_cache).unwrap();
+        let win_cache = Mutex::new(win_cache);
+        let exported = export_originals(&ids, &export_dir.0, &mut win_store, &s4, &win_cache).unwrap();
         assert_eq!(exported.len(), 2);
 
         // Mac writes a snapshot; a brand-new rebuild loads snapshot + logs cleanly
@@ -1709,7 +1758,7 @@ mod tests {
         assert_eq!(win_store.list_timeline(None, None).unwrap().len(), 1);
 
         // Check library confirms 0 missing originals and 0 unknown S4 keys
-        let check = check_library(&win_store, &s4).unwrap();
+        let check = check_library(&mut win_store, &s4).unwrap();
         assert!(check.missing_originals.is_empty());
         assert!(check.unknown_s4_keys.is_empty());
     }
@@ -1761,7 +1810,7 @@ mod tests {
         assert_eq!(timeline.len(), 2);
         let ids: Vec<String> = timeline.into_iter().map(|a| a.id).collect();
 
-        let exported = export_originals(&ids, &export_dir.0, &store, &s4, &mut cache).unwrap();
+        let exported = export_originals(&ids, &export_dir.0, &mut store, &s4, &Mutex::new(cache)).unwrap();
         assert_eq!(exported.len(), 2);
         assert_ne!(exported[0], exported[1]);
         assert!(exported[0].exists());
@@ -1775,20 +1824,21 @@ mod tests {
     fn import_unknown_s4_keys_adds_unindexed_objects_to_library() {
         let cache_dir = TempDir::new();
         let s4 = InMemoryObjectStore::new(S4Config::default());
-        let mut store = Store::open_in_memory("mac-1").unwrap();
-        let mut cache = LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+        // The app's shared form: the store is locked only between S4 calls.
+        let store = Mutex::new(Store::open_in_memory("mac-1").unwrap());
+        let cache = Mutex::new(LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap());
 
         let key = "originals/2024/05/IMG_20240512_143022.JPG";
         let bytes = b"unindexed-s4-photo-bytes";
         s4.put_object(key, bytes, "image/jpeg").unwrap();
 
-        let check = check_library(&store, &s4).unwrap();
+        let check = check_library(&mut &store, &s4).unwrap();
         assert_eq!(check.unknown_s4_keys, vec![key.to_string()]);
 
         let added = import_unknown_s4_keys(
-            &mut store,
+            &mut &store,
             &s4,
-            &mut cache,
+            &cache,
             &check.unknown_s4_keys,
             t(50),
         )
@@ -1796,9 +1846,9 @@ mod tests {
         assert_eq!(added, 1);
 
         let expected_id = sha256_bytes(bytes);
-        assert!(store.has_active_or_trashed_asset(&expected_id).unwrap());
+        assert!(store.lock().unwrap().has_active_or_trashed_asset(&expected_id).unwrap());
 
-        let check_after = check_library(&store, &s4).unwrap();
+        let check_after = check_library(&mut &store, &s4).unwrap();
         assert!(check_after.unknown_s4_keys.is_empty());
     }
 
@@ -2048,5 +2098,122 @@ mod tests {
             .filter(|row| row.state != ImportState::Logged)
             .all(|row| row.state == ImportState::Failed
                 && row.error.as_deref().is_some_and(|e| e.starts_with("Cancelled"))));
+    }
+
+    /// An S4 stand-in that fails the test if the store is locked while any
+    /// S4 request is made, i.e. if a network call happens under the lock.
+    struct LockCheckingStore<'a> {
+        inner: InMemoryObjectStore,
+        store: &'a Mutex<Store>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LockCheckingStore<'_> {
+        fn check(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(self.store.try_lock().is_ok(), "S4 request made while the store was locked");
+        }
+    }
+
+    impl ObjectStore for LockCheckingStore<'_> {
+        fn head_object(&self, key: &str) -> crate::s4::Result<Option<crate::s4::ObjectMeta>> {
+            self.check();
+            self.inner.head_object(key)
+        }
+        fn get_object(&self, key: &str) -> crate::s4::Result<Option<Vec<u8>>> {
+            self.check();
+            self.inner.get_object(key)
+        }
+        fn get_object_range(&self, key: &str, start: u64, end: Option<u64>) -> crate::s4::Result<Option<Vec<u8>>> {
+            self.check();
+            self.inner.get_object_range(key, start, end)
+        }
+        fn put_object(&self, key: &str, body: &[u8], content_type: &str) -> crate::s4::Result<String> {
+            self.check();
+            self.inner.put_object(key, body, content_type)
+        }
+        fn delete_object(&self, key: &str) -> crate::s4::Result<()> {
+            self.check();
+            self.inner.delete_object(key)
+        }
+        fn list_objects(&self, prefix: &str) -> crate::s4::Result<Vec<crate::s4::ObjectMeta>> {
+            self.check();
+            self.inner.list_objects(prefix)
+        }
+        fn put_object_from_file(&self, key: &str, path: &Path, content_type: &str, sha: Option<&str>) -> crate::s4::Result<String> {
+            self.check();
+            self.inner.put_object_from_file(key, path, content_type, sha)
+        }
+        fn create_multipart_upload(&self, key: &str, content_type: &str, sha: Option<&str>) -> crate::s4::Result<String> {
+            self.check();
+            self.inner.create_multipart_upload(key, content_type, sha)
+        }
+        fn upload_part(&self, key: &str, upload_id: &str, part: u32, body: &[u8]) -> crate::s4::Result<String> {
+            self.check();
+            self.inner.upload_part(key, upload_id, part, body)
+        }
+        fn list_parts(&self, key: &str, upload_id: &str) -> crate::s4::Result<Vec<crate::s4::UploadedPart>> {
+            self.check();
+            self.inner.list_parts(key, upload_id)
+        }
+        fn complete_multipart_upload(&self, key: &str, upload_id: &str, parts: &[(u32, String)]) -> crate::s4::Result<()> {
+            self.check();
+            self.inner.complete_multipart_upload(key, upload_id, parts)
+        }
+        fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> crate::s4::Result<()> {
+            self.check();
+            self.inner.abort_multipart_upload(key, upload_id)
+        }
+        fn list_multipart_uploads(&self) -> crate::s4::Result<Vec<crate::s4::IncompleteMultipartUpload>> {
+            self.check();
+            self.inner.list_multipart_uploads()
+        }
+        fn presign_get(&self, key: &str, now: DateTime<Utc>, expires_secs: u64) -> crate::s4::Result<String> {
+            self.inner.presign_get(key, now, expires_secs)
+        }
+        fn config(&self) -> &S4Config {
+            self.inner.config()
+        }
+    }
+
+    #[test]
+    fn sync_check_and_trash_never_hold_the_store_lock_during_s4_calls() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        fs::write(src_dir.0.join("IMG_20240512_150000.JPG"), b"from-the-pc").unwrap();
+        let s4 = InMemoryObjectStore::new(S4Config::default());
+
+        // The other computer imports a photo and logs it.
+        let mut win = Store::open_in_memory("win-1").unwrap();
+        let mut win_cache = LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+        run_import([&src_dir.0], None, &mut win, &s4, &mut win_cache, t(10)).unwrap();
+
+        // This computer has a local change waiting in its outbox.
+        let mac = Mutex::new(Store::open_in_memory("mac-1").unwrap());
+        mac.lock().unwrap().create_album("alb-1".into(), "Trip".into(), t(11)).unwrap();
+        let checking = LockCheckingStore {
+            inner: s4,
+            store: &mac,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let rep = sync_once(&mut &mac, &checking, t(12)).unwrap();
+        assert_eq!(rep.batches_pushed, 1);
+        assert!(rep.batches_pulled >= 1);
+        let ids: Vec<String> = mac
+            .lock()
+            .unwrap()
+            .list_timeline(None, None)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids.len(), 1);
+
+        check_library(&mut &mac, &checking).unwrap();
+        mac.lock().unwrap().trash_assets(ids, t(13)).unwrap();
+        let purged = crate::trash::empty_trash(&mut &mac, &checking, t(14)).unwrap();
+        assert_eq!(purged.purged_asset_ids.len(), 1);
+        assert!(checking.calls.load(Ordering::SeqCst) > 5);
     }
 }

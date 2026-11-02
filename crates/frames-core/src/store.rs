@@ -137,6 +137,8 @@ pub struct MonthGroup {
     pub year: i32,
     pub month: u32,
     pub count: usize,
+    /// The month's newest asset, used as its cover in the Years and Months views.
+    pub key_asset_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +307,28 @@ pub struct SnapshotAlbumItem {
 
 pub struct Store {
     conn: Connection,
+}
+
+/// How sync, import and trash code reach the store. The app passes its shared
+/// `&Mutex<Store>`, which is locked only for each closure, so S4 calls made
+/// between closures never block the UI; tests pass a plain `Store`.
+///
+/// Pass the mutex itself (`&mut &*arc`), never `&mut *guard`: a held guard
+/// would keep the lock across the network calls these functions make.
+pub trait StoreAccess {
+    fn with<R>(&mut self, f: impl FnOnce(&mut Store) -> R) -> R;
+}
+
+impl StoreAccess for Store {
+    fn with<R>(&mut self, f: impl FnOnce(&mut Store) -> R) -> R {
+        f(self)
+    }
+}
+
+impl StoreAccess for &std::sync::Mutex<Store> {
+    fn with<R>(&mut self, f: impl FnOnce(&mut Store) -> R) -> R {
+        f(&mut self.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
 }
 
 impl Store {
@@ -1162,18 +1186,22 @@ impl Store {
     /// using local wall-clock time (`taken_at` + `tz_offset`), matching sticky month headers.
     pub fn timeline_month_groups(&self) -> Result<Vec<MonthGroup>> {
         let mut stmt = self.conn.prepare(
-            "SELECT taken_at, tz_offset
+            "SELECT taken_at, tz_offset, id
              FROM assets
              WHERE trashed_at IS NULL AND purged_at IS NULL
              ORDER BY taken_at DESC, id ASC",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i32>>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i32>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
 
         let mut groups: Vec<MonthGroup> = Vec::new();
         for row in rows {
-            let (taken_str, tz_offset) = row?;
+            let (taken_str, tz_offset, id) = row?;
             let utc = parse_utc(&taken_str)?;
             let taken = Taken {
                 utc,
@@ -1188,10 +1216,12 @@ impl Store {
                     continue;
                 }
             }
+            // Rows arrive newest first, so the first asset seen is the cover.
             groups.push(MonthGroup {
                 year,
                 month,
                 count: 1,
+                key_asset_id: id,
             });
         }
         Ok(groups)
@@ -2778,5 +2808,27 @@ mod tests {
         // Idempotent: nothing left to remove, backup untouched.
         assert_eq!(store.remove_legacy_folder_assets(&backup).unwrap(), 0);
         let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn month_groups_use_each_months_newest_asset_as_cover() {
+        let store = Store::open_in_memory("mac-1").unwrap();
+        for (id, taken) in [
+            ("may-early", "2024-05-02T10:00:00.000Z"),
+            ("may-late", "2024-05-28T10:00:00.000Z"),
+            ("april", "2024-04-15T10:00:00.000Z"),
+        ] {
+            store.connection().execute(
+                "INSERT INTO assets (id, kind, filename, size, taken_at, tz_offset, date_at, state_at)
+                 VALUES (?1, 'photo', 'p.jpg', 1, ?2, 0, 'now', 'now')",
+                params![id, taken],
+            ).unwrap();
+        }
+        let groups = store.timeline_month_groups().unwrap();
+        let summary: Vec<(u32, usize, &str)> = groups
+            .iter()
+            .map(|g| (g.month, g.count, g.key_asset_id.as_str()))
+            .collect();
+        assert_eq!(summary, vec![(5, 2, "may-late"), (4, 1, "april")]);
     }
 }

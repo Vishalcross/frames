@@ -44,6 +44,9 @@
   // Real Backend State
   const isTauri = isTauriAvailable();
   let gridKey = $state(0);
+  // Bumped when the library changes underneath (import, sync); grids refetch
+  // in place instead of remounting, so the scroll position survives.
+  let libraryVersion = $state(0);
   let albums = $state<AlbumItem[]>([]);
   let isSyncing = $state(false);
   let outboxPending = $state(0);
@@ -158,11 +161,17 @@
   });
 
   async function loadLibraryData() {
+    await refreshLibraryData();
+    gridKey++;
+  }
+
+  /** Reload library data and refresh the visible grid where it stands. */
+  async function refreshLibraryData() {
     await tauriRepo.loadBootstrap();
     albums = tauriRepo.getAlbums();
     outboxPending = tauriRepo.outboxPending;
     isOffline = tauriRepo.offline;
-    gridKey++;
+    libraryVersion++;
   }
 
   async function handleSyncNow() {
@@ -174,7 +183,7 @@
     toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Syncing with MEGA S4 cloud…' }];
     const rep = await tauriRepo.syncNow();
     isSyncing = false;
-    await loadLibraryData();
+    await refreshLibraryData();
     if (rep?.error) {
       toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Sync status: ${rep.error}` }];
     } else if (rep) {
@@ -220,10 +229,13 @@
           if (!importRefreshTimer) {
             importRefreshTimer = setTimeout(async () => {
               importRefreshTimer = null;
-              await loadLibraryData();
-            }, 1000);
+              await refreshLibraryData();
+            }, 2000);
           }
         }).then((un) => unlistens.push(un));
+
+        // The background sync pulled changes from another computer.
+        listen('library-changed', () => refreshLibraryData()).then((un) => unlistens.push(un));
       });
     }
 
@@ -548,6 +560,7 @@
                   bind:isFill
                   bind:selectedIds
                   onopenphoto={openPhoto}
+                  version={libraryVersion}
                 />
               {/key}
             {/if}
@@ -569,6 +582,7 @@
             bind:selectedIds
             onopenphoto={openPhoto}
             ondelete={isTauri ? handleDeleteAlbumPrompt : undefined}
+            version={libraryVersion}
           />
         {:else if currentRoute === 'people-pets'}
           <PeoplePetsView onselectperson={() => navigate('library')} />
@@ -584,7 +598,7 @@
             {isTauri}
             onimport={handlePickFolderAndImport}
             onsync={handleSyncNow}
-            onimported={() => loadLibraryData()}
+            onimported={() => refreshLibraryData()}
             onnavigatelibrary={() => navigate('library')}
           />
         {:else}
@@ -597,6 +611,7 @@
               bind:isFill
               bind:selectedIds
               onopenphoto={openPhoto}
+              version={libraryVersion}
             />
           {/key}
         {/if}

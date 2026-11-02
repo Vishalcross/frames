@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::AppState;
 use frames_core::{AlbumTheme, Palette};
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_palette(
     state: State<'_, AppState>,
     asset_id: String,
@@ -30,7 +30,7 @@ pub fn get_palette(
     Ok(None)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_album_theme(
     state: State<'_, AppState>,
     album_id: String,
@@ -40,7 +40,7 @@ pub fn get_album_theme(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_asset_album_id(
     state: State<'_, AppState>,
     asset_id: String,
@@ -61,7 +61,7 @@ pub fn get_asset_album_id(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_album_theme(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -101,7 +101,7 @@ pub fn set_album_theme(
     Ok(theme)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn regenerate_album_palette(
     app: AppHandle,
     state: State<'_, AppState>,

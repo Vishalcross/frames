@@ -14,7 +14,8 @@
     isFill = $bindable(true),
     selectedIds = $bindable<Set<string>>(new Set()),
     onopenphoto,
-    onselectionchange
+    onselectionchange,
+    version = 0
   }: {
     query?: Query;
     repo?: AssetRepo;
@@ -23,6 +24,8 @@
     selectedIds?: Set<string>;
     onopenphoto?: (asset: Asset) => void;
     onselectionchange?: (ids: Set<string>) => void;
+    /** Bump to refetch the current query in place, keeping the scroll position. */
+    version?: number;
   } = $props();
 
   let containerRef: HTMLDivElement | null = $state(null);
@@ -37,6 +40,9 @@
   let loadedPages = new Set<number>();
   let inFlightPages = new Set<number>();
   let activeQueryKey = '';
+  let activeVersion = 0;
+  // Read by the page loader so a refresh can refetch pages already loaded.
+  let refreshTick = $state(0);
 
   export function getAsset(index: number): Asset | undefined {
     const pageIdx = Math.floor(index / PAGE_SIZE);
@@ -103,8 +109,25 @@
     }
   });
 
+  // Library changed underneath (import, sync): recount and refetch in place.
+  // Loaded pages stay on screen until their replacements arrive.
+  $effect(() => {
+    const v = version;
+    if (v === activeVersion) return;
+    activeVersion = v;
+    const key = activeQueryKey;
+    repo.count(query).then((cnt) => {
+      if (activeQueryKey !== key) return;
+      loadedPages.clear();
+      inFlightPages.clear();
+      totalAssets = cnt;
+      refreshTick++;
+    });
+  });
+
   // Load pages of 200 assets covering visible rows
   $effect(() => {
+    void refreshTick;
     if (totalAssets <= 0) return;
     const s = startIndex;
     const e = Math.min(totalAssets, endIndex);

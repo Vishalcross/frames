@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::keys::{thumb_preview_key, thumb_small_key};
+use crate::keys::thumb_small_key;
 use crate::s4::{ObjectStore, Result as S4Result};
 
 /// Default LRU cap for `m.webp` previews and originals: 10 GB (spec section 9 & 10).
@@ -210,19 +210,6 @@ impl LocalCache {
         self.put_lru_entry(&rel, bytes)
     }
 
-    /// Fetch `m.webp` from local LRU cache, or download from S4 and cache it on demand.
-    pub fn get_or_fetch_preview(&mut self, s4: &dyn ObjectStore, id: &str) -> S4Result<Option<PathBuf>> {
-        if let Some(p) = self.get_preview_path(id) {
-            return Ok(Some(p));
-        }
-        let key = thumb_preview_key(id);
-        if let Some(bytes) = s4.get_object(&key)? {
-            let p = self.put_preview(id, &bytes)?;
-            return Ok(Some(p));
-        }
-        Ok(None)
-    }
-
     pub fn get_original_path(&mut self, id: &str, filename: &str) -> Option<PathBuf> {
         let rel = Self::original_rel_path(id, filename);
         self.touch_lru(&rel)
@@ -267,25 +254,6 @@ impl LocalCache {
     pub fn put_original(&mut self, id: &str, filename: &str, bytes: &[u8]) -> io::Result<PathBuf> {
         let rel = Self::original_rel_path(id, filename);
         self.put_lru_entry(&rel, bytes)
-    }
-
-    /// Fetch an original file from local LRU cache, or stream it directly from S4
-    /// (`s4_key`) to disk without buffering the entire file in RAM.
-    pub fn get_or_fetch_original(
-        &mut self,
-        s4: &dyn ObjectStore,
-        id: &str,
-        filename: &str,
-        s4_key: &str,
-    ) -> S4Result<Option<PathBuf>> {
-        if let Some(p) = self.get_original_path(id, filename) {
-            return Ok(Some(p));
-        }
-        let full = self.original_disk_path(id, filename);
-        if s4.get_object_to_file(s4_key, &full)? {
-            return Ok(self.register_downloaded_original(id, filename)?);
-        }
-        Ok(None)
     }
 
     fn touch_lru(&mut self, rel_path: &str) -> Option<PathBuf> {

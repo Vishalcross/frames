@@ -36,7 +36,7 @@ use frames_core::sync::{
 };
 use frames_core::thumbnails::ThumbService;
 use frames_core::trash::{
-    delete_trash_items_now, empty_trash, purge_expired_trash_concurrent, trash_summary,
+    delete_trash_items_now, empty_trash, purge_expired_trash, trash_summary,
     PurgeReport, TrashSummary,
 };
 
@@ -376,9 +376,29 @@ impl AppState {
     }
 }
 
-/// How often unfinished imports are retried, so an import cut off by a lost
-/// connection carries on once the network is back (spec sections 7 and 11).
-const IMPORT_RESUME_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How often the library syncs with S4 and unfinished imports are retried
+/// (spec section 6: "every 5 minutes and after coming back online").
+const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// One background round: push local changes, pull the other computer's, tell
+/// the UI if anything arrived or the connection changed, then carry on with
+/// unfinished imports. The store is only locked between S4 calls.
+fn background_sync(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Ok(s4) = state.require_s4() {
+        if let Ok(rep) = sync_once(&mut &*state.store, s4.as_ref(), Utc::now()) {
+            let was_offline =
+                std::mem::replace(&mut *state.offline_mode.lock().unwrap(), rep.offline);
+            if rep.batches_pulled > 0 {
+                state.start_thumb_backfill(app);
+            }
+            if rep.batches_pulled > 0 || was_offline != rep.offline {
+                let _ = app.emit("library-changed", &rep);
+            }
+        }
+    }
+    resume_imports_in_background(app);
+}
 
 /// Carry on with imports an earlier run left unfinished, if S4 is usable and
 /// no import is running. Reports through the usual `frames://import-progress`
@@ -428,7 +448,7 @@ fn check_core_status(filename: &str) -> CoreStatus {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_app_bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
     let now = Utc::now();
     let payload = {
@@ -482,7 +502,7 @@ fn get_app_bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Boots
     Ok(payload)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_timeline(
     limit: Option<usize>,
     offset: Option<usize>,
@@ -499,7 +519,7 @@ fn get_timeline(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_asset_detail(id: String, state: State<'_, AppState>) -> Result<Option<AssetDetail>, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.get_asset(&id).map_err(|e| e.to_string())
@@ -523,7 +543,7 @@ async fn get_thumbnail_data_url(
     .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_video_playback(
     id: String,
     supports_hevc: bool,
@@ -585,7 +605,7 @@ fn get_video_playback(
     Ok(plan)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_video_seek_url(
     base_url: String,
     seek_seconds: f64,
@@ -594,7 +614,7 @@ fn get_video_seek_url(
     Ok(state.player_server.build_seek_url(&base_url, seek_seconds))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn adjust_asset_date(
     id: String,
     new_taken_iso: String,
@@ -621,10 +641,9 @@ async fn export_assets(
     let s4 = state.require_s4()?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = store_arc.lock().map_err(|e| e.to_string())?;
-        let mut cache = cache_arc.lock().map_err(|e| e.to_string())?;
-        let paths = export_originals(&ids, &destination_folder, &store, s4.as_ref(), &mut cache)
-            .map_err(|e| e.to_string())?;
+        let paths =
+            export_originals(&ids, &destination_folder, &mut &*store_arc, s4.as_ref(), &cache_arc)
+                .map_err(|e| e.to_string())?;
         Ok(paths
             .into_iter()
             .map(|p| p.to_string_lossy().to_string())
@@ -697,19 +716,19 @@ async fn pick_folder_dialog(prompt: Option<String>) -> Result<Option<String>, St
 // Album Commands
 // =============================================================================
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_albums(state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn album_asset_count(album_id: String, state: State<'_, AppState>) -> Result<usize, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.album_asset_count(&album_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_album_assets(
     album_id: String,
     offset: Option<usize>,
@@ -722,7 +741,7 @@ fn get_album_assets(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn debug_album(
     album_id: String,
     state: State<'_, AppState>,
@@ -731,7 +750,7 @@ fn debug_album(
     store.debug_album(&album_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_album(name: String, state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -745,7 +764,7 @@ fn create_album(name: String, state: State<'_, AppState>) -> Result<Vec<AlbumSum
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_album(
     album_id: String,
     name: String,
@@ -762,7 +781,7 @@ fn rename_album(
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_album(album_id: String, state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store
@@ -771,7 +790,7 @@ fn delete_album(album_id: String, state: State<'_, AppState>) -> Result<Vec<Albu
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_to_album(
     album_id: String,
     asset_ids: Vec<String>,
@@ -784,7 +803,7 @@ fn add_to_album(
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_from_album(
     album_id: String,
     asset_ids: Vec<String>,
@@ -797,7 +816,7 @@ fn remove_from_album(
     store.list_album_assets(&album_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn move_to_album(
     from_album_id: String,
     to_album_id: String,
@@ -817,7 +836,7 @@ fn move_to_album(
 // Search Commands
 // =============================================================================
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_search_suggestions(
     query: String,
     state: State<'_, AppState>,
@@ -826,7 +845,7 @@ fn get_search_suggestions(
     store.search_suggestions(&query).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn search_assets(
     filter: SearchFilter,
     state: State<'_, AppState>,
@@ -839,7 +858,7 @@ fn search_assets(
 // Trash Commands
 // =============================================================================
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_trash(state: State<'_, AppState>) -> Result<TrashPayload, String> {
     let now = Utc::now();
     let store = state.store.lock().map_err(|e| e.to_string())?;
@@ -848,7 +867,7 @@ fn get_trash(state: State<'_, AppState>) -> Result<TrashPayload, String> {
     Ok(TrashPayload { items, summary })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn trash_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store
@@ -856,7 +875,7 @@ fn trash_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), Stri
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn restore_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store
@@ -865,17 +884,25 @@ fn restore_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), St
 }
 
 #[tauri::command]
-fn delete_trash_now(ids: Vec<String>, state: State<'_, AppState>) -> Result<PurgeReport, String> {
+async fn delete_trash_now(ids: Vec<String>, state: State<'_, AppState>) -> Result<PurgeReport, String> {
     let s4 = state.require_s4()?;
-    let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    delete_trash_items_now(&mut store, s4.as_ref(), &ids, Utc::now()).map_err(|e| e.to_string())
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_trash_items_now(&mut &*store, s4.as_ref(), &ids, Utc::now()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn empty_all_trash(state: State<'_, AppState>) -> Result<PurgeReport, String> {
+async fn empty_all_trash(state: State<'_, AppState>) -> Result<PurgeReport, String> {
     let s4 = state.require_s4()?;
-    let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    empty_trash(&mut store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        empty_trash(&mut &*store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // =============================================================================
@@ -916,31 +943,31 @@ async fn import_from_paths(
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pause_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     state.import_control.pause();
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resume_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     state.import_control.resume();
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cancel_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     state.import_control.cancel();
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reset_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     state.import_control.force_reset();
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_import_queue(all: Option<bool>, state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
@@ -953,7 +980,7 @@ fn clear_import_queue(all: Option<bool>, state: State<'_, AppState>) -> Result<I
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_import_status(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let progress = store.import_progress().map_err(|e| e.to_string())?;
@@ -972,7 +999,7 @@ fn sample_id(name: &str) -> String {
     frames_core::media::sha256_bytes(name.as_bytes())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
     // Explicitly switch to Local Sandbox Mode when seeding the demo library if real S4 is unconfigured
     {
@@ -1177,7 +1204,9 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
         added += 1;
     }
 
-    let _ = sync_once(&mut store, s4.as_ref(), now);
+    drop(cache);
+    drop(store);
+    let _ = sync_once(&mut &*state.store, s4.as_ref(), now);
     Ok(added)
 }
 
@@ -1218,8 +1247,7 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncRepo
     };
 
     let rep = tauri::async_runtime::spawn_blocking(move || {
-        let mut store = store_arc.lock().map_err(|e| e.to_string())?;
-        sync_once(&mut store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
+        sync_once(&mut &*store_arc, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -1256,14 +1284,14 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncRepo
     Ok(rep)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn toggle_offline_mode(offline: bool, state: State<'_, AppState>) -> Result<bool, String> {
     state.demo_s4.set_offline(offline);
     *state.offline_mode.lock().unwrap() = offline;
     Ok(offline)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_settings(
     input: SettingsInput,
     app: AppHandle,
@@ -1329,7 +1357,7 @@ pub struct WorkerStatus {
     pub thumb_generating_count: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_worker_status(state: State<'_, AppState>) -> Result<WorkerStatus, String> {
     let uploading_count = if state.import_control.is_running() {
         let store = state.store.lock().map_err(|e| e.to_string())?;
@@ -1345,7 +1373,7 @@ fn get_worker_status(state: State<'_, AppState>) -> Result<WorkerStatus, String>
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_local_cache(state: State<'_, AppState>) -> Result<(u64, CacheStats), String> {
     let mut cache = state.cache.lock().map_err(|e| e.to_string())?;
     let freed = cache.clear_lru_cache().map_err(|e| e.to_string())?;
@@ -1358,8 +1386,7 @@ async fn run_check_library(state: State<'_, AppState>) -> Result<LibraryCheckRep
     let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || {
-        let store = store_arc.lock().map_err(|e| e.to_string())?;
-        check_library(&store, s4.as_ref()).map_err(|e| e.to_string())
+        check_library(&mut &*store_arc, s4.as_ref()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1374,9 +1401,7 @@ async fn add_unknown_s4_files(
     let store_arc = Arc::clone(&state.store);
     let cache_arc = Arc::clone(&state.cache);
     tauri::async_runtime::spawn_blocking(move || {
-        let mut store = store_arc.lock().map_err(|e| e.to_string())?;
-        let mut cache = cache_arc.lock().map_err(|e| e.to_string())?;
-        import_unknown_s4_keys(&mut store, s4.as_ref(), &mut cache, &keys, Utc::now())
+        import_unknown_s4_keys(&mut &*store_arc, s4.as_ref(), &cache_arc, &keys, Utc::now())
             .map_err(|e| e.to_string())
     })
     .await
@@ -1388,8 +1413,7 @@ async fn run_rebuild_database(app: AppHandle, state: State<'_, AppState>) -> Res
     let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
     let rep = tauri::async_runtime::spawn_blocking(move || {
-        let mut store = store_arc.lock().map_err(|e| e.to_string())?;
-        rebuild_from_s4(&mut store, s4.as_ref()).map_err(|e| e.to_string())
+        rebuild_from_s4(&mut &*store_arc, s4.as_ref()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -1421,11 +1445,7 @@ pub fn run() {
                     loop {
                         let state = handle.state::<AppState>();
                         if let Ok(s4) = state.require_s4() {
-                            let _ = purge_expired_trash_concurrent(
-                                &state.store,
-                                s4.as_ref(),
-                                Utc::now(),
-                            );
+                            let _ = purge_expired_trash(&mut &*state.store, s4.as_ref(), Utc::now());
                         }
                         std::thread::sleep(Duration::from_secs(24 * 3600));
                     }
@@ -1434,14 +1454,17 @@ pub fn run() {
 
             app.state::<AppState>().start_thumb_backfill(app.handle());
 
+            // The UI syncs once at launch; this picks up unfinished imports
+            // shortly after, then keeps syncing every few minutes.
             let handle = app.handle().clone();
             std::thread::Builder::new()
-                .name("frames-import-resume".into())
+                .name("frames-background-sync".into())
                 .spawn(move || {
                     std::thread::sleep(Duration::from_secs(5));
+                    resume_imports_in_background(&handle);
                     loop {
-                        resume_imports_in_background(&handle);
-                        std::thread::sleep(IMPORT_RESUME_INTERVAL);
+                        std::thread::sleep(BACKGROUND_SYNC_INTERVAL);
+                        background_sync(&handle);
                     }
                 })
                 .ok();

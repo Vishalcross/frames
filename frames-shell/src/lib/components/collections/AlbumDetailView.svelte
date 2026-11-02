@@ -11,7 +11,8 @@
     isFill = $bindable(true),
     selectedIds = $bindable<Set<string>>(new Set()),
     onopenphoto,
-    onselectionchange
+    onselectionchange,
+    ondelete
   }: {
     album: AlbumItem;
     repo?: AssetRepo;
@@ -20,15 +21,27 @@
     selectedIds?: Set<string>;
     onopenphoto?: (asset: Asset) => void;
     onselectionchange?: (ids: Set<string>) => void;
+    /** Asks the page to confirm and delete this album. */
+    ondelete?: (album: AlbumItem) => void;
   } = $props();
 
   import { onMount } from 'svelte';
   import AlbumThemeSettings from './AlbumThemeSettings.svelte';
+  import Menu, { type MenuItem } from '$lib/components/surface/Menu.svelte';
+  import Icon from '$lib/components/icons/Icon.svelte';
   import { handleViewedPhotoChange } from '$lib/adaptive';
 
   let heroFallback = $state<string | null>(null);
   let countOverride = $state<number | null>(null);
   let settingsOpen = $state(false);
+  let moreMenuOpen = $state(false);
+  const moreMenuItems: MenuItem[] = [
+    { id: 'delete', label: 'Delete Album', icon: 'trash', danger: true }
+  ];
+
+  function handleMoreSelect(item: MenuItem) {
+    if (item.id === 'delete') ondelete?.(album);
+  }
   const assetCount = $derived(countOverride ?? album.assetCount);
 
   $effect(() => {
@@ -71,20 +84,11 @@
     let unlistens: Array<() => void> = [];
 
     import('@tauri-apps/api/event').then(({ listen }) => {
-      listen<{ album_id?: string }>('album-synced', (ev) => {
-        if (!ev.payload?.album_id || ev.payload.album_id === album.id) {
-          tauriRepo.getAlbumAssetCount(album.id).then((cnt) => {
-            countOverride = cnt;
-          });
-          logDebugIfEnabled(album.id);
-        }
-      }).then((un) => unlistens.push(un));
-
-      listen('scan-finished', () => {
+      // Imports add to albums while they run; keep the count current.
+      listen('frames://import-progress', () => {
         tauriRepo.getAlbumAssetCount(album.id).then((cnt) => {
           countOverride = cnt;
         });
-        logDebugIfEnabled(album.id);
       }).then((un) => unlistens.push(un));
     });
 
@@ -147,6 +151,26 @@
           >
             🎨 Theme
           </button>
+          {#if ondelete}
+            <div class="more-menu-wrap">
+              <button
+                type="button"
+                class="album-settings-btn"
+                aria-label="More album actions"
+                aria-haspopup="menu"
+                aria-expanded={moreMenuOpen}
+                onclick={() => (moreMenuOpen = !moreMenuOpen)}
+              >
+                <Icon name="more-horizontal" size={16} />
+              </button>
+              <Menu
+                items={moreMenuItems}
+                bind:open={moreMenuOpen}
+                onselect={handleMoreSelect}
+                style="top: 38px; right: 0;"
+              />
+            </div>
+          {/if}
         </div>
       </div>
     </div>
@@ -285,6 +309,16 @@
 
   .album-settings-btn:hover {
     background: rgba(255, 255, 255, 0.3);
+  }
+
+  .hero-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .more-menu-wrap {
+    position: relative;
   }
 
   .settings-popover-backdrop {

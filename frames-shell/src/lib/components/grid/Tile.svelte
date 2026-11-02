@@ -1,5 +1,5 @@
 <script module lang="ts">
-  import { isTauriAvailable, tauriRepo } from '$lib/services/tauriRepo';
+  import { isTauriAvailable } from '$lib/services/tauriRepo';
 
   type ThumbReadyCallback = (assetId: string) => void;
   const thumbReadyListeners = new Set<ThumbReadyCallback>();
@@ -23,65 +23,6 @@
       if (thumbReadyListeners.size === 0 && unlistenThumbReady) {
         unlistenThumbReady();
         unlistenThumbReady = null;
-      }
-    };
-  }
-
-  let visibleAssetIds = new Set<string>();
-  let prioritizeTimer: any = null;
-
-  function schedulePrioritize() {
-    if (prioritizeTimer) clearTimeout(prioritizeTimer);
-    prioritizeTimer = setTimeout(() => {
-      if (visibleAssetIds.size > 0 && isTauriAvailable()) {
-        import('@tauri-apps/api/core').then(({ invoke }) => {
-          invoke('prioritize', { assetIds: Array.from(visibleAssetIds) }).catch(() => {});
-        });
-      }
-    }, 150);
-  }
-
-  let sharedObserver: IntersectionObserver | null = null;
-  function getSharedObserver() {
-    if (!sharedObserver && typeof IntersectionObserver !== 'undefined') {
-      sharedObserver = new IntersectionObserver(
-        (entries) => {
-          let changed = false;
-          for (const entry of entries) {
-            const id = (entry.target as HTMLElement).dataset.assetId;
-            if (!id) continue;
-            if (entry.isIntersecting) {
-              if (!visibleAssetIds.has(id)) {
-                visibleAssetIds.add(id);
-                changed = true;
-              }
-            } else {
-              if (visibleAssetIds.delete(id)) {
-                changed = true;
-              }
-            }
-          }
-          if (changed) schedulePrioritize();
-        },
-        { threshold: 0.05 }
-      );
-    }
-    return sharedObserver;
-  }
-
-  function observeAssetVisibility(node: HTMLElement, assetId: string) {
-    node.dataset.assetId = assetId;
-    const observer = getSharedObserver();
-    observer?.observe(node);
-    return {
-      update(newId: string) {
-        node.dataset.assetId = newId;
-      },
-      destroy() {
-        observer?.unobserve(node);
-        if (visibleAssetIds.delete(node.dataset.assetId || '')) {
-          schedulePrioritize();
-        }
       }
     };
   }
@@ -119,36 +60,22 @@
 
   let isLoaded = $state(false);
   let reloadCounter = $state(0);
-  let fallbackDataUrl = $state<string | null>(null);
-  let fallbackAttempted = false;
 
   $effect(() => {
     const _ = asset.id;
     isLoaded = false;
     reloadCounter = 0;
-    fallbackDataUrl = null;
-    fallbackAttempted = false;
   });
 
+  // A missing thumbnail answers 404 and the tile keeps its placeholder until
+  // the backend announces it with `thumb-ready`.
   const currentThumbUrl = $derived(
-    fallbackDataUrl || (reloadCounter > 0 ? `${thumbUrl(asset.id)}?v=${reloadCounter}` : thumbUrl(asset.id))
+    reloadCounter > 0 ? `${thumbUrl(asset.id)}?v=${reloadCounter}` : thumbUrl(asset.id)
   );
-
-  async function handleImgError() {
-    if (fallbackAttempted) return;
-    fallbackAttempted = true;
-    try {
-      const dataUrl = await tauriRepo.getThumbnailDataUrl(asset.id, false);
-      if (dataUrl) {
-        fallbackDataUrl = dataUrl;
-      }
-    } catch {}
-  }
 
   onMount(() => {
     return onThumbReady((assetId) => {
       if (assetId === asset.id) {
-        fallbackDataUrl = null;
         reloadCounter++;
       }
     });
@@ -180,7 +107,6 @@
   {tabindex}
   class="photo-tile {isSelected ? 'is-selected' : ''} {isFill ? 'is-fill' : 'is-fit'} appearance-{theme.appearance}"
   style="--tile-size: {size}px;"
-  use:observeAssetVisibility={asset.id}
   {onclick}
   {ondblclick}
   onkeydown={handleKeyDown}
@@ -196,7 +122,6 @@
       decoding="async"
       class="tile-image {isLoaded ? 'loaded' : ''}"
       onload={() => (isLoaded = true)}
-      onerror={handleImgError}
     />
   </div>
 

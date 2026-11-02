@@ -26,7 +26,17 @@ export interface BackendAlbumSummary {
   id: string;
   name: string;
   asset_count: number;
-  key_asset_id: string | null;
+  cover_asset_id: string | null;
+}
+
+function backendAlbumToItem(a: BackendAlbumSummary): AlbumItem {
+  return {
+    id: a.id,
+    title: a.name,
+    assetCount: a.asset_count,
+    keyAssetId: a.cover_asset_id ?? '',
+    dateRange: ''
+  };
 }
 
 export interface BackendMonthGroup {
@@ -231,13 +241,7 @@ export class TauriAssetRepo implements AssetRepo {
       this.deviceId = data.device_id;
       this.settings = data.settings as BackendSettingsView;
       this.cachedAssets = (data.timeline.assets || []).map(backendSummaryToAsset);
-      this.cachedAlbums = (data.albums || []).map((a) => ({
-        id: a.id,
-        title: a.name,
-        assetCount: a.asset_count,
-        keyAssetId: a.key_asset_id || (this.cachedAssets[0]?.id ?? ''),
-        dateRange: ''
-      }));
+      this.cachedAlbums = (data.albums || []).map(backendAlbumToItem);
       this.monthGroups = data.timeline.month_groups || [];
       this.trashItems = data.trash?.items || [];
       this.outboxPending = data.outbox_pending || 0;
@@ -509,13 +513,7 @@ export class TauriAssetRepo implements AssetRepo {
     if (!isTauriAvailable()) return this.cachedAlbums;
     try {
       const raw = await invoke<BackendAlbumSummary[]>('create_album', { name });
-      this.cachedAlbums = raw.map((a) => ({
-        id: a.id,
-        title: a.name,
-        assetCount: a.asset_count,
-        keyAssetId: a.key_asset_id || '',
-        dateRange: ''
-      }));
+      this.cachedAlbums = raw.map(backendAlbumToItem);
       return this.cachedAlbums;
     } catch (e) {
       console.error('Failed to create album:', e);
@@ -526,7 +524,7 @@ export class TauriAssetRepo implements AssetRepo {
   async renameAlbum(id: string, name: string): Promise<void> {
     if (!isTauriAvailable()) return;
     try {
-      await invoke('rename_album', { id, name });
+      await invoke('rename_album', { albumId: id, name });
       const found = this.cachedAlbums.find((a) => a.id === id);
       if (found) found.title = name;
     } catch (e) {
@@ -534,14 +532,15 @@ export class TauriAssetRepo implements AssetRepo {
     }
   }
 
-  async deleteAlbum(id: string): Promise<void> {
-    if (!isTauriAvailable()) return;
-    try {
-      await invoke('delete_album', { id });
-      this.cachedAlbums = this.cachedAlbums.filter((a) => a.id !== id);
-    } catch (e) {
-      console.error('Failed to delete album:', e);
-    }
+  /**
+   * Delete an album on every device (`album.delete`). Its photos stay in the
+   * library. Throws so the caller can report a failure.
+   */
+  async deleteAlbum(id: string): Promise<AlbumItem[]> {
+    if (!isTauriAvailable()) return this.cachedAlbums;
+    const raw = await invoke<BackendAlbumSummary[]>('delete_album', { albumId: id });
+    this.cachedAlbums = raw.map(backendAlbumToItem);
+    return this.cachedAlbums;
   }
 
   // Native File Dialog & Import (§4.1, §7)
@@ -641,64 +640,12 @@ export class TauriAssetRepo implements AssetRepo {
     return await invoke<BackendImportStatusView>('clear_import_queue', { all });
   }
 
-  // Local Library Roots & Background Scan (§1.2, §1.3)
-  async getLocalRoots(): Promise<string[]> {
-    if (!isTauriAvailable()) return [];
-    try {
-      return await invoke<string[]>('get_local_roots');
-    } catch (e) {
-      console.error('Failed to get local roots:', e);
-      return [];
-    }
-  }
-
-  async setLocalRoots(paths: string[]): Promise<void> {
-    if (!isTauriAvailable()) return;
-    try {
-      await invoke('set_local_roots', { paths });
-      await this.loadBootstrap();
-    } catch (e) {
-      console.error('Failed to set local roots:', e);
-    }
-  }
-
-  async scanLocalLibrary(): Promise<number> {
-    if (!isTauriAvailable()) return 0;
-    try {
-      const count = await invoke<number>('scan_local_library');
-      await this.loadBootstrap();
-      return count;
-    } catch (e) {
-      console.error('Failed to scan local library:', e);
-      return 0;
-    }
-  }
-
-  async queueUpload(assetId: string): Promise<string> {
-    if (!isTauriAvailable()) return '';
-    try {
-      return await invoke<string>('queue_upload', { assetId });
-    } catch (e) {
-      console.error('Failed to queue upload:', e);
-      return '';
-    }
-  }
-
   async getWorkerStatus(): Promise<{ uploading_count: number; thumb_generating_count: number }> {
     if (!isTauriAvailable()) return { uploading_count: 0, thumb_generating_count: 0 };
     try {
       return await invoke<{ uploading_count: number; thumb_generating_count: number }>('get_worker_status');
     } catch (e) {
       return { uploading_count: 0, thumb_generating_count: 0 };
-    }
-  }
-
-  async prioritize(assetIds: string[]): Promise<void> {
-    if (!isTauriAvailable()) return;
-    try {
-      await invoke('prioritize', { assetIds });
-    } catch (e) {
-      console.warn('Failed to prioritize assets:', e);
     }
   }
 }

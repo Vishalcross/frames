@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { invoke } from '@tauri-apps/api/core';
   import Surface from '$lib/components/surface/Surface.svelte';
   import Button from '$lib/components/surface/Button.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
@@ -27,48 +25,6 @@
   let useRealS4 = $state(initial?.use_real_s4 ?? true);
   let saving = $state(false);
   let error = $state('');
-
-  let localRoots = $state<string[]>([]);
-  let isScanning = $state(false);
-  let scanMessage = $state('');
-
-  onMount(async () => {
-    try {
-      localRoots = await tauriRepo.getLocalRoots();
-    } catch {}
-  });
-
-  async function addLocalFolder() {
-    try {
-      const chosen = await invoke<string | null>('pick_folder_dialog', {
-        prompt: 'Choose a folder of photos to add as a local library root'
-      });
-      if (chosen && !localRoots.includes(chosen)) {
-        localRoots = [...localRoots, chosen];
-        await tauriRepo.setLocalRoots(localRoots);
-      }
-    } catch (e: any) {
-      error = e?.toString?.() ?? 'Failed to pick folder';
-    }
-  }
-
-  async function removeLocalFolder(path: string) {
-    localRoots = localRoots.filter((r) => r !== path);
-    await tauriRepo.setLocalRoots(localRoots);
-  }
-
-  async function triggerScan() {
-    isScanning = true;
-    scanMessage = '';
-    try {
-      const count = await tauriRepo.scanLocalLibrary();
-      scanMessage = `Scanned ${count} local items`;
-    } catch (e: any) {
-      scanMessage = `Scan failed: ${e?.toString() || e}`;
-    } finally {
-      isScanning = false;
-    }
-  }
 
   async function save() {
     error = '';
@@ -102,47 +58,13 @@
     <div class="conn-header">
       <div>
         <h2 class="conn-title">Library Settings & Connection</h2>
-        <span class="conn-sub">Configure local photo roots and MEGA S4 cloud storage.</span>
+        <span class="conn-sub">Configure MEGA S4 cloud storage.</span>
       </div>
       <Button variant="icon" title="Close" onclick={onclose}><Icon name="x" size={15} /></Button>
     </div>
 
     <div class="conn-body">
       {#if hint}<div class="conn-hint">{hint}</div>{/if}
-
-      <div class="conn-section-title">
-        <span>Local Photo Folders</span>
-      </div>
-      <div class="local-roots-container">
-        <span class="conn-sub">Folders on this drive where albums are matched and read directly from disk.</span>
-        {#if localRoots.length === 0}
-          <div class="local-root-empty">No custom folders configured (defaults to your OS Pictures folder).</div>
-        {:else}
-          <div class="local-root-list">
-            {#each localRoots as root}
-              <div class="local-root-item">
-                <span class="local-root-path" title={root}>{root}</span>
-                <Button variant="ghost" title="Remove folder" onclick={() => removeLocalFolder(root)}>
-                  <Icon name="trash" size={14} />
-                </Button>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        <div class="local-root-actions">
-          <Button variant="standard" onclick={addLocalFolder}>
-            <Icon name="plus" size={14} />
-            <span>Add Folder…</span>
-          </Button>
-          <Button variant="standard" disabled={isScanning} onclick={triggerScan}>
-            <Icon name="rotate-cw" size={14} />
-            <span>{isScanning ? 'Scanning…' : 'Scan Folders Now'}</span>
-          </Button>
-          {#if scanMessage}
-            <span class="scan-status-msg">{scanMessage}</span>
-          {/if}
-        </div>
-      </div>
 
       <div class="conn-section-title">
         <span>MEGA S4 Cloud Connection</span>
@@ -249,52 +171,6 @@
   .conn-section-title:first-of-type {
     border-top: none;
     padding-top: 0;
-  }
-  .local-roots-container {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .local-root-empty {
-    font-size: var(--text-size-caption);
-    color: var(--text-2);
-    font-style: italic;
-    padding: 6px 0;
-  }
-  .local-root-list {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .local-root-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding: 6px 10px;
-    background: var(--fill-1);
-    border-radius: 6px;
-    border: 1px solid var(--separator);
-  }
-  .local-root-path {
-    font-size: var(--text-size-caption);
-    color: var(--text-1);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    direction: rtl;
-    text-align: left;
-  }
-  .local-root-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-top: 4px;
-  }
-  .scan-status-msg {
-    font-size: var(--text-size-caption);
-    color: var(--accent);
   }
   .conn-field {
     display: flex;

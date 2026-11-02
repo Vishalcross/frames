@@ -11,10 +11,10 @@
 //!   duration, and Apple Live Photo `ContentIdentifier`), supplemented by
 //!   `ffprobe` when available on the system.
 //! - Embedded JPEG preview extraction from RAW files (TIFF/DNG/CR2/NEF/ARW/CR3).
-//! - EXIF orientation transformation (`1..=8`), aspect-preserving resize for
-//!   `s.webp` (short edge ~300 px) and `m.webp` (long edge ~1600 px), WebP
-//!   encoding (`ffmpeg` when present, pure-Rust VP8L lossless WebP fallback),
-//!   and placeholder thumbnail generation (`thumb_failed = true`) on decode failure.
+//! - Thumbnails: in-process decode with EXIF orientation, aspect-preserving
+//!   resize for `s.webp` (short edge ~300 px) and `m.webp` (long edge ~1600 px),
+//!   lossy WebP via libwebp; `ffmpeg` for HEIC and video frames; placeholder
+//!   thumbnails (`thumb_failed = true`) on decode failure.
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -519,6 +519,12 @@ fn parse_webp(bytes: &[u8], meta: &mut MediaMetadata) {
             let bits = LittleEndian::read_u32(&data[1..5]);
             let w = (bits & 0x3FFF) + 1;
             let h = ((bits >> 14) & 0x3FFF) + 1;
+            meta.width.get_or_insert(w);
+            meta.height.get_or_insert(h);
+        } else if chunk_id == b"VP8 " && data.len() >= 10 && data[3..6] == [0x9d, 0x01, 0x2a] {
+            // Lossy key frame: 3-byte frame tag, start code, then 14-bit sizes.
+            let w = u32::from(LittleEndian::read_u16(&data[6..8]) & 0x3FFF);
+            let h = u32::from(LittleEndian::read_u16(&data[8..10]) & 0x3FFF);
             meta.width.get_or_insert(w);
             meta.height.get_or_insert(h);
         } else if chunk_id == b"EXIF" {
@@ -1674,8 +1680,10 @@ pub fn decode_png_rgb(bytes: &[u8]) -> Option<RgbImage> {
 }
 
 /// Generate `s.webp` and `m.webp` thumbnails for `path` (spec section 7, step 5):
-/// 1. Try pure-Rust PNG decode (or embedded RAW JPEG preview + `ffmpeg`).
-/// 2. Try `ffmpeg` (extracting frame at ~1 s for videos, applying orientation).
+/// 1. Photos the `image` crate can read (JPEG, PNG, WebP, TIFF, GIF, and a RAW
+///    file's embedded JPEG) are decoded once in-process, oriented, resized to
+///    both sizes and encoded as lossy WebP.
+/// 2. Everything else (HEIC, video, undecodable files) goes through `ffmpeg`.
 /// 3. Fall back to `placeholder_thumbnails()` with `thumb_failed = true`.
 pub fn generate_thumbnails(
     path: impl AsRef<Path>,
@@ -1683,31 +1691,13 @@ pub fn generate_thumbnails(
     meta: &MediaMetadata,
 ) -> ThumbnailPair {
     let path = path.as_ref();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
 
-    // 1. Try pure-Rust PNG path first only for PNG photos (never read multi-GB videos into RAM!)
-    if kind == AssetKind::Photo && ext == "png" {
-        if let Ok(bytes) = std::fs::read(path) {
-            if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                if let Some(raw_img) = decode_png_rgb(&bytes) {
-                    let oriented = apply_exif_orientation(&raw_img, meta.orientation);
-                    let small_img = resize_short_edge(&oriented, SMALL_THUMB_SHORT_EDGE);
-                    let preview_img = resize_long_edge(&oriented, PREVIEW_THUMB_LONG_EDGE);
-                    return ThumbnailPair {
-                        small_webp: encode_webp_lossless(&small_img),
-                        preview_webp: encode_webp_lossless(&preview_img),
-                        thumb_failed: false,
-                    };
-                }
-            }
+    if kind != AssetKind::Video {
+        if let Some(img) = decode_photo_oriented(path, meta.orientation) {
+            return thumbnails_from_image(&img);
         }
     }
 
-    // 2. Try ffmpeg for photos/videos
     if let Some((small_webp, preview_webp)) = generate_thumbnails_via_ffmpeg(path, kind, meta) {
         return ThumbnailPair {
             small_webp,
@@ -1716,8 +1706,101 @@ pub fn generate_thumbnails(
         };
     }
 
-    // 3. Fallback placeholder with thumb_failed = true
     placeholder_thumbnails()
+}
+
+/// WebP quality for both thumbnail sizes. 80 keeps `s.webp` near the spec's
+/// ~25 KB estimate (section 10).
+const THUMB_WEBP_QUALITY: f32 = 80.0;
+
+/// Decode a photo with the `image` crate and apply its orientation. The
+/// decoder's own EXIF orientation wins; `fallback_orientation` (from
+/// [`read_metadata`]) covers RAW previews, whose orientation lives in the RAW
+/// container rather than the embedded JPEG. Returns `None` for formats the
+/// crate cannot read (HEIC) so the caller can fall back to `ffmpeg`.
+fn decode_photo_oriented(path: &Path, fallback_orientation: u16) -> Option<image::DynamicImage> {
+    use image::{metadata::Orientation, DynamicImage, ImageDecoder, ImageReader};
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_heic_extension(&ext) {
+        return None;
+    }
+
+    let raw_bytes;
+    let mut decoder: Box<dyn ImageDecoder> = if is_raw_extension(&ext) {
+        raw_bytes = std::fs::read(path).ok()?;
+        let jpeg = extract_embedded_jpeg(&raw_bytes)?;
+        Box::new(
+            ImageReader::new(io::Cursor::new(jpeg))
+                .with_guessed_format()
+                .ok()?
+                .into_decoder()
+                .ok()?,
+        )
+    } else {
+        Box::new(
+            ImageReader::open(path)
+                .ok()?
+                .with_guessed_format()
+                .ok()?
+                .into_decoder()
+                .ok()?,
+        )
+    };
+
+    let orientation = match decoder.orientation() {
+        Ok(o) if o != Orientation::NoTransforms => o,
+        _ => u8::try_from(fallback_orientation)
+            .ok()
+            .and_then(Orientation::from_exif)
+            .unwrap_or(Orientation::NoTransforms),
+    };
+    let mut img = DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    Some(img)
+}
+
+/// Resize an oriented photo to `m.webp` (long edge 1600) and `s.webp` (short
+/// edge 300), never upscaling, and encode both as lossy WebP.
+fn thumbnails_from_image(img: &image::DynamicImage) -> ThumbnailPair {
+    use image::imageops::FilterType;
+
+    let (w, h) = (img.width().max(1), img.height().max(1));
+
+    // Area-averaging `thumbnail` is fast for the big first step down.
+    let preview = if w.max(h) > PREVIEW_THUMB_LONG_EDGE {
+        img.thumbnail(PREVIEW_THUMB_LONG_EDGE, PREVIEW_THUMB_LONG_EDGE)
+    } else {
+        img.clone()
+    };
+
+    let (pw, ph) = (preview.width().max(1), preview.height().max(1));
+    let short = pw.min(ph);
+    let small = if short > SMALL_THUMB_SHORT_EDGE {
+        let scale = f64::from(SMALL_THUMB_SHORT_EDGE) / f64::from(short);
+        let sw = ((f64::from(pw) * scale).round() as u32).max(1);
+        let sh = ((f64::from(ph) * scale).round() as u32).max(1);
+        preview.resize_exact(sw, sh, FilterType::Triangle)
+    } else {
+        preview.clone()
+    };
+
+    ThumbnailPair {
+        small_webp: encode_webp_lossy(&small),
+        preview_webp: encode_webp_lossy(&preview),
+        thumb_failed: false,
+    }
+}
+
+fn encode_webp_lossy(img: &image::DynamicImage) -> Vec<u8> {
+    let rgb = img.to_rgb8();
+    webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+        .encode(THUMB_WEBP_QUALITY)
+        .to_vec()
 }
 
 fn generate_thumbnails_via_ffmpeg(

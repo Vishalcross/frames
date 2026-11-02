@@ -69,6 +69,8 @@
   let connectionOpen = $state(false);
   let connectionHint = $state('');
   let deleteSheetOpen = $state(false);
+  let albumPendingDelete = $state<AlbumItem | null>(null);
+  let albumDeleteSheetOpen = $state(false);
   let importDragging = $state(false);
 
   // Search & Filters State
@@ -213,14 +215,6 @@
     let unlistens: Array<() => void> = [];
     if (isTauri) {
       import('@tauri-apps/api/event').then(({ listen }) => {
-        listen('album-synced', async () => {
-          await loadLibraryData();
-        }).then((un) => unlistens.push(un));
-
-        listen('scan-finished', async () => {
-          await loadLibraryData();
-        }).then((un) => unlistens.push(un));
-
         let importRefreshTimer: ReturnType<typeof setTimeout> | null = null;
         listen('frames://import-progress', () => {
           if (!importRefreshTimer) {
@@ -340,6 +334,29 @@
     gridKey++;
   }
 
+  function handleDeleteAlbumPrompt(album: AlbumItem) {
+    albumPendingDelete = album;
+    albumDeleteSheetOpen = true;
+  }
+
+  async function handleDeleteAlbumConfirmed() {
+    const album = albumPendingDelete;
+    albumPendingDelete = null;
+    if (!album) return;
+    try {
+      albums = await tauriRepo.deleteAlbum(album.id);
+      if (currentRoute === 'album-detail' && currentAlbumId === album.id) {
+        navigate('collections');
+      }
+      toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Deleted album “${album.title}”` }];
+    } catch (e: any) {
+      toasts = [
+        ...toasts,
+        { id: Date.now().toString(), type: 'error', text: `Could not delete album: ${e?.toString() || e}` }
+      ];
+    }
+  }
+
   function openConnection(hint = '') {
     connectionHint = hint;
     settingsOpen = false;
@@ -406,20 +423,6 @@
     ];
   }
 
-  async function handleScanLocal() {
-    toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Scanning local picture folders…' }];
-    try {
-      const count = await tauriRepo.scanLocalLibrary();
-      await loadLibraryData();
-      toasts = [
-        ...toasts,
-        { id: Date.now().toString(), type: 'info', text: `Scan complete: found ${count} local photos and videos` }
-      ];
-    } catch (e: any) {
-      toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: `Scan error: ${e?.message || e}` }];
-    }
-  }
-
   // Global Keyboard Shortcuts (§12)
   function handleGlobalKeyDown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.altKey && e.key.toLowerCase() === 's') {
@@ -477,6 +480,7 @@
       {outboxPending}
       onnavigate={navigate}
       onsync={handleSyncNow}
+      ondeletealbum={isTauri ? handleDeleteAlbumPrompt : undefined}
     />
 
     <!-- Main Content Area -->
@@ -534,7 +538,6 @@
                 onimport={handlePickFolderAndImport}
                 onsync={handleSyncNow}
                 onseed={handleSeedDemo}
-                onscan={handleScanLocal}
               />
             {:else}
               {#key gridKey}
@@ -565,6 +568,7 @@
             bind:isFill
             bind:selectedIds
             onopenphoto={openPhoto}
+            ondelete={isTauri ? handleDeleteAlbumPrompt : undefined}
           />
         {:else if currentRoute === 'people-pets'}
           <PeoplePetsView onselectperson={() => navigate('library')} />
@@ -680,6 +684,16 @@
     bind:open={deleteSheetOpen}
     count={selectedIds.size}
     onconfirm={handleDeleteConfirmed}
+  />
+
+  <!-- Album delete confirmation: removes the album everywhere, keeps its photos -->
+  <DeleteSheet
+    bind:open={albumDeleteSheetOpen}
+    title={`Delete Album “${albumPendingDelete?.title ?? ''}”?`}
+    description="The album is removed from all your synced devices. The photos and videos in it stay in your library."
+    confirmLabel="Delete Album"
+    onconfirm={handleDeleteAlbumConfirmed}
+    oncancel={() => (albumPendingDelete = null)}
   />
 
   <!-- OS Drag-and-Drop Import Overlay (§4.12) -->

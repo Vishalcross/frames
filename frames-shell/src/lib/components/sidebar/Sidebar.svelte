@@ -3,6 +3,7 @@
   import Surface from '$lib/components/surface/Surface.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import SyncPopover from '$lib/components/dialogs/SyncPopover.svelte';
+  import Menu, { type MenuItem } from '$lib/components/surface/Menu.svelte';
   import type { AlbumItem } from '$lib/types';
   import { theme } from '$lib/theme/engine.svelte';
   import { isTauriAvailable } from '$lib/services/tauriRepo';
@@ -16,7 +17,8 @@
     isSyncing = false,
     outboxPending = 0,
     onnavigate,
-    onsync
+    onsync,
+    ondeletealbum
   }: {
     currentRoute: string;
     currentAlbumId?: string;
@@ -27,7 +29,27 @@
     outboxPending?: number;
     onnavigate?: (route: string, extraId?: string) => void;
     onsync?: () => void;
+    /** Asks the page to confirm and delete an album (right-click menu). */
+    ondeletealbum?: (album: AlbumItem) => void;
   } = $props();
+
+  // Right-click menu on album rows, as in Photos for macOS.
+  let albumMenu = $state<{ album: AlbumItem; x: number; y: number } | null>(null);
+  let albumMenuOpen = $state(false);
+  const albumMenuItems: MenuItem[] = [
+    { id: 'delete', label: 'Delete Album', icon: 'trash', danger: true }
+  ];
+
+  function openAlbumMenu(e: MouseEvent, album: AlbumItem) {
+    if (!ondeletealbum) return;
+    e.preventDefault();
+    albumMenu = { album, x: e.clientX, y: e.clientY };
+    albumMenuOpen = true;
+  }
+
+  function handleAlbumMenuSelect(item: MenuItem) {
+    if (item.id === 'delete' && albumMenu) ondeletealbum?.(albumMenu.album);
+  }
 
   let syncPopoverOpen = $state(false);
   let syncPaused = $state(false);
@@ -71,24 +93,12 @@
     refreshCounts();
 
     import('@tauri-apps/api/event').then(({ listen }) => {
-      listen<{ job_id: string; state: string }>('upload-progress', () => {
-        refreshCounts();
-      }).then((un) => unlistens.push(un));
-
       listen<{ asset_id: string }>('thumb-ready', () => {
         if (thumbCount > 0) {
           thumbCount--;
         } else {
           refreshCounts();
         }
-      }).then((un) => unlistens.push(un));
-
-      listen('album-synced', () => {
-        refreshCounts();
-      }).then((un) => unlistens.push(un));
-
-      listen('scan-finished', () => {
-        refreshCounts();
       }).then((un) => unlistens.push(un));
 
       listen('frames://import-progress', () => {
@@ -298,6 +308,7 @@
                         type="button"
                         class="sidebar-row {currentAlbumId === child.id ? 'selected' : ''}"
                         onclick={() => navigate('album-detail', child.id)}
+                        oncontextmenu={(e) => openAlbumMenu(e, child)}
                       >
                         <span class="row-icon"><Icon name="album" size={16} /></span>
                         <span class="row-label">{child.title}</span>
@@ -314,6 +325,7 @@
                 type="button"
                 class="sidebar-row {currentAlbumId === album.id ? 'selected' : ''}"
                 onclick={() => navigate('album-detail', album.id)}
+                oncontextmenu={(e) => openAlbumMenu(e, album)}
               >
                 <span class="row-icon"><Icon name="album" size={16} /></span>
                 <span class="row-label">{album.title}</span>
@@ -419,6 +431,15 @@
 
       <SyncPopover bind:open={syncPopoverOpen} bind:isPaused={syncPaused} />
     </div>
+
+    {#if albumMenu}
+      <Menu
+        items={albumMenuItems}
+        bind:open={albumMenuOpen}
+        onselect={handleAlbumMenuSelect}
+        style="position: fixed; top: {albumMenu.y}px; left: {albumMenu.x}px;"
+      />
+    {/if}
 
     <!-- Drag Resizer Handle -->
     <button

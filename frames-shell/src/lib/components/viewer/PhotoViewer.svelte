@@ -246,6 +246,7 @@
   }
 
   function navigate(direction: -1 | 1) {
+    travel = direction;
     showAt(index + direction);
   }
 
@@ -343,6 +344,61 @@
       return photoUrl(asset.id);
     }
     return getThumbnailDataUrl(asset, 'preview');
+  });
+
+  // Apple's 1-up viewer: the preview shows at once and the original takes
+  // its place once loaded and decoded, so arrowing through photos never
+  // waits on a large file. The ring appears only if that takes a while.
+  let shownUrl = $state('');
+
+  $effect(() => {
+    const a = asset;
+    const preview = previewUrl;
+    const full = fullPhotoUrl;
+    if (a.kind === 'video') return;
+    shownUrl = preview;
+    if (full === preview) return;
+    const slow = setTimeout(() => {
+      if (asset.id === a.id) loadingOriginalProgress = 40;
+    }, 300);
+    const original = new Image();
+    original.decoding = 'async';
+    original.src = full;
+    original
+      .decode()
+      .then(() => {
+        if (asset.id === a.id) shownUrl = full;
+      })
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(slow);
+        if (asset.id === a.id) loadingOriginalProgress = 100;
+      });
+  });
+
+  // Fetch the neighbours' previews, and the next original in the direction of
+  // travel, so the arrow keys land on an image that is already there.
+  let travel: -1 | 1 = 1;
+  const prefetched = new Map<string, HTMLImageElement>();
+
+  function prefetch(url: string) {
+    if (!url || prefetched.has(url)) return;
+    const img = new Image();
+    img.decoding = 'async';
+    img.src = url;
+    prefetched.set(url, img);
+    if (prefetched.size > 12) prefetched.delete(prefetched.keys().next().value!);
+  }
+
+  $effect(() => {
+    if (!query || !isTauriAvailable()) return;
+    const at = index - windowStart;
+    for (const step of [1, -1, 2, -2]) {
+      const near = windowAssets[at + step];
+      if (near && near.kind !== 'video') prefetch(getAssetUrl('preview', near.id));
+    }
+    const next = windowAssets[at + travel];
+    if (next && next.kind !== 'video') prefetch(photoUrl(next.id));
   });
 
   async function handlePreviewError() {
@@ -504,7 +560,8 @@
           {/if}
         {:else}
           <img
-            src={fullPhotoUrl}
+            src={shownUrl || previewUrl}
+            decoding="async"
             alt={asset.title || 'Photo'}
             class="viewer-main-image"
             onerror={handlePreviewError}

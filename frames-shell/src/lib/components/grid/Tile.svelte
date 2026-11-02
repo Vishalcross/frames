@@ -29,11 +29,11 @@
 </script>
 
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import type { Asset } from '$lib/types';
   import Badge from '$lib/components/surface/Badge.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
-  import { thumbUrl } from '$lib/media';
+  import { placeholderUrl, thumbUrl } from '$lib/media';
   import { theme } from '$lib/theme/engine.svelte';
 
   let {
@@ -42,6 +42,7 @@
     isFill = true,
     size = 128,
     tabindex = -1,
+    deferLoad = false,
     onclick,
     ondblclick,
     onpointerenter,
@@ -52,6 +53,8 @@
     isFill?: boolean;
     size?: number;
     tabindex?: number;
+    /** The grid is flinging or scrubbing past: do not start loading yet. */
+    deferLoad?: boolean;
     onclick?: (e: MouseEvent) => void;
     ondblclick?: (e: MouseEvent) => void;
     onpointerenter?: (e: PointerEvent) => void;
@@ -60,18 +63,54 @@
 
   let isLoaded = $state(false);
   let reloadCounter = $state(0);
+  // Loading starts once the grid has slowed down, then carries on regardless.
+  let started = $state(false);
+  // Large tiles swap the 300 px thumbnail for the 1600 px preview once it is
+  // decoded: something fast first, the sharp version when ready (PhotoKit's
+  // opportunistic delivery, at the size the tile is actually shown).
+  let upgraded = $state(false);
 
   $effect(() => {
     const _ = asset.id;
     isLoaded = false;
     reloadCounter = 0;
+    upgraded = false;
+    started = untrack(() => !deferLoad);
+  });
+
+  $effect(() => {
+    if (!deferLoad) started = true;
+  });
+
+  const wantsLarge = $derived(
+    typeof window !== 'undefined' && size * (window.devicePixelRatio || 1) > 360
+  );
+
+  $effect(() => {
+    if (!wantsLarge || !isLoaded || upgraded || deferLoad) return;
+    const id = asset.id;
+    const large = new Image();
+    large.src = thumbUrl(id, 1024);
+    large
+      .decode()
+      .then(() => {
+        if (asset.id === id) upgraded = true;
+      })
+      .catch(() => {});
   });
 
   // A missing thumbnail answers 404 and the tile keeps its placeholder until
   // the backend announces it with `thumb-ready`.
   const currentThumbUrl = $derived(
-    reloadCounter > 0 ? `${thumbUrl(asset.id)}?v=${reloadCounter}` : thumbUrl(asset.id)
+    upgraded
+      ? thumbUrl(asset.id, 1024)
+      : reloadCounter > 0
+        ? `${thumbUrl(asset.id)}?v=${reloadCounter}`
+        : thumbUrl(asset.id)
   );
+
+  // The blurred ThumbHash sketch under the image, shown until it loads.
+  const placeholder = $derived(isTauriAvailable() ? placeholderUrl(asset.thumbHash) : '');
 
   onMount(() => {
     return onThumbReady((assetId) => {
@@ -114,15 +153,17 @@
   {onpointerleave}
 >
   <!-- Background ThumbHash blur placeholder crossfading to real image (§4.4) -->
-  <div class="thumb-container">
-    <img
-      src={currentThumbUrl}
-      alt=""
-      loading="lazy"
-      decoding="async"
-      class="tile-image {isLoaded ? 'loaded' : ''}"
-      onload={() => (isLoaded = true)}
-    />
+  <div class="thumb-container" style:background-image={placeholder ? `url(${placeholder})` : null}>
+    {#if started}
+      <img
+        src={currentThumbUrl}
+        alt=""
+        loading="lazy"
+        decoding="async"
+        class="tile-image {isLoaded ? 'loaded' : ''}"
+        onload={() => (isLoaded = true)}
+      />
+    {/if}
   </div>
 
   <!-- Tile States (§4.4) -->
@@ -211,7 +252,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: var(--fill-1);
+    background-color: var(--fill-1);
+    background-size: cover;
+    background-position: center;
   }
 
   .tile-image {

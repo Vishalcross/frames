@@ -249,6 +249,7 @@ impl ThumbService {
         let spawned = std::thread::Builder::new()
             .name("frames-thumb-backfill".into())
             .spawn(move || {
+                crate::qos::set_current_thread(crate::qos::WorkClass::Background);
                 while me.backfill_requested.swap(false, Ordering::SeqCst) {
                     me.backfill_pass(on_ready.as_ref());
                 }
@@ -265,39 +266,53 @@ impl ThumbService {
     }
 
     fn backfill_pass(&self, on_ready: Option<&ThumbReadyCallback>) {
-        let ids: Vec<String> = self
+        // (id, has a placeholder)
+        let rows: Vec<(String, bool)> = self
             .with_reader(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT id FROM assets
+                    "SELECT id, thumbhash IS NOT NULL FROM assets
                      WHERE trashed_at IS NULL AND purged_at IS NULL
                      ORDER BY taken_at DESC, id ASC",
                 )?;
-                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))?;
                 rows.collect()
             })
             .unwrap_or_default();
-        let todo: Vec<String> = {
+        // Missing thumbnails first in line; also thumbnails that exist (the
+        // importer writes them) but have no placeholder yet.
+        let todo: Vec<(String, bool)> = {
             let missing = self.missing.lock().unwrap();
-            ids.into_iter()
-                .filter(|id| {
-                    !missing.contains(&(id.clone(), ThumbSize::Small))
-                        && !self.small_thumb_path(id).is_file()
+            rows.into_iter()
+                .filter(|(id, _)| !missing.contains(&(id.clone(), ThumbSize::Small)))
+                .map(|(id, has_placeholder)| {
+                    let has_small = self.small_thumb_path(&id).is_file();
+                    (id, has_small, has_placeholder)
                 })
+                .filter(|(_, has_small, has_placeholder)| !has_small || !has_placeholder)
+                .map(|(id, has_small, _)| (id, has_small))
                 .collect()
         };
-        self.backfill_pending.store(todo.len(), Ordering::SeqCst);
+        let need_thumbnails = todo.iter().filter(|(_, has_small)| !has_small).count();
+        self.backfill_pending.store(need_thumbnails, Ordering::SeqCst);
 
         let queue = Mutex::new(todo.into_iter());
         let offline = AtomicBool::new(false);
         std::thread::scope(|s| {
             for _ in 0..BACKFILL_WORKERS {
-                s.spawn(|| loop {
+                s.spawn(|| crate::qos::run_as(crate::qos::WorkClass::Background, || loop {
                     if offline.load(Ordering::SeqCst) {
                         break;
                     }
-                    let Some(id) = queue.lock().unwrap().next() else {
+                    let Some((id, had_small)) = queue.lock().unwrap().next() else {
                         break;
                     };
+                    if had_small {
+                        // Only the placeholder is missing.
+                        if let Ok(bytes) = fs::read(self.small_thumb_path(&id)) {
+                            self.record_placeholder(&id, &bytes);
+                        }
+                        continue;
+                    }
                     match self.ensure(&id, ThumbSize::Small) {
                         Outcome::Ready(_) => {
                             if let Some(cb) = on_ready {
@@ -313,7 +328,7 @@ impl ThumbService {
                         Ordering::SeqCst,
                         |n| Some(n.saturating_sub(1)),
                     );
-                });
+                }));
             }
         });
         self.backfill_pending.store(0, Ordering::SeqCst);
@@ -389,7 +404,12 @@ impl ThumbService {
         };
         match fetched {
             Ok(Some(bytes)) if !bytes.is_empty() => match self.store_bytes(id, size, &bytes) {
-                Some(p) => Outcome::Ready(p),
+                Some(p) => {
+                    if size == ThumbSize::Small {
+                        self.record_placeholder(id, &bytes);
+                    }
+                    Outcome::Ready(p)
+                }
                 None => Outcome::Missing,
             },
             Ok(_) => Outcome::Missing,
@@ -423,10 +443,24 @@ impl ThumbService {
         }
         let small = self.store_bytes(id, ThumbSize::Small, &pair.small_webp)?;
         let preview = self.store_bytes(id, ThumbSize::Preview, &pair.preview_webp)?;
+        self.record_placeholder(id, &pair.small_webp);
         Some(match size {
             ThumbSize::Small => small,
             ThumbSize::Preview => preview,
         })
+    }
+
+    /// Save the grid placeholder (a ThumbHash) for `id`, computed from its `s.webp`.
+    fn record_placeholder(&self, id: &str, small_webp: &[u8]) {
+        let Some(hash) = thumbhash_of(small_webp) else {
+            return;
+        };
+        self.with_reader(|c| {
+            c.execute(
+                "UPDATE assets SET thumbhash = ?2 WHERE id = ?1",
+                rusqlite::params![id, hash],
+            )
+        });
     }
 
     fn store_bytes(&self, id: &str, size: ThumbSize, bytes: &[u8]) -> Option<PathBuf> {
@@ -503,6 +537,16 @@ impl ThumbService {
         }
         out
     }
+}
+
+/// A ThumbHash of an encoded image, base64: a ~25-byte blurred sketch of its
+/// colours and layout that the grid paints while the thumbnail loads.
+pub fn thumbhash_of(image_bytes: &[u8]) -> Option<String> {
+    use base64::Engine;
+    // ThumbHash takes at most 100x100; more detail would not survive anyway.
+    let img = image::load_from_memory(image_bytes).ok()?.thumbnail(100, 100).to_rgba8();
+    let hash = thumbhash::rgba_to_thumb_hash(img.width() as usize, img.height() as usize, img.as_raw());
+    Some(base64::engine::general_purpose::STANDARD.encode(hash))
 }
 
 /// Lowercase hex SHA-256, the only form an asset id takes (spec section 4).
@@ -680,15 +724,49 @@ mod tests {
         f.service.start_backfill(Some(Arc::new(move |id: &str| {
             sink.lock().unwrap().push(id.to_string());
         })));
-        for _ in 0..200 {
-            if !f.service.backfill_running.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_backfill(&f);
         assert_eq!(ready.lock().unwrap().len(), 6);
         assert!((10..16).all(|n| f.service.small_thumb_path(&id(n)).is_file()));
         assert_eq!(f.service.pending_count(), 0);
+        assert!((10..16).all(|n| placeholder(&f, &id(n)).is_some()));
+    }
+
+    /// Debug builds decode slowly; allow a generous 60 s before failing.
+    fn wait_for_backfill(f: &Fixture) {
+        for _ in 0..3000 {
+            if !f.service.backfill_running.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("backfill did not finish");
+    }
+
+    fn placeholder(f: &Fixture, id: &str) -> Option<String> {
+        f.store
+            .connection()
+            .query_row("SELECT thumbhash FROM assets WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn backfill_adds_placeholders_to_existing_thumbnails_without_announcing_them() {
+        let f = fixture();
+        let src = f.dir.join("imported.jpg");
+        let size = write_jpeg(&src, 640, 480);
+        insert_asset(&f.store, &id(20), size, None);
+        // The importer wrote the small thumbnail; no placeholder yet.
+        let pair = crate::media::generate_thumbnails(&src, AssetKind::Photo, &Default::default());
+        f.service.cache.lock().unwrap().put_small_thumb(&id(20), &pair.small_webp).unwrap();
+        assert!(placeholder(&f, &id(20)).is_none());
+
+        let announced = Arc::new(Mutex::new(0));
+        let count = Arc::clone(&announced);
+        f.service.start_backfill(Some(Arc::new(move |_: &str| *count.lock().unwrap() += 1)));
+        wait_for_backfill(&f);
+        let hash = placeholder(&f, &id(20)).expect("placeholder recorded");
+        assert!(hash.len() < 64, "compact: {hash}");
+        assert_eq!(*announced.lock().unwrap(), 0);
     }
 
     #[test]

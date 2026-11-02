@@ -1503,6 +1503,7 @@ pub fn run() {
             std::thread::Builder::new()
                 .name("frames-daily-trash-purge".into())
                 .spawn(move || {
+                    frames_core::qos::set_current_thread(frames_core::qos::WorkClass::Background);
                     std::thread::sleep(Duration::from_secs(5));
                     loop {
                         let state = handle.state::<AppState>();
@@ -1522,6 +1523,7 @@ pub fn run() {
             std::thread::Builder::new()
                 .name("frames-background-sync".into())
                 .spawn(move || {
+                    frames_core::qos::set_current_thread(frames_core::qos::WorkClass::Background);
                     std::thread::sleep(Duration::from_secs(5));
                     resume_imports_in_background(&handle);
                     loop {

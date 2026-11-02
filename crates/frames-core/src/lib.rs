@@ -14,6 +14,7 @@ pub mod media;
 pub mod ops;
 pub mod palette;
 pub mod player;
+pub mod qos;
 pub mod s4;
 pub mod store;
 pub mod sync;

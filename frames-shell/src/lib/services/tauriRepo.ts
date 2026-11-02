@@ -20,6 +20,8 @@ export interface BackendAssetSummary {
   height: number | null;
   duration_ms: number | null;
   thumb_failed: boolean;
+  /** Base64 ThumbHash placeholder, once the thumbnail service has made one. */
+  thumbhash?: string;
 }
 
 export interface BackendVideoPlaybackPlan {
@@ -190,7 +192,7 @@ export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
     w: s.width || 4032,
     h: s.height || 3024,
     durationMs: s.duration_ms || undefined,
-    thumbHash: s.id,
+    thumbHash: s.thumbhash ?? '',
     palette: [
       { l: 0.65, c: 0.16, h: hue, pop: 0.5 },
       { l: 0.50, c: 0.12, h: (hue + 60) % 360, pop: 0.3 }

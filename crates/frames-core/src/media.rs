@@ -1703,8 +1703,13 @@ pub fn generate_thumbnails(
     let path = path.as_ref();
 
     if kind != AssetKind::Video {
-        if let Some(img) = decode_photo_oriented(path, meta.orientation) {
-            return thumbnails_from_image(&img);
+        // Decoders run on arbitrary files; a panic on a corrupt one falls
+        // through to ffmpeg and the placeholder instead of ending the app.
+        let decoded = std::panic::catch_unwind(|| {
+            decode_photo_oriented(path, meta.orientation).map(|img| thumbnails_from_image(&img))
+        });
+        if let Ok(Some(pair)) = decoded {
+            return pair;
         }
     }
 
@@ -1726,10 +1731,11 @@ const THUMB_WEBP_QUALITY: f32 = 80.0;
 /// Decode a photo with the `image` crate and apply its orientation. The
 /// decoder's own EXIF orientation wins; `fallback_orientation` (from
 /// [`read_metadata`]) covers RAW previews, whose orientation lives in the RAW
-/// container rather than the embedded JPEG. Returns `None` for formats the
-/// crate cannot read (HEIC) so the caller can fall back to `ffmpeg`.
+/// container rather than the embedded JPEG. HEIC, and RAW files without an
+/// embedded preview, go through the system decoder on macOS. Returns `None`
+/// for what none of these can read, so the caller can fall back to `ffmpeg`.
 fn decode_photo_oriented(path: &Path, fallback_orientation: u16) -> Option<image::DynamicImage> {
-    use image::{metadata::Orientation, DynamicImage, ImageDecoder, ImageReader};
+    use image::ImageReader;
 
     let ext = path
         .extension()
@@ -1737,31 +1743,29 @@ fn decode_photo_oriented(path: &Path, fallback_orientation: u16) -> Option<image
         .unwrap_or("")
         .to_ascii_lowercase();
     if is_heic_extension(&ext) {
-        return None;
+        return decode_with_system(path);
     }
+    if is_raw_extension(&ext) {
+        let raw_bytes = std::fs::read(path).ok()?;
+        let preview = extract_embedded_jpeg(&raw_bytes)
+            .and_then(|jpeg| ImageReader::new(io::Cursor::new(jpeg)).with_guessed_format().ok())
+            .and_then(|reader| decode_reader_oriented(reader, fallback_orientation));
+        // Phone DNGs often carry no usable preview (only lossless-JPEG sensor
+        // data). Developing the RAW is slow, tens of seconds for 100 MB, but
+        // happens once per photo.
+        return preview.or_else(|| decode_with_system(path));
+    }
+    let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    decode_reader_oriented(reader, fallback_orientation)
+}
 
-    let raw_bytes;
-    let mut decoder: Box<dyn ImageDecoder> = if is_raw_extension(&ext) {
-        raw_bytes = std::fs::read(path).ok()?;
-        let jpeg = extract_embedded_jpeg(&raw_bytes)?;
-        Box::new(
-            ImageReader::new(io::Cursor::new(jpeg))
-                .with_guessed_format()
-                .ok()?
-                .into_decoder()
-                .ok()?,
-        )
-    } else {
-        Box::new(
-            ImageReader::open(path)
-                .ok()?
-                .with_guessed_format()
-                .ok()?
-                .into_decoder()
-                .ok()?,
-        )
-    };
+fn decode_reader_oriented<R: io::BufRead + io::Seek>(
+    reader: image::ImageReader<R>,
+    fallback_orientation: u16,
+) -> Option<image::DynamicImage> {
+    use image::{metadata::Orientation, DynamicImage, ImageDecoder};
 
+    let mut decoder = reader.into_decoder().ok()?;
     let orientation = match decoder.orientation() {
         Ok(o) if o != Orientation::NoTransforms => o,
         _ => u8::try_from(fallback_orientation)
@@ -1772,6 +1776,40 @@ fn decode_photo_oriented(path: &Path, fallback_orientation: u16) -> Option<image
     let mut img = DynamicImage::from_decoder(decoder).ok()?;
     img.apply_orientation(orientation);
     Some(img)
+}
+
+/// Decode with the operating system's image stack. iPhone HEIC photos are
+/// grids of HEVC tiles that ffmpeg (6.x, and 8.x's command line) does not
+/// reassemble: it returns one 512 px tile. macOS decodes HEIC and RAW with
+/// ImageIO, reached through `sips`, which writes a JPEG at preview size that
+/// keeps the EXIF orientation. Other systems return `None`.
+fn decode_with_system(path: &Path) -> Option<image::DynamicImage> {
+    #[cfg(target_os = "macos")]
+    {
+        let tmp = std::env::temp_dir().join(format!("frames-heic-{}.jpg", fastrand::u64(..)));
+        let converted = Command::new("/usr/bin/sips")
+            .args(["-s", "format", "jpeg", "-s", "formatOptions", "92", "-Z"])
+            .arg(PREVIEW_THUMB_LONG_EDGE.to_string())
+            .arg(path)
+            .arg("--out")
+            .arg(&tmp)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let img = converted
+            .then(|| image::ImageReader::open(&tmp).ok()?.with_guessed_format().ok())
+            .flatten()
+            .and_then(|reader| decode_reader_oriented(reader, 1));
+        let _ = std::fs::remove_file(&tmp);
+        img
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Resize an oriented photo to `m.webp` (long edge 1600) and `s.webp` (short

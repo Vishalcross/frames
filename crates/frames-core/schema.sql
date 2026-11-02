@@ -40,7 +40,8 @@ CREATE TABLE assets (
   local_path    TEXT,
   remote_key    TEXT,
   thumb_state   TEXT NOT NULL DEFAULT 'none' CHECK (thumb_state IN ('none', 'queued', 'ready', 'failed')),
-  content_hash  TEXT
+  content_hash  TEXT,
+  thumbhash     TEXT                              -- [+] local-only grid placeholder (base64 ThumbHash)
 );
 
 -- Timeline: visible assets by date.

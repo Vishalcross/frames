@@ -804,7 +804,7 @@ where
             let out_ref = &outcomes;
             let store_ref = Arc::clone(store);
             let snap_ref = &report_snapshot;
-            s.spawn(move || loop {
+            s.spawn(move || crate::qos::run_as(crate::qos::WorkClass::Utility, move || loop {
                 if control.is_cancelled() {
                     break;
                 }
@@ -879,7 +879,7 @@ where
                     sha256: hash,
                     metadata,
                 }));
-            });
+            }));
         }
     });
 
@@ -1082,7 +1082,7 @@ where
                     let alb = album_id.map(str::to_string);
                     let progress_cb = &on_progress;
 
-                    handles.push(s.spawn(move || loop {
+                    handles.push(s.spawn(move || crate::qos::run_as(crate::qos::WorkClass::Utility, move || loop {
                         if control_ref.is_cancelled() || stop_ref.load(Ordering::SeqCst) {
                             break;
                         }
@@ -1170,7 +1170,7 @@ where
                                 }
                             }
                         }
-                    }));
+                    })));
                 }
                 for h in handles {
                     let _ = h.join();

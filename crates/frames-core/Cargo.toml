@@ -6,6 +6,7 @@ publish = false
 description = "Frames core logic: bucket keys, dates, change-log types, local schema. No I/O, no UI."
 
 [dependencies]
+base64 = "0.23"
 byteorder = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "7"
@@ -19,8 +20,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+thumbhash = "0.1"
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 webp = { version = "0.3", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

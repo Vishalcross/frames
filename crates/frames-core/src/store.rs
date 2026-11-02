@@ -116,6 +116,10 @@ pub struct AssetSummary {
     pub height: Option<u32>,
     pub duration_ms: Option<u64>,
     pub thumb_failed: bool,
+    /// Base64 ThumbHash: a ~25-byte blurred sketch the grid shows until the
+    /// thumbnail arrives. Local-only; filled in by the thumbnail service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
 }
 
 /// Full asset detail for the viewer info panel.
@@ -451,6 +455,9 @@ impl Store {
         }
         if !existing_cols.contains("content_hash") {
             conn.execute("ALTER TABLE assets ADD COLUMN content_hash TEXT", [])?;
+        }
+        if !existing_cols.contains("thumbhash") {
+            conn.execute("ALTER TABLE assets ADD COLUMN thumbhash TEXT", [])?;
         }
 
         // Album membership lives in `album_items` (spec section 5). These indexes
@@ -1549,13 +1556,19 @@ impl Store {
         args.push(Box::new(offset as i64));
         let mut stmt = self.conn.prepare(&format!(
             "SELECT s.id, s.kind, s.key, s.filename, s.size, s.taken_at, s.tz_offset,
-                    s.date_guessed, s.width, s.height, s.duration_ms, s.thumb_failed
+                    s.date_guessed, s.width, s.height, s.duration_ms, s.thumb_failed,
+                    s.thumbhash
              FROM assets s
              WHERE {where_sql}
              ORDER BY s.taken_at DESC, s.id ASC
              LIMIT ? OFFSET ?"
         ))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_summary)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            Ok(AssetSummary {
+                thumbhash: r.get(12)?,
+                ..row_to_summary(r)?
+            })
+        })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -1849,6 +1862,7 @@ fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<AssetSummary> {
         height: r.get::<_, Option<i64>>(9)?.map(|v| v as u32),
         duration_ms: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
         thumb_failed: r.get::<_, i64>(11)? != 0,
+        thumbhash: None,
     })
 }
 

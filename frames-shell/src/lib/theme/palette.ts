@@ -266,6 +266,49 @@ export interface PhotoPalette {
   accent: string;
   on_bg: string;
   on_sidebar: string;
+  /** Colours someone chose for an album: shown exactly, not re-toned. */
+  exact?: boolean;
+}
+
+/** sRGB (0-255) to OKLCH, the inverse of `oklchToRgb`. */
+export function rgbToOklch(r: number, g: number, b: number): OklchColor {
+  const lin = (v: number) => {
+    const s = v / 255;
+    return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  const [R, G, B] = [lin(r), lin(g), lin(b)];
+  const l = Math.cbrt(0.4122214708 * R + 0.5363325363 * G + 0.0514459929 * B);
+  const m = Math.cbrt(0.2119034982 * R + 0.6806995451 * G + 0.1073969566 * B);
+  const s = Math.cbrt(0.0883024619 * R + 0.2817188376 * G + 0.6299787005 * B);
+  const L = 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s;
+  const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s;
+  const bb = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s;
+  let h = (Math.atan2(bb, a) * 180) / Math.PI;
+  if (h < 0) h += 360;
+  return { l: L, c: Math.sqrt(a * a + bb * bb), h, pop: 1 };
+}
+
+/**
+ * A photo's palette in the user's light or dark scheme: surfaces and text
+ * take the photo's dominant hue, the accent its most vivid colour, at the
+ * scheme's own tones. So opening a photo recolours the app without flipping a
+ * light app to dark. `null` if a colour is malformed.
+ */
+export function rolesFromPhotoSeeds(
+  p: PhotoPalette,
+  scheme: ResolvedScheme,
+  intensity: AdaptiveIntensity = 'balanced',
+  highContrast = false
+): ComputedPaletteRoles | null {
+  const bg = hexToRgb(p.bg);
+  const sidebar = hexToRgb(p.sidebar);
+  const accent = hexToRgb(p.accent);
+  if (!bg || !sidebar || !accent) return null;
+  const dominant = rgbToOklch(...bg);
+  const vivid = rgbToOklch(...accent);
+  const base = computeTonalRoles(dominant, rgbToOklch(...sidebar), scheme, intensity, highContrast);
+  const accented = computeTonalRoles(vivid, dominant, scheme, intensity, highContrast);
+  return { ...base, accent: accented.accent, accentFg: accented.accentFg, ambient1: accented.ambient1 };
 }
 
 type Rgb = [number, number, number];

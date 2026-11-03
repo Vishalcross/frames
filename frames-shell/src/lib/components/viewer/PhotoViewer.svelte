@@ -106,6 +106,9 @@
     });
   }
 
+  // However the viewer closes, browsing takes over the colour again.
+  onMount(() => () => focusAsset(null, { source: 'viewer' }));
+
   $effect(() => {
     if (asset) {
       // Focus asset in viewer with top priority (§7.6 #1)

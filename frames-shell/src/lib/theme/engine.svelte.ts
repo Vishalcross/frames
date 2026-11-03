@@ -12,6 +12,7 @@ import type {
 import {
   computeTonalRoles,
   rolesFromPhotoPalette,
+  rolesFromPhotoSeeds,
   selectSeedAndSecondary,
   oklchToCss,
   type ComputedPaletteRoles,
@@ -102,6 +103,19 @@ export function setPhotoPalette(p: PhotoPalette | null): void {
   syncDOM();
 }
 
+// Browsing focus ("Viewer and browsing"): the photo under the pointer or at
+// the centre of the scroll. The palette lookup lives in $lib/adaptive.
+let browsingFocusHandler: ((assetId: string) => void) | null = null;
+
+export function onBrowsingFocus(handler: (assetId: string) => void): void {
+  browsingFocusHandler = handler;
+}
+
+function browsingFocus(id: string): void {
+  if (theme.appearance !== 'adaptive' || theme.colourSource !== 'both' || activeViewerAssetId) return;
+  browsingFocusHandler?.(id);
+}
+
 let activeViewerAssetId: string | null = null;
 let activeDetailAssetId: string | null = null;
 let hoverDwellTimer: any = null;
@@ -118,10 +132,23 @@ export function focusAsset(
   if (opts.swatches) {
     registerAssetPalette(id || 'temp', opts.swatches, opts.lum ?? 0.5);
   }
-  // Without real swatches for this asset there is nothing to adapt to; the
-  // photo palette (setPhotoPalette) or the current seed stays.
+  // Without swatches cached here, the real palette comes from the backend:
+  // the viewer's through $lib/adaptive, browsing's through browsingFocus.
   if (!id || !assetPaletteCache.has(id)) {
     if (opts.source === 'viewer') activeViewerAssetId = id;
+    if (!id || activeViewerAssetId) return;
+    if (opts.source === 'hover') {
+      if (hoverDwellTimer) clearTimeout(hoverDwellTimer);
+      // Rest on a photo before the app takes its colour (§7.6 #3).
+      hoverDwellTimer = setTimeout(() => browsingFocus(id), 400);
+    } else if (opts.source === 'scroll') {
+      const now = performance.now();
+      // Follow the scroll at most every 800 ms so colours do not strobe.
+      if (now - lastScrollSeedTimestamp >= 800) {
+        lastScrollSeedTimestamp = now;
+        browsingFocus(id);
+      }
+    }
     return;
   }
 
@@ -223,9 +250,10 @@ export function syncDOM(): void {
   } else if (theme.scheme === 'light' || theme.scheme === 'dark') {
     resolved.scheme = theme.scheme;
   }
-  // A photo palette brings its own background, so its scheme decides.
+  // Colours chosen for an album bring their own background, so their scheme
+  // decides; photo palettes are re-toned to the scheme instead.
   const fromPhoto =
-    theme.appearance === 'adaptive' && photoPalette ? rolesFromPhotoPalette(photoPalette) : null;
+    theme.appearance === 'adaptive' && photoPalette?.exact ? rolesFromPhotoPalette(photoPalette) : null;
   if (fromPhoto) resolved.scheme = fromPhoto.scheme;
 
   // Detect Tier
@@ -285,7 +313,13 @@ function syncDOMTokens(): void {
   if (theme.appearance === 'adaptive') {
     // One source for every token: the photo palette when there is one,
     // otherwise the seed's tonal roles for the resolved scheme.
-    let roles = photoPalette ? (rolesFromPhotoPalette(photoPalette)?.roles ?? null) : null;
+    const highContrast = root.getAttribute('data-contrast') === 'more';
+    let roles: ComputedPaletteRoles | null = null;
+    if (photoPalette?.exact) {
+      roles = rolesFromPhotoPalette(photoPalette)?.roles ?? null;
+    } else if (photoPalette) {
+      roles = rolesFromPhotoSeeds(photoPalette, resolved.scheme, theme.intensity, highContrast);
+    }
     if (!roles && resolved.palette) {
       const isBrowsingOnly = theme.colourSource === 'viewer' && !activeViewerAssetId;
       roles = computeTonalRoles(
@@ -293,7 +327,7 @@ function syncDOMTokens(): void {
         resolved.palette.secondary,
         resolved.scheme,
         isBrowsingOnly ? 'subtle' : theme.intensity,
-        root.getAttribute('data-contrast') === 'more'
+        highContrast
       );
     }
     if (roles) {

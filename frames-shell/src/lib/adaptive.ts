@@ -4,7 +4,7 @@
  * and debounced transitions.
  */
 import { invoke } from '@tauri-apps/api/core';
-import { setPhotoPalette } from '$lib/theme/engine.svelte';
+import { onBrowsingFocus, setPhotoPalette } from '$lib/theme/engine.svelte';
 
 export interface AdaptivePalette {
   bg: string;
@@ -12,6 +12,8 @@ export interface AdaptivePalette {
   accent: string;
   on_bg: string;
   on_sidebar: string;
+  /** Chosen by hand for an album, so shown exactly rather than re-toned. */
+  exact?: boolean;
 }
 
 export interface BackendAlbumTheme {
@@ -50,6 +52,12 @@ let currentAppliedPalette: AdaptivePalette | null = null;
 let requestCounter = 0;
 let debounceTimer: any = null;
 let isListeningToPaletteReady = false;
+// The album page being browsed, if any (set when no photo is open).
+let pageAlbumId: string | null = null;
+
+// "Viewer and browsing": the photo under the pointer or centred in the scroll
+// colours the app like an open one, under the same album rules.
+onBrowsingFocus((assetId) => handleViewedPhotoChange(assetId, pageAlbumId));
 
 /**
  * Setup Tauri event listener for album-palette-ready
@@ -125,7 +133,8 @@ export async function resolvePalette(
           sidebar: theme.sidebar,
           accent: theme.accent,
           on_bg: theme.on_bg || '#FFFFFF',
-          on_sidebar: theme.on_sidebar || '#FFFFFF'
+          on_sidebar: theme.on_sidebar || '#FFFFFF',
+          exact: true
         };
       }
       return null;
@@ -195,6 +204,7 @@ export function handleViewedPhotoChange(
   if (debounceTimer) {
     clearTimeout(debounceTimer);
   }
+  if (!assetId) pageAlbumId = albumId ?? null;
 
   const reqId = ++requestCounter;
   debounceTimer = setTimeout(async () => {

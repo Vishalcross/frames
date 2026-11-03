@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use base64::Engine;
@@ -30,7 +30,7 @@ use frames_core::store::{
     SearchFilter, SearchSuggestions, Store, TrashItem,
 };
 use frames_core::sync::{
-    check_library, export_originals, import_unknown_s4_keys, rebuild_from_s4,
+    check_library, export_originals, flush_outbox, import_unknown_s4_keys, rebuild_from_s4,
     resume_unfinished_imports, run_import_concurrent, sync_once, unfinished_imports,
     ImportControl, ImportRunReport, LibraryCheckReport, SyncReport,
 };
@@ -165,6 +165,8 @@ pub struct AppState {
     pub offline_mode: Mutex<bool>,
     pub db_damaged: Mutex<Option<String>>,
     pub import_control: Arc<ImportControl>,
+    /// Wakes the thread that uploads local edits (see `push_edits_soon`).
+    edit_pusher: OnceLock<mpsc::Sender<()>>,
 }
 
 impl AppState {
@@ -251,6 +253,7 @@ impl AppState {
             offline_mode: Mutex::new(false),
             db_damaged: Mutex::new(db_damaged_err),
             import_control: Arc::new(ImportControl::new()),
+            edit_pusher: OnceLock::new(),
         };
         // Hand the thumbnail service its S4 client if settings already allow one.
         let _ = state.require_s4();
@@ -377,6 +380,14 @@ impl AppState {
 
     /// Fill in missing `s.webp` thumbnails in the background (spec section 10),
     /// telling the UI as each one lands. Safe to call repeatedly.
+    /// Upload local edits (albums, trash, dates) once they pause, rather than
+    /// at the next background sync.
+    pub fn push_edits_soon(&self) {
+        if let Some(edits) = self.edit_pusher.get() {
+            let _ = edits.send(());
+        }
+    }
+
     pub fn start_thumb_backfill(&self, app: &AppHandle) {
         let app = app.clone();
         self.thumbs.start_backfill(Some(Arc::new(move |id: &str| {
@@ -388,6 +399,26 @@ impl AppState {
 /// How often the library syncs with S4 and unfinished imports are retried
 /// (spec section 6: "every 5 minutes and after coming back online").
 const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Quiet time after the last edit before it is uploaded (spec section 6:
+/// "local edits flush after a ~2 s debounce").
+const EDIT_PUSH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Upload local edits a moment after they stop, so a burst of them (adding
+/// photos one by one, say) becomes one log batch. Offline, they wait for the
+/// background sync.
+fn push_edits_when_quiet(app: AppHandle, edits: mpsc::Receiver<()>) {
+    while edits.recv().is_ok() {
+        while edits.recv_timeout(EDIT_PUSH_DEBOUNCE).is_ok() {}
+        let state = app.state::<AppState>();
+        if *state.offline_mode.lock().unwrap() {
+            continue;
+        }
+        if let Ok(s4) = state.require_s4() {
+            let _ = flush_outbox(&mut &*state.store, s4.as_ref(), Utc::now());
+        }
+    }
+}
 
 /// One background round: push local changes, pull the other computer's, tell
 /// the UI if anything arrived or the connection changed, then carry on with
@@ -669,6 +700,7 @@ fn adjust_asset_date(
     store
         .set_asset_date(&id, parsed, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.get_asset(&id).map_err(|e| e.to_string())
 }
 
@@ -813,6 +845,7 @@ fn create_album(
     if let Some(ids) = asset_ids.filter(|ids| !ids.is_empty()) {
         store.add_to_album(&id, ids, now).map_err(|e| e.to_string())?;
     }
+    state.push_edits_soon();
     store.list_albums().map_err(|e| e.to_string())
 }
 
@@ -830,6 +863,7 @@ fn rename_album(
     store
         .rename_album(&album_id, trimmed.to_string(), Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.list_albums().map_err(|e| e.to_string())
 }
 
@@ -839,6 +873,7 @@ fn delete_album(album_id: String, state: State<'_, AppState>) -> Result<Vec<Albu
     store
         .delete_album(&album_id, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.list_albums().map_err(|e| e.to_string())
 }
 
@@ -852,6 +887,7 @@ fn add_to_album(
     store
         .add_to_album(&album_id, asset_ids, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.list_albums().map_err(|e| e.to_string())
 }
 
@@ -865,6 +901,7 @@ fn remove_from_album(
     store
         .remove_from_album(&album_id, asset_ids, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.list_album_assets(&album_id).map_err(|e| e.to_string())
 }
 
@@ -879,6 +916,7 @@ fn move_to_album(
     store
         .move_to_album(&from_album_id, &to_album_id, asset_ids, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store
         .list_album_assets(&from_album_id)
         .map_err(|e| e.to_string())
@@ -944,7 +982,9 @@ fn trash_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), Stri
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store
         .trash_assets(ids, Utc::now())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -952,7 +992,9 @@ fn restore_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), St
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store
         .restore_assets(ids, Utc::now())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1531,6 +1573,18 @@ pub fn run() {
                 .ok();
 
             app.state::<AppState>().start_thumb_backfill(app.handle());
+
+            let (edits, edits_rx) = mpsc::channel();
+            let _ = app.state::<AppState>().edit_pusher.set(edits);
+            let handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("frames-edit-push".into())
+                .spawn(move || {
+                    // Utility, not Background: macOS throttles background network traffic.
+                    frames_core::qos::set_current_thread(frames_core::qos::WorkClass::Utility);
+                    push_edits_when_quiet(handle, edits_rx);
+                })
+                .ok();
 
             // The UI syncs once at launch; this picks up unfinished imports
             // shortly after, then keeps syncing every few minutes.

@@ -181,10 +181,6 @@ export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
   const takenAt = new Date(s.taken_at).getTime() || Date.now();
   const d = new Date(takenAt);
 
-  // Seed palette deterministically from ID
-  const idNum = s.id.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
-  const hue = (idNum * 37) % 360;
-
   return {
     id: s.id,
     kind: s.kind,
@@ -193,10 +189,8 @@ export function backendSummaryToAsset(s: BackendAssetSummary): Asset {
     h: s.height || 3024,
     durationMs: s.duration_ms || undefined,
     thumbHash: s.thumbhash ?? '',
-    palette: [
-      { l: 0.65, c: 0.16, h: hue, pop: 0.5 },
-      { l: 0.50, c: 0.12, h: (hue + 60) % 360, pop: 0.3 }
-    ],
+    // Real palettes come from the backend (get_palette); none is invented here.
+    palette: null,
     lum: 0.55,
     favorite: false,
     hidden: false,
@@ -528,17 +522,22 @@ export class TauriAssetRepo implements AssetRepo {
   }
 
   // Album management
-  async createAlbum(name: string): Promise<AlbumItem[]> {
+  /** Create an album, optionally holding `assetIds` from the start. Throws on failure. */
+  async createAlbum(name: string, assetIds: string[] = []): Promise<AlbumItem[]> {
     if (!isTauriAvailable()) return this.cachedAlbums;
-    try {
-      const raw = await invoke<BackendAlbumSummary[]>('create_album', { name });
-      this.cachedAlbums = raw.map(backendAlbumToItem);
-      return this.cachedAlbums;
-    } catch (e) {
-      console.error('Failed to create album:', e);
-      return this.cachedAlbums;
-    }
+    const raw = await invoke<BackendAlbumSummary[]>('create_album', { name, assetIds });
+    this.cachedAlbums = raw.map(backendAlbumToItem);
+    return this.cachedAlbums;
   }
+
+  /** Add photos to an album (`album.add` on every device). Throws on failure. */
+  async addToAlbum(albumId: string, assetIds: string[]): Promise<AlbumItem[]> {
+    if (!isTauriAvailable()) return this.cachedAlbums;
+    const raw = await invoke<BackendAlbumSummary[]>('add_to_album', { albumId, assetIds });
+    this.cachedAlbums = raw.map(backendAlbumToItem);
+    return this.cachedAlbums;
+  }
+
 
   async renameAlbum(id: string, name: string): Promise<void> {
     if (!isTauriAvailable()) return;

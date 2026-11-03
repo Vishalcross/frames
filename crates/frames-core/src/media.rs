@@ -269,14 +269,42 @@ fn resolve_tool_binary_with_env(
 /// and setting `CREATE_NO_WINDOW` (`0x0800_0000`) on Windows so console windows never flash.
 pub fn spawn_hidden_command(tool: &str) -> Command {
     let bin = resolve_tool_binary(tool);
+    // A tool launched for background work (an import's decoder, the
+    // thumbnail backfill's ffmpeg) runs at that work's priority, not the UI's.
+    let class = crate::qos::current();
+    #[cfg(target_os = "macos")]
+    let cmd = match class {
+        Some(class) => {
+            // taskpolicy applies the clamp and then execs the tool in place.
+            let mut cmd = Command::new("/usr/sbin/taskpolicy");
+            cmd.arg("-c")
+                .arg(match class {
+                    crate::qos::WorkClass::Utility => "utility",
+                    crate::qos::WorkClass::Background => "background",
+                })
+                .arg(bin);
+            cmd
+        }
+        None => Command::new(bin),
+    };
+    #[cfg(not(target_os = "macos"))]
     #[allow(unused_mut)]
     let mut cmd = Command::new(bin);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+        let priority = match class {
+            Some(crate::qos::WorkClass::Utility) => BELOW_NORMAL_PRIORITY_CLASS,
+            Some(crate::qos::WorkClass::Background) => IDLE_PRIORITY_CLASS,
+            None => 0,
+        };
+        cmd.creation_flags(CREATE_NO_WINDOW | priority);
     }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = class;
     cmd
 }
 
@@ -1787,7 +1815,7 @@ fn decode_with_system(path: &Path) -> Option<image::DynamicImage> {
     #[cfg(target_os = "macos")]
     {
         let tmp = std::env::temp_dir().join(format!("frames-heic-{}.jpg", fastrand::u64(..)));
-        let converted = Command::new("/usr/bin/sips")
+        let converted = spawn_hidden_command("/usr/bin/sips")
             .args(["-s", "format", "jpeg", "-s", "formatOptions", "92", "-Z"])
             .arg(PREVIEW_THUMB_LONG_EDGE.to_string())
             .arg(path)
@@ -2289,6 +2317,20 @@ mod tests {
         let small_meta = parse_metadata_from_bytes(&pair.small_webp, "webp");
         assert_eq!(small_meta.width, Some(300));
         assert_eq!(small_meta.height, Some(450));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn tools_launched_from_background_work_inherit_its_priority() {
+        let program = std::thread::spawn(|| {
+            crate::qos::set_current_thread(crate::qos::WorkClass::Background);
+            spawn_hidden_command("/bin/echo").get_program().to_owned()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(program, "/usr/sbin/taskpolicy");
+        // Interactive work (this test thread) launches tools directly.
+        assert_eq!(spawn_hidden_command("/bin/echo").get_program(), "/bin/echo");
     }
 
     #[test]

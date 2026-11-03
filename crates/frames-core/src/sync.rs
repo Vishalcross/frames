@@ -142,6 +142,9 @@ pub struct SyncReport {
     pub snapshot_written: Option<String>,
 }
 
+/// Thumbnail decodes an import may run at once, whatever its upload concurrency.
+static IMPORT_DECODE_SLOTS: crate::thumbnails::Slots = crate::thumbnails::Slots::new(2);
+
 /// One flush at a time: a batch's seq is read, uploaded and only then marked
 /// flushed, so two flushers must never hold the same seq at once.
 static FLUSH_LOCK: Mutex<()> = Mutex::new(());
@@ -1334,7 +1337,12 @@ fn upload_and_log_one_asset(
     let (upload_primary, upload_motion) = plan_original_uploads(item, s4)?;
 
     // Step 5: Generate thumbnails & store locally
-    let thumbs = item.build_thumbnails();
+    // Decoding is CPU-heavy (HEIC and RAW go through the system decoder),
+    // so an import makes at most two thumbnails at a time.
+    let thumbs = {
+        let _slot = IMPORT_DECODE_SLOTS.acquire();
+        item.build_thumbnails()
+    };
     let _ = cache.put_small_thumb(&item.record.id, &thumbs.small_webp);
     let _ = cache.put_preview(&item.record.id, &thumbs.preview_webp);
 
@@ -1464,7 +1472,12 @@ where
     let (upload_primary, upload_motion) = plan_original_uploads(item, s4)?;
 
     // Step 5: Generate thumbnails outside the DB lock
-    let thumbs = item.build_thumbnails();
+    // Decoding is CPU-heavy (HEIC and RAW go through the system decoder),
+    // so an import makes at most two thumbnails at a time.
+    let thumbs = {
+        let _slot = IMPORT_DECODE_SLOTS.acquire();
+        item.build_thumbnails()
+    };
     if let Ok(mut c) = cache.lock() {
         let _ = c.put_small_thumb(&item.record.id, &thumbs.small_webp);
         let _ = c.put_preview(&item.record.id, &thumbs.preview_webp);

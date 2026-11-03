@@ -12,10 +12,20 @@ pub enum WorkClass {
     Background,
 }
 
+thread_local! {
+    static CURRENT: std::cell::Cell<Option<WorkClass>> = const { std::cell::Cell::new(None) };
+}
+
+/// The class set on this thread, if any; tools it launches run at it too.
+pub fn current() -> Option<WorkClass> {
+    CURRENT.with(|c| c.get())
+}
+
 /// Lower the calling thread's priority for the rest of its life. Call it only
 /// on threads this app spawns for the work, never on pooled runtime threads,
 /// which would keep the lower priority for unrelated work later.
 pub fn set_current_thread(class: WorkClass) {
+    CURRENT.with(|c| c.set(Some(class)));
     #[cfg(target_os = "macos")]
     {
         let qos = match class {

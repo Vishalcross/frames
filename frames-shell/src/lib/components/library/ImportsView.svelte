@@ -123,8 +123,14 @@
     return status.queue.filter((item) => item.state === 'failed' || Boolean(item.error));
   });
 
+  // The status carries the whole queue; fetch it at most every 700 ms however
+  // many progress events arrive.
+  let lastStatusFetch = 0;
   async function refreshStatus() {
     if (!isTauriAvailable()) return;
+    const now = Date.now();
+    if (now - lastStatusFetch < 700) return;
+    lastStatusFetch = now;
     try {
       const s = await tauriRepo.getImportStatus();
       status = s;

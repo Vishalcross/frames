@@ -2,16 +2,35 @@
   import Icon from '$lib/components/icons/Icon.svelte';
   import type { AlbumItem } from '$lib/types';
   import { getAssetUrl } from '$lib/services/tauriRepo';
+  import ContextMenu from '$lib/components/surface/ContextMenu.svelte';
+  import type { MenuItem } from '$lib/components/surface/Menu.svelte';
+  import Button from '$lib/components/surface/Button.svelte';
 
   let {
     albums = [],
     onnavigatealbum,
-    onnavigateroute
+    onnavigateroute,
+    oncreatealbum,
+    ondeletealbum
   }: {
     albums?: AlbumItem[];
     onnavigatealbum?: (albumId: string) => void;
     onnavigateroute?: (route: string) => void;
+    oncreatealbum?: () => void;
+    ondeletealbum?: (album: AlbumItem) => void;
   } = $props();
+
+  // Right-click on an album card.
+  let cardMenu = $state<{ album: AlbumItem; x: number; y: number } | null>(null);
+  let cardMenuOpen = $state(false);
+  const cardMenuItems: MenuItem[] = [{ id: 'delete', label: 'Delete Album', icon: 'trash', danger: true }];
+
+  function openCardMenu(e: MouseEvent, album: AlbumItem) {
+    if (!ondeletealbum) return;
+    e.preventDefault();
+    cardMenu = { album, x: e.clientX, y: e.clientY };
+    cardMenuOpen = true;
+  }
 
   function getCardThumb(assetId?: string) {
     if (!assetId) return '';
@@ -24,6 +43,12 @@
   <section class="collection-rail-section">
     <div class="rail-header">
       <span class="rail-title">Albums</span>
+      {#if oncreatealbum}
+        <Button variant="ghost" title="New Album" onclick={oncreatealbum}>
+          <Icon name="plus" size={14} />
+          <span>New Album</span>
+        </Button>
+      {/if}
     </div>
     {#if albums.length === 0}
       <div class="empty-rail-message">No albums found in library. Create an album or sync with MEGA S4.</div>
@@ -34,6 +59,7 @@
             type="button"
             class="album-card"
             onclick={() => onnavigatealbum?.(album.id)}
+            oncontextmenu={(e) => openCardMenu(e, album)}
           >
             <div class="album-thumb-container {album.isFolder ? 'is-folder-stack' : ''}">
               {#if album.keyAssetId}
@@ -58,6 +84,18 @@
       </div>
     {/if}
   </section>
+
+  {#if cardMenu}
+    <ContextMenu
+      items={cardMenuItems}
+      bind:open={cardMenuOpen}
+      x={cardMenu.x}
+      y={cardMenu.y}
+      onselect={(item) => {
+        if (item.id === 'delete' && cardMenu) ondeletealbum?.(cardMenu.album);
+      }}
+    />
+  {/if}
 
   <!-- 2. Media Types Rail (§4.9) -->
   <section class="collection-rail-section">

@@ -555,24 +555,24 @@ pub fn is_asset_id(id: &str) -> bool {
 }
 
 /// Counting semaphore for blocking threads.
-struct Slots {
+pub(crate) struct Slots {
     used: Mutex<usize>,
     freed: Condvar,
     max: usize,
 }
 
-struct SlotGuard<'a>(&'a Slots);
+pub(crate) struct SlotGuard<'a>(&'a Slots);
 
 impl Slots {
-    fn new(max: usize) -> Self {
+    pub(crate) const fn new(max: usize) -> Self {
         Self {
             used: Mutex::new(0),
             freed: Condvar::new(),
-            max: max.max(1),
+            max: if max == 0 { 1 } else { max },
         }
     }
 
-    fn acquire(&self) -> SlotGuard<'_> {
+    pub(crate) fn acquire(&self) -> SlotGuard<'_> {
         let mut used = self.used.lock().unwrap();
         while *used >= self.max {
             used = self.freed.wait(used).unwrap();

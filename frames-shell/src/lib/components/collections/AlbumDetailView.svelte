@@ -30,7 +30,8 @@
 
   import { onMount } from 'svelte';
   import AlbumThemeSettings from './AlbumThemeSettings.svelte';
-  import Menu, { type MenuItem } from '$lib/components/surface/Menu.svelte';
+  import ContextMenu from '$lib/components/surface/ContextMenu.svelte';
+  import type { MenuItem } from '$lib/components/surface/Menu.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import { handleViewedPhotoChange } from '$lib/adaptive';
 
@@ -38,6 +39,9 @@
   let countOverride = $state<number | null>(null);
   let settingsOpen = $state(false);
   let moreMenuOpen = $state(false);
+  // The menu opens below the button's right edge; it lives at the top level so
+  // the hero's overflow cannot clip it.
+  let moreMenuAt = $state({ x: 0, y: 0 });
   const moreMenuItems: MenuItem[] = [
     { id: 'delete', label: 'Delete Album', icon: 'trash', danger: true }
   ];
@@ -162,15 +166,21 @@
                 aria-label="More album actions"
                 aria-haspopup="menu"
                 aria-expanded={moreMenuOpen}
-                onclick={() => (moreMenuOpen = !moreMenuOpen)}
+                onclick={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  moreMenuAt = { x: r.right, y: r.bottom + 6 };
+                  moreMenuOpen = !moreMenuOpen;
+                }}
               >
                 <Icon name="more-horizontal" size={16} />
               </button>
-              <Menu
+              <ContextMenu
                 items={moreMenuItems}
                 bind:open={moreMenuOpen}
+                x={moreMenuAt.x}
+                y={moreMenuAt.y}
+                align="right"
                 onselect={handleMoreSelect}
-                style="top: 38px; right: 0;"
               />
             </div>
           {/if}

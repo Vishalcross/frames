@@ -258,3 +258,72 @@ export function computeTonalRoles(
     ambient2
   };
 }
+
+/** A photo's or album's colours, as hex (from the Rust palette extractor or chosen by hand). */
+export interface PhotoPalette {
+  bg: string;
+  sidebar: string;
+  accent: string;
+  on_bg: string;
+  on_sidebar: string;
+}
+
+type Rgb = [number, number, number];
+
+function hexToRgb(hex: string): Rgb | null {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function rgbCss([r, g, b]: Rgb, alpha = 1): string {
+  return alpha < 1 ? `rgba(${r}, ${g}, ${b}, ${alpha})` : `rgb(${r}, ${g}, ${b})`;
+}
+
+function mixRgb(a: Rgb, b: Rgb, t: number): Rgb {
+  return [0, 1, 2].map((i) => Math.round(a[i] + (b[i] - a[i]) * t)) as Rgb;
+}
+
+/**
+ * Every role from a photo or album palette. Text, fills and separators are
+ * derived from the background they sit on, never mixed with another
+ * scheme's tokens, and the scheme follows that background: light text on a
+ * dark photo, dark text on a light one. `null` if a colour is malformed.
+ */
+export function rolesFromPhotoPalette(
+  p: PhotoPalette
+): { roles: ComputedPaletteRoles; scheme: ResolvedScheme } | null {
+  const bg = hexToRgb(p.bg);
+  const sidebar = hexToRgb(p.sidebar);
+  const accent = hexToRgb(p.accent);
+  if (!bg || !sidebar || !accent) return null;
+
+  const white: Rgb = [255, 255, 255];
+  const ink: Rgb = [17, 17, 19];
+  const text = contrastRatio(white, bg) >= contrastRatio(ink, bg) ? white : ink;
+  const scheme: ResolvedScheme = text === white ? 'dark' : 'light';
+  const accentFg = contrastRatio(white, accent) >= contrastRatio(ink, accent) ? '#ffffff' : '#111113';
+
+  return {
+    scheme,
+    roles: {
+      bgCanvas: rgbCss(bg),
+      bgSidebar: rgbCss(sidebar, 0.9),
+      bgViewer: rgbCss(bg),
+      surfaceRaised: rgbCss(mixRgb(bg, text, 0.06)),
+      surfaceOverlay: rgbCss(mixRgb(bg, text, 0.1), 0.94),
+      fill1: rgbCss(text, 0.08),
+      fill2: rgbCss(text, 0.13),
+      fill3: rgbCss(text, 0.2),
+      text1: rgbCss(text),
+      text2: rgbCss(text, 0.66),
+      text3: rgbCss(text, 0.42),
+      separator: rgbCss(text, 0.16),
+      accent: rgbCss(accent),
+      accentFg,
+      ambient1: rgbCss(accent, scheme === 'dark' ? 0.32 : 0.26),
+      ambient2: rgbCss(sidebar, 0.28)
+    }
+  };
+}

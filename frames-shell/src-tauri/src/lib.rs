@@ -438,6 +438,7 @@ fn resume_imports_in_background(app: &AppHandle) {
         let _ = resume_unfinished_imports(store, s4, cache, control, Utc::now(), move |rep| {
             let _ = emitter.emit("frames://import-progress", rep);
         });
+        app.state::<AppState>().start_thumb_backfill(&app);
     });
 }
 
@@ -458,7 +459,7 @@ fn check_core_status(filename: &str) -> CoreStatus {
 }
 
 #[tauri::command(async)]
-fn get_app_bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
+fn get_app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
     let now = Utc::now();
     let payload = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
@@ -506,7 +507,6 @@ fn get_app_bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Boots
         }
     };
 
-    state.start_thumb_backfill(&app);
     Ok(payload)
 }
 
@@ -793,16 +793,26 @@ fn debug_album(
 }
 
 #[tauri::command(async)]
-fn create_album(name: String, state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> {
+/// Create an album, optionally holding `asset_ids` from the start (New Album
+/// from a selection).
+fn create_album(
+    name: String,
+    asset_ids: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<Vec<AlbumSummary>, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("Album name cannot be empty".into());
     }
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     let id = Uuid::new_v4().to_string();
+    let now = Utc::now();
     store
-        .create_album(id, trimmed.to_string(), Utc::now())
+        .create_album(id.clone(), trimmed.to_string(), now)
         .map_err(|e| e.to_string())?;
+    if let Some(ids) = asset_ids.filter(|ids| !ids.is_empty()) {
+        store.add_to_album(&id, ids, now).map_err(|e| e.to_string())?;
+    }
     store.list_albums().map_err(|e| e.to_string())
 }
 
@@ -987,7 +997,7 @@ async fn import_from_paths(
     let control = Arc::clone(&state.import_control);
 
     tauri::async_runtime::spawn_blocking(move || {
-        run_import_concurrent(
+        let report = run_import_concurrent(
             paths,
             album_id.as_deref(),
             store_arc,
@@ -999,7 +1009,10 @@ async fn import_from_paths(
                 let _ = app.emit("frames://import-progress", rep);
             },
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+        // New photos get their grid placeholders.
+        app.state::<AppState>().start_thumb_backfill(&app);
+        report
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1417,6 +1430,7 @@ fn save_settings(
 pub struct WorkerStatus {
     pub uploading_count: usize,
     pub thumb_generating_count: usize,
+    pub import_running: bool,
 }
 
 #[tauri::command(async)]
@@ -1432,6 +1446,7 @@ fn get_worker_status(state: State<'_, AppState>) -> Result<WorkerStatus, String>
     Ok(WorkerStatus {
         uploading_count,
         thumb_generating_count: state.thumbs.pending_count(),
+        import_running: state.import_control.is_running(),
     })
 }
 

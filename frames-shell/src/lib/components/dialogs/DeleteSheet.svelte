@@ -2,6 +2,7 @@
   import Surface from '$lib/components/surface/Surface.svelte';
   import Button from '$lib/components/surface/Button.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
+  import { portal } from '$lib/actions/portal';
 
   let {
     open = $bindable(false),
@@ -34,7 +35,7 @@
 </script>
 
 {#if open}
-  <div class="sheet-modal-backdrop" onclick={(e) => { if (e.target === e.currentTarget) handleCancel(); }} role="presentation">
+  <div use:portal class="sheet-modal-backdrop" onclick={(e) => { if (e.target === e.currentTarget) handleCancel(); }} role="presentation">
     <div class="sheet-container" role="dialog" aria-modal="true" tabindex="-1">
       <Surface kind="sheet" class="delete-sheet-surface">
         <div class="delete-sheet-icon">

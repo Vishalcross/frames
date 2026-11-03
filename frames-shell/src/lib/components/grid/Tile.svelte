@@ -70,8 +70,13 @@
   // opportunistic delivery, at the size the tile is actually shown).
   let upgraded = $state(false);
 
+  // Reset only when the tile shows a different photo. A refresh hands the
+  // grid new objects for the same photos; reacting to those blanked tiles
+  // whose <img> src had not changed, so no load event ever brought them back.
+  const assetId = $derived(asset.id);
+
   $effect(() => {
-    const _ = asset.id;
+    const _ = assetId;
     isLoaded = false;
     reloadCounter = 0;
     upgraded = false;
@@ -88,7 +93,7 @@
 
   $effect(() => {
     if (!wantsLarge || !isLoaded || upgraded || deferLoad) return;
-    const id = asset.id;
+    const id = assetId;
     const large = new Image();
     large.src = thumbUrl(id, 1024);
     large
@@ -263,14 +268,13 @@
     object-fit: cover;
     display: block;
     opacity: 0;
-    filter: blur(8px);
-    transition: opacity 150ms var(--ease-standard),
-                filter 150ms var(--ease-standard);
+    /* A plain fade over the ThumbHash placeholder; animating filters on
+       hundreds of tiles costs the compositor every frame. */
+    transition: opacity 150ms var(--ease-standard);
   }
 
   .tile-image.loaded {
     opacity: 1;
-    filter: blur(0px);
   }
 
   /* Check badge top-left (22px, §4.4) */

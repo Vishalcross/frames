@@ -28,6 +28,9 @@
   import ConnectionPane from '$lib/components/settings/ConnectionPane.svelte';
   import KitGallery from '$lib/components/settings/KitGallery.svelte';
   import DeleteSheet from '$lib/components/dialogs/DeleteSheet.svelte';
+  import NewAlbumSheet from '$lib/components/dialogs/NewAlbumSheet.svelte';
+  import ContextMenu from '$lib/components/surface/ContextMenu.svelte';
+  import type { MenuItem } from '$lib/components/surface/Menu.svelte';
   import ImportOverlay from '$lib/components/dialogs/ImportOverlay.svelte';
   import Toast, { type ToastMessage } from '$lib/components/dialogs/Toast.svelte';
 
@@ -225,7 +228,13 @@
     if (isTauri) {
       import('@tauri-apps/api/event').then(({ listen }) => {
         let importRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-        listen('frames://import-progress', () => {
+        // Progress fires for every hashed and uploaded file; the library only
+        // changes when an import adds a photo.
+        let lastImported = -1;
+        listen<{ imported_count?: number }>('frames://import-progress', (event) => {
+          const imported = event.payload?.imported_count ?? 0;
+          if (imported === lastImported) return;
+          lastImported = imported;
           if (!importRefreshTimer) {
             importRefreshTimer = setTimeout(async () => {
               importRefreshTimer = null;
@@ -350,6 +359,75 @@
     ];
     selectedIds = new Set();
     gridKey++;
+  }
+
+  // New Album: from the sidebar or Albums page (empty), or from a selection.
+  let newAlbumOpen = $state(false);
+  let newAlbumAssetIds = $state<string[]>([]);
+
+  function openNewAlbum(assetIds: string[] = []) {
+    newAlbumAssetIds = assetIds;
+    newAlbumOpen = true;
+  }
+
+  async function handleCreateAlbum(name: string) {
+    const ids = newAlbumAssetIds;
+    newAlbumAssetIds = [];
+    const before = new Set(albums.map((a) => a.id));
+    try {
+      albums = await tauriRepo.createAlbum(name, ids);
+      const created = albums.find((a) => !before.has(a.id));
+      if (ids.length > 0) selectedIds = new Set();
+      const added = ids.length > 0 ? ` with ${ids.length} ${ids.length === 1 ? 'item' : 'items'}` : '';
+      toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Created album “${name}”${added}` }];
+      if (created) navigate('album-detail', created.id);
+    } catch (e: any) {
+      toasts = [
+        ...toasts,
+        { id: Date.now().toString(), type: 'error', text: `Could not create album: ${e?.toString() || e}` }
+      ];
+    }
+  }
+
+  // Add to Album, from the selection bar: every album, plus New Album with the selection.
+  let addToAlbumOpen = $state(false);
+  let addToAlbumAt = $state({ x: 0, y: 0 });
+  const addToAlbumItems = $derived<MenuItem[]>([
+    { id: '__new', label: 'New Album…', icon: 'plus' },
+    ...(albums.length > 0 ? [{ id: '__sep', label: '', separator: true }] : []),
+    ...albums.map((a) => ({ id: a.id, label: a.title, icon: 'album' }))
+  ]);
+
+  function openAddToAlbum(e: MouseEvent) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    addToAlbumAt = { x: r.left, y: r.top };
+    addToAlbumOpen = true;
+  }
+
+  async function handleAddToAlbum(item: MenuItem) {
+    const ids = Array.from(selectedIds);
+    if (item.id === '__new') {
+      openNewAlbum(ids);
+      return;
+    }
+    try {
+      albums = await tauriRepo.addToAlbum(item.id, ids);
+      selectedIds = new Set();
+      if (currentRoute === 'album-detail' && currentAlbumId === item.id) libraryVersion++;
+      toasts = [
+        ...toasts,
+        {
+          id: Date.now().toString(),
+          type: 'info',
+          text: `Added ${ids.length} ${ids.length === 1 ? 'item' : 'items'} to “${item.label}”`
+        }
+      ];
+    } catch (e: any) {
+      toasts = [
+        ...toasts,
+        { id: Date.now().toString(), type: 'error', text: `Could not add to album: ${e?.toString() || e}` }
+      ];
+    }
   }
 
   function handleDeleteAlbumPrompt(album: AlbumItem) {
@@ -499,6 +577,7 @@
       onnavigate={navigate}
       onsync={handleSyncNow}
       ondeletealbum={isTauri ? handleDeleteAlbumPrompt : undefined}
+      oncreatealbum={isTauri ? () => openNewAlbum() : undefined}
     />
 
     <!-- Main Content Area -->
@@ -576,6 +655,8 @@
           <CollectionsView
             {albums}
             onnavigatealbum={(id) => navigate('album-detail', id)}
+            oncreatealbum={isTauri ? () => openNewAlbum() : undefined}
+            ondeletealbum={isTauri ? handleDeleteAlbumPrompt : undefined}
             onnavigateroute={(r) => navigate(r)}
           />
         {:else if currentRoute === 'album-detail'}
@@ -628,7 +709,7 @@
         selectedCount={selectedIds.size}
         onshare={handleShare}
         onfavorite={handleFavorite}
-        onaddtoalbum={() => handleShare()}
+        onaddtoalbum={isTauri ? openAddToAlbum : undefined}
         ondelete={handleDeletePrompt}
         onclear={() => (selectedIds = new Set())}
       />
@@ -709,6 +790,16 @@
     bind:open={deleteSheetOpen}
     count={selectedIds.size}
     onconfirm={handleDeleteConfirmed}
+  />
+
+  <NewAlbumSheet bind:open={newAlbumOpen} count={newAlbumAssetIds.length} oncreate={handleCreateAlbum} />
+
+  <ContextMenu
+    items={addToAlbumItems}
+    bind:open={addToAlbumOpen}
+    x={addToAlbumAt.x}
+    y={addToAlbumAt.y}
+    onselect={handleAddToAlbum}
   />
 
   <!-- Album delete confirmation: removes the album everywhere, keeps its photos -->

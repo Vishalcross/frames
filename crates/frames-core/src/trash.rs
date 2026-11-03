@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::keys::{thumb_preview_key, thumb_small_key};
 use crate::s4::{ObjectStore, S4Error};
-use crate::store::{PurgeCandidate, Store, StoreError};
+use crate::store::{PurgeCandidate, Store, StoreAccess, StoreError};
 
 #[derive(Debug, Error)]
 pub enum TrashError {
@@ -54,99 +54,54 @@ pub fn trash_summary(store: &Store, now: DateTime<Utc>) -> Result<TrashSummary> 
 /// Finds all assets trashed >= 30 days ago, deletes their original, motion file,
 /// and thumbnails (`s.webp`, `m.webp`) from S4, and logs `asset.purge`.
 pub fn purge_expired_trash(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<PurgeReport> {
-    let candidates = store.assets_due_for_purge(now)?;
+    let candidates = store.with(|st| st.assets_due_for_purge(now))?;
     purge_candidates(store, s4, &candidates, now)
-}
-
-/// Concurrent-friendly 30-day auto-purge that only locks `store` briefly to read
-/// purge candidates and commit tombstones, never holding the DB mutex across S4
-/// network `DELETE` requests.
-pub fn purge_expired_trash_concurrent(
-    store: &std::sync::Mutex<Store>,
-    s4: &dyn ObjectStore,
-    now: DateTime<Utc>,
-) -> Result<PurgeReport> {
-    let candidates: Vec<PurgeCandidate> = {
-        let st = store
-            .lock()
-            .map_err(|_| StoreError::Io(std::io::Error::other("store mutex poisoned")))?;
-        st.assets_due_for_purge(now)?
-    };
-    if candidates.is_empty() {
-        return Ok(PurgeReport::default());
-    }
-
-    let mut purged_ids = Vec::with_capacity(candidates.len());
-    let mut s4_deleted = 0usize;
-
-    for cand in &candidates {
-        s4.delete_object(&cand.key)?;
-        s4_deleted += 1;
-
-        if let Some(ref m_key) = cand.motion_key {
-            s4.delete_object(m_key)?;
-            s4_deleted += 1;
-        }
-
-        s4.delete_object(&thumb_small_key(&cand.id))?;
-        s4.delete_object(&thumb_preview_key(&cand.id))?;
-        s4_deleted += 2;
-
-        purged_ids.push(cand.id.clone());
-    }
-
-    {
-        let mut st = store
-            .lock()
-            .map_err(|_| StoreError::Io(std::io::Error::other("store mutex poisoned")))?;
-        st.purge_assets(purged_ids.clone(), now)?;
-    }
-
-    Ok(PurgeReport {
-        purged_asset_ids: purged_ids,
-        s4_objects_deleted: s4_deleted,
-    })
 }
 
 /// Immediately purge specific trashed assets ("Delete now" in Trash view, spec section 9).
 pub fn delete_trash_items_now(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     asset_ids: &[String],
     now: DateTime<Utc>,
 ) -> Result<PurgeReport> {
-    let mut candidates = Vec::new();
-    for id in asset_ids {
-        if let Some(detail) = store.get_asset(id)? {
-            if detail.trashed_at.is_some() {
-                candidates.push(PurgeCandidate {
-                    id: detail.record.id,
-                    key: detail.record.key,
-                    motion_key: detail.record.motion_key,
-                });
+    let candidates = store.with(|st| -> Result<Vec<PurgeCandidate>> {
+        let mut candidates = Vec::new();
+        for id in asset_ids {
+            if let Some(detail) = st.get_asset(id)? {
+                if detail.trashed_at.is_some() {
+                    candidates.push(PurgeCandidate {
+                        id: detail.record.id,
+                        key: detail.record.key,
+                        motion_key: detail.record.motion_key,
+                    });
+                }
             }
         }
-    }
+        Ok(candidates)
+    })?;
     purge_candidates(store, s4, &candidates, now)
 }
 
 /// Immediately purge all items currently in the Trash ("Empty Trash", spec section 9).
 pub fn empty_trash(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<PurgeReport> {
-    let items = store.list_trash(now)?;
+    let items = store.with(|st| st.list_trash(now))?;
     let ids: Vec<String> = items.into_iter().map(|i| i.asset.id).collect();
     delete_trash_items_now(store, s4, &ids, now)
 }
 
+/// Delete each candidate's objects from S4 with the store unlocked, then log
+/// the purges under one short lock.
 fn purge_candidates(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     candidates: &[PurgeCandidate],
     now: DateTime<Utc>,
@@ -177,7 +132,7 @@ fn purge_candidates(
         purged_ids.push(cand.id.clone());
     }
 
-    store.purge_assets(purged_ids.clone(), now)?;
+    store.with(|st| st.purge_assets(purged_ids.clone(), now))?;
 
     Ok(PurgeReport {
         purged_asset_ids: purged_ids,

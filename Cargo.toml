@@ -13,5 +13,7 @@ incremental = true
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# Unwind, not abort: decoders run on arbitrary user files, and a panic on one
+# corrupt photo must fail that photo, not close the app.
+panic = "unwind"
 strip = true

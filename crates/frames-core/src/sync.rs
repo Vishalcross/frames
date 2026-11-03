@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -31,7 +31,7 @@ use crate::s4::{
     S4Error, SpaceUsage,
 };
 use crate::store::{
-    ImportQueueRow, ImportState, Store, StoreError, DEFAULT_OUTBOX_MAX_ASSETS,
+    ImportQueueRow, ImportState, Store, StoreAccess, StoreError, DEFAULT_OUTBOX_MAX_ASSETS,
 };
 
 #[derive(Debug, Error)]
@@ -142,42 +142,59 @@ pub struct SyncReport {
     pub snapshot_written: Option<String>,
 }
 
+/// Thumbnail decodes an import may run at once, whatever its upload concurrency.
+static IMPORT_DECODE_SLOTS: crate::thumbnails::Slots = crate::thumbnails::Slots::new(2);
+
+/// One flush at a time: a batch's seq is read, uploaded and only then marked
+/// flushed, so two flushers must never hold the same seq at once.
+static FLUSH_LOCK: Mutex<()> = Mutex::new(());
+/// One pull at a time, so each device's batches are applied in seq order.
+static PULL_LOCK: Mutex<()> = Mutex::new(());
+
 /// Flush all pending local ops in `outbox` to `index/log/<device>/<seq:09>.json`
-/// in batches of at most `DEFAULT_OUTBOX_MAX_ASSETS` (~100 assets).
+/// in batches of at most `DEFAULT_OUTBOX_MAX_ASSETS` (~100 assets). The store
+/// is locked to read each batch and to mark it flushed, not during the upload.
 pub fn flush_outbox(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<usize> {
+    let _one_flusher = FLUSH_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let base_delay = s4.config().retry_base_delay_ms;
     let mut pushed = 0usize;
-    while let Some(pending) = store.peek_outbox_batch(DEFAULT_OUTBOX_MAX_ASSETS, now)? {
+    while let Some(pending) =
+        store.with(|st| st.peek_outbox_batch(DEFAULT_OUTBOX_MAX_ASSETS, now))?
+    {
         let key = log_key(&pending.batch.device, pending.batch.seq);
         let payload = serde_json::to_vec(&pending.batch)?;
         retry_with_backoff_cfg(5, base_delay, || {
             s4.put_object(&key, &payload, "application/json").map(|_| ())
         })?;
-        store.mark_outbox_flushed(&pending)?;
+        store.with(|st| st.mark_outbox_flushed(&pending))?;
         pushed += 1;
     }
     Ok(pushed)
 }
 
 /// Pull and apply any change-log batches in S4 (`index/log/<device>/<seq>.json`)
-/// with `seq > store.applied_seq(device)`, in `(device, seq)` order.
-pub fn pull_remote_logs(store: &mut Store, s4: &dyn ObjectStore) -> Result<usize> {
+/// with `seq > store.applied_seq(device)`, in `(device, seq)` order. Downloads
+/// happen with the store unlocked; each batch is applied under a short lock.
+pub fn pull_remote_logs(store: &mut impl StoreAccess, s4: &dyn ObjectStore) -> Result<usize> {
+    let _one_puller = PULL_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let base_delay = s4.config().retry_base_delay_ms;
     let objects = retry_with_backoff_cfg(5, base_delay, || s4.list_objects(LOG_PREFIX))?;
 
-    let mut to_fetch: Vec<(String, u64, String)> = Vec::new();
-    for obj in objects {
-        if let Some((dev, seq)) = parse_log_key(&obj.key) {
-            let applied = store.applied_seq(dev)?;
-            if seq > applied {
-                to_fetch.push((dev.to_string(), seq, obj.key));
+    let mut to_fetch = store.with(|st| -> Result<Vec<(String, u64, String)>> {
+        let mut out = Vec::new();
+        for obj in objects {
+            if let Some((dev, seq)) = parse_log_key(&obj.key) {
+                if seq > st.applied_seq(dev)? {
+                    out.push((dev.to_string(), seq, obj.key));
+                }
             }
         }
-    }
+        Ok(out)
+    })?;
     // Sort by device then seq ascending so each device's log is applied in seq order
     to_fetch.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
 
@@ -187,7 +204,7 @@ pub fn pull_remote_logs(store: &mut Store, s4: &dyn ObjectStore) -> Result<usize
             continue;
         };
         let batch: Batch = serde_json::from_slice(&bytes)?;
-        if store.apply_remote_batch(&batch)? {
+        if store.with(|st| st.apply_remote_batch(&batch))? {
             pulled += 1;
         }
     }
@@ -196,15 +213,20 @@ pub fn pull_remote_logs(store: &mut Store, s4: &dyn ObjectStore) -> Result<usize
 
 /// Write a full-state `.json.gz` snapshot to S4 if `store.needs_snapshot(now)` is true.
 pub fn write_snapshot_if_needed(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<Option<String>> {
-    if !store.needs_snapshot(now)? {
+    let snapshot = store.with(|st| -> Result<Option<(String, Vec<u8>)>> {
+        if !st.needs_snapshot(now)? {
+            return Ok(None);
+        }
+        Ok(Some(st.export_snapshot_gz(now)?))
+    })?;
+    let Some((key, gz_bytes)) = snapshot else {
         return Ok(None);
-    }
+    };
     let base_delay = s4.config().retry_base_delay_ms;
-    let (key, gz_bytes) = store.export_snapshot_gz(now)?;
     retry_with_backoff_cfg(5, base_delay, || {
         s4.put_object(&key, &gz_bytes, "application/gzip").map(|_| ())
     })?;
@@ -215,7 +237,7 @@ pub fn write_snapshot_if_needed(
 /// If S4 is unreachable (`S4Error::Offline`), returns `SyncReport { offline: true, .. }`
 /// while leaving local changes safely in `outbox` (spec section 11).
 pub fn sync_once(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
     now: DateTime<Utc>,
 ) -> Result<SyncReport> {
@@ -254,15 +276,15 @@ pub fn sync_once(
 /// Rebuild the local database from the newest S4 snapshot plus subsequent change
 /// logs (spec section 6 & section 11: "Rebuild deletes it and reloads from the
 /// snapshot plus logs").
-pub fn rebuild_from_s4(store: &mut Store, s4: &dyn ObjectStore) -> Result<SyncReport> {
-    store.reset_for_rebuild()?;
+pub fn rebuild_from_s4(store: &mut impl StoreAccess, s4: &dyn ObjectStore) -> Result<SyncReport> {
+    store.with(|st| st.reset_for_rebuild())?;
 
     let base_delay = s4.config().retry_base_delay_ms;
     let snap_objs = retry_with_backoff_cfg(5, base_delay, || s4.list_objects(SNAPSHOT_PREFIX))?;
     let snap_keys: Vec<&str> = snap_objs.iter().map(|o| o.key.as_str()).collect();
     if let Some(latest_key) = newest_snapshot(snap_keys) {
         if let Some(gz_bytes) = retry_with_backoff_cfg(5, base_delay, || s4.get_object(latest_key))? {
-            store.import_snapshot_gz(&gz_bytes)?;
+            store.with(|st| st.import_snapshot_gz(&gz_bytes))?;
         }
     }
 
@@ -294,7 +316,10 @@ pub struct LibraryCheckReport {
 /// multipart uploads (spec section 11: "Check library compares the S4 listing
 /// with the index: lists missing originals, offers to add unknown files, tidies
 /// uploads left over from a crash").
-pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheckReport> {
+pub fn check_library(
+    store: &mut impl StoreAccess,
+    s4: &dyn ObjectStore,
+) -> Result<LibraryCheckReport> {
     let all_objects = s4.list_objects("")?;
     let total_used: u64 = all_objects.iter().map(|o| o.size).sum();
     let space_usage = Some(SpaceUsage::compute(
@@ -308,34 +333,46 @@ pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheck
         .map(|o| o.key)
         .collect();
 
-    let mut indexed_keys: HashSet<String> = HashSet::new();
-    let mut missing_originals: Vec<String> = Vec::new();
+    let (missing_originals, indexed_keys, active_upload_ids) = store.with(
+        |st| -> Result<(Vec<String>, HashSet<String>, HashSet<String>)> {
+            let mut indexed_keys: HashSet<String> = HashSet::new();
+            let mut missing_originals: Vec<String> = Vec::new();
 
-    let mut stmt = store.connection().prepare(
-        "SELECT id, key, motion_key FROM assets WHERE purged_at IS NULL ORDER BY id ASC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Option<String>>(2)?,
-        ))
-    })?;
+            let mut stmt = st.connection().prepare(
+                "SELECT id, key, motion_key FROM assets WHERE purged_at IS NULL ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
 
-    for row in rows {
-        let (id, key, motion_key) = row?;
-        let mut missing = !s4_original_keys.contains(&key);
-        indexed_keys.insert(key);
-        if let Some(m_key) = motion_key {
-            if !s4_original_keys.contains(&m_key) {
-                missing = true;
+            for row in rows {
+                let (id, key, motion_key) = row?;
+                let mut missing = !s4_original_keys.contains(&key);
+                indexed_keys.insert(key);
+                if let Some(m_key) = motion_key {
+                    if !s4_original_keys.contains(&m_key) {
+                        missing = true;
+                    }
+                    indexed_keys.insert(m_key);
+                }
+                if missing {
+                    missing_originals.push(id);
+                }
             }
-            indexed_keys.insert(m_key);
-        }
-        if missing {
-            missing_originals.push(id);
-        }
-    }
+
+            // Incomplete multipart uploads still tracked in import_queue are live.
+            let active_upload_ids: HashSet<String> = st
+                .list_import_queue()?
+                .into_iter()
+                .filter_map(|r| r.upload_id)
+                .collect();
+            Ok((missing_originals, indexed_keys, active_upload_ids))
+        },
+    )?;
 
     let mut unknown_s4_keys: Vec<String> = s4_original_keys
         .into_iter()
@@ -344,12 +381,6 @@ pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheck
     unknown_s4_keys.sort();
 
     // Tidy incomplete multipart uploads not actively tracked in import_queue
-    let active_upload_ids: HashSet<String> = store
-        .list_import_queue()?
-        .into_iter()
-        .filter_map(|r| r.upload_id)
-        .collect();
-
     let incomplete = s4.list_multipart_uploads()?;
     let mut tidied = 0usize;
     for up in incomplete {
@@ -371,9 +402,9 @@ pub fn check_library(store: &Store, s4: &dyn ObjectStore) -> Result<LibraryCheck
 /// library by streaming each object to a temporary file, hashing it, extracting
 /// metadata and thumbnails, uploading thumbnails, and logging `asset.add` (spec §11).
 pub fn import_unknown_s4_keys(
-    store: &mut Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
-    cache: &mut LocalCache,
+    cache: &Mutex<LocalCache>,
     keys: &[String],
     now: DateTime<Utc>,
 ) -> Result<usize> {
@@ -395,7 +426,7 @@ pub fn import_unknown_s4_keys(
             continue;
         }
         let hash = sha256_file(&tmp_file)?;
-        if store.has_active_or_trashed_asset(&hash)? {
+        if store.with(|st| st.has_active_or_trashed_asset(&hash))? {
             let _ = fs::remove_file(&tmp_file);
             continue;
         }
@@ -407,8 +438,10 @@ pub fn import_unknown_s4_keys(
             AssetKind::Photo
         };
         let thumbs = generate_thumbnails(&tmp_file, kind, &meta);
-        let _ = cache.put_small_thumb(&hash, &thumbs.small_webp);
-        let _ = cache.put_preview(&hash, &thumbs.preview_webp);
+        if let Ok(mut c) = cache.lock() {
+            let _ = c.put_small_thumb(&hash, &thumbs.small_webp);
+            let _ = c.put_preview(&hash, &thumbs.preview_webp);
+        }
 
         let s_key = thumb_small_key(&hash);
         let m_key = thumb_preview_key(&hash);
@@ -453,7 +486,7 @@ pub fn import_unknown_s4_keys(
             motion_size: None,
             thumb_failed: thumbs.thumb_failed,
         };
-        store.add_asset(record, None, now)?;
+        store.with(|st| st.add_asset(record, None, now))?;
         let _ = fs::remove_file(&tmp_file);
         added += 1;
     }
@@ -563,19 +596,8 @@ fn prepare_folder_assets(
             item.existing_upload_id = existing_uid.clone();
             item.parts_already_done = *parts_done;
         }
-        // If this paired Live Photo absorbed a companion MOV file, mark the companion MOV row as Skipped
-        // in import_queue so it doesn't linger as 'scanned'.
-        if let Some(ref mov_path) = item.motion_path {
-            let mov_str = mov_path.to_string_lossy().to_string();
-            let _ = store.update_import_state(
-                &mov_str,
-                ImportState::Skipped,
-                item.record.motion_id.as_deref(),
-                None,
-                0,
-                None,
-            );
-        }
+        // The companion MOV travels with its photo and is logged with it.
+        set_motion_import_state(store, &item, ImportState::Hashed);
         let path_str = item.primary_path.to_string_lossy().to_string();
         let state = if item.existing_upload_id.is_some() {
             ImportState::Uploading
@@ -584,7 +606,7 @@ fn prepare_folder_assets(
         };
         store.enqueue_import(&ImportQueueRow {
             path: path_str,
-            size: item.record.size + item.record.motion_size.unwrap_or(0),
+            size: item.record.size,
             mtime: item.primary_mtime_ms,
             state,
             asset_id: Some(item.record.id.clone()),
@@ -785,7 +807,7 @@ where
             let out_ref = &outcomes;
             let store_ref = Arc::clone(store);
             let snap_ref = &report_snapshot;
-            s.spawn(move || loop {
+            s.spawn(move || crate::qos::run_as(crate::qos::WorkClass::Utility, move || loop {
                 if control.is_cancelled() {
                     break;
                 }
@@ -860,7 +882,7 @@ where
                     sha256: hash,
                     metadata,
                 }));
-            });
+            }));
         }
     });
 
@@ -917,20 +939,11 @@ where
             } else {
                 ImportState::Hashed
             };
-            if let Some(ref mov_path) = item.motion_path {
-                let mov_str = mov_path.to_string_lossy().to_string();
-                let _ = st.update_import_state(
-                    &mov_str,
-                    ImportState::Skipped,
-                    item.record.motion_id.as_deref(),
-                    None,
-                    0,
-                    None,
-                );
-            }
+            // The companion MOV travels with its photo and is logged with it.
+            set_motion_import_state(&mut st, &item, ImportState::Hashed);
             st.enqueue_import(&ImportQueueRow {
                 path: path_str,
-                size: item.record.size + item.record.motion_size.unwrap_or(0),
+                size: item.record.size,
                 mtime: item.primary_mtime_ms,
                 state,
                 asset_id: Some(item.record.id.clone()),
@@ -1072,7 +1085,7 @@ where
                     let alb = album_id.map(str::to_string);
                     let progress_cb = &on_progress;
 
-                    handles.push(s.spawn(move || loop {
+                    handles.push(s.spawn(move || crate::qos::run_as(crate::qos::WorkClass::Utility, move || loop {
                         if control_ref.is_cancelled() || stop_ref.load(Ordering::SeqCst) {
                             break;
                         }
@@ -1160,7 +1173,7 @@ where
                                 }
                             }
                         }
-                    }));
+                    })));
                 }
                 for h in handles {
                     let _ = h.join();
@@ -1170,9 +1183,7 @@ where
             report = shared_report.into_inner().unwrap();
 
             if !report.paused_offline && !control.is_cancelled() {
-                if let Ok(mut st) = store.lock() {
-                    let _ = flush_outbox(&mut st, s4.as_ref(), now);
-                }
+                let _ = flush_outbox(&mut &*store, s4.as_ref(), now);
             }
             if stop_folder_loop.load(Ordering::SeqCst) || control.is_cancelled() {
                 break 'folders;
@@ -1181,12 +1192,134 @@ where
     }
 
     if !report.paused_offline && !control.is_cancelled() {
+        let _ = flush_outbox(&mut &*store, s4.as_ref(), now);
+    }
+    if control.is_cancelled() {
         if let Ok(mut st) = store.lock() {
-            let _ = flush_outbox(&mut st, s4.as_ref(), now);
+            let _ = st.cancel_unfinished_imports();
         }
     }
     on_progress(&report);
     Ok(report)
+}
+
+/// Largest untagged object compared byte for byte; bigger ones count as a
+/// clash rather than download the whole file to check.
+const UNTAGGED_VERIFY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What is already at `key`: nothing (`None`), this very file (`Some(true)`)
+/// or a different file (`Some(false)`). Uploads carry their SHA-256 as a tag;
+/// objects written before tags existed, or by another S3 tool, are compared
+/// by size and then by content.
+fn object_at_key(s4: &dyn ObjectStore, key: &str, local: &Path, sha256: &str) -> Result<Option<bool>> {
+    let Some(meta) = s4.head_object(key)? else {
+        return Ok(None);
+    };
+    if let Some(tag) = meta.content_sha256 {
+        return Ok(Some(tag == sha256));
+    }
+    let local_size = std::fs::metadata(local)?.len();
+    if meta.size != local_size || local_size > UNTAGGED_VERIFY_MAX_BYTES {
+        return Ok(Some(false));
+    }
+    Ok(s4
+        .get_object(key)?
+        .map(|bytes| crate::media::sha256_bytes(&bytes) == sha256))
+}
+
+/// Settle where this asset's files go and which still need uploading (spec
+/// section 4 name clash). An object at the planned key may be this very file,
+/// left by an interrupted run; otherwise it is another file with the same name
+/// and this one moves to `<name>-<hash8>.<ext>`. Returns
+/// `(upload_primary, upload_motion)`.
+fn plan_original_uploads(item: &mut PreparedImportAsset, s4: &dyn ObjectStore) -> Result<(bool, bool)> {
+    let check = |item: &PreparedImportAsset| -> Result<(Option<bool>, Option<bool>)> {
+        let primary = object_at_key(s4, &item.record.key, &item.primary_path, &item.record.id)?;
+        let motion = match (&item.record.motion_key, &item.motion_path, &item.record.motion_id) {
+            (Some(key), Some(path), Some(sha)) => object_at_key(s4, key, path, sha)?,
+            _ => None,
+        };
+        Ok((primary, motion))
+    };
+
+    let (mut primary, mut motion) = check(item)?;
+    let primary_clash = primary == Some(false);
+    let motion_clash = motion == Some(false);
+    if primary_clash || motion_clash {
+        item.apply_name_clash(primary_clash, motion_clash);
+        // The renamed keys may hold this file from an interrupted run too.
+        (primary, motion) = check(item)?;
+    }
+    Ok((
+        primary != Some(true),
+        item.record.motion_key.is_some() && motion != Some(true),
+    ))
+}
+
+/// Mark a Live Photo's MOV with the same import state as its photo, so an
+/// interrupted pair resumes as a pair.
+fn set_motion_import_state(store: &mut Store, item: &PreparedImportAsset, state: ImportState) {
+    if let Some(ref mov_path) = item.motion_path {
+        let _ = store.update_import_state(
+            &mov_path.to_string_lossy(),
+            state,
+            item.record.motion_id.as_deref(),
+            None,
+            0,
+            None,
+        );
+    }
+}
+
+/// Files an earlier import left unfinished, grouped by the album they were
+/// going into. Files that are no longer on disk (an unplugged drive) stay
+/// queued for the next time they appear.
+pub fn unfinished_imports(store: &Store) -> Result<Vec<(Option<String>, Vec<PathBuf>)>> {
+    let mut groups: BTreeMap<Option<String>, Vec<PathBuf>> = BTreeMap::new();
+    for (path, album_id) in store.unfinished_import_rows()? {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            groups.entry(album_id).or_default().push(path);
+        }
+    }
+    Ok(groups.into_iter().collect())
+}
+
+/// Resume every unfinished import (spec section 7: "Unplugging the disk,
+/// losing the network or quitting pauses it; the next run resumes").
+/// Returns the report of the last run, or `None` if there was nothing to do.
+#[allow(clippy::too_many_arguments)]
+pub fn resume_unfinished_imports<F>(
+    store: Arc<Mutex<Store>>,
+    s4: Arc<dyn ObjectStore>,
+    cache: Arc<Mutex<LocalCache>>,
+    control: Arc<ImportControl>,
+    now: DateTime<Utc>,
+    on_progress: F,
+) -> Result<Option<ImportRunReport>>
+where
+    F: Fn(&ImportRunReport) + Send + Sync,
+{
+    let groups = unfinished_imports(&store.lock().unwrap())?;
+    let mut last = None;
+    for (album_id, paths) in groups {
+        let rep = run_import_concurrent(
+            paths,
+            album_id.as_deref(),
+            Arc::clone(&store),
+            Arc::clone(&s4),
+            Arc::clone(&cache),
+            Arc::clone(&control),
+            now,
+            &on_progress,
+        )?;
+        let stop = rep.paused_offline || rep.stopped_space_full || control.is_cancelled();
+        last = Some(rep);
+        if stop {
+            break;
+        }
+    }
+    Ok(last)
 }
 
 fn upload_and_log_one_asset(
@@ -1201,15 +1334,15 @@ fn upload_and_log_one_asset(
     let base_delay = s4.config().retry_base_delay_ms;
 
     // Step 4b: Name clash check via S4 HEAD (spec section 4)
-    let primary_clashed = s4.head_object(&item.record.key)?.is_some();
-    let motion_clashed = match item.record.motion_key.as_deref() {
-        Some(mk) => s4.head_object(mk)?.is_some(),
-        None => false,
-    };
-    item.apply_name_clash(primary_clashed, motion_clashed);
+    let (upload_primary, upload_motion) = plan_original_uploads(item, s4)?;
 
     // Step 5: Generate thumbnails & store locally
-    let thumbs = item.build_thumbnails();
+    // Decoding is CPU-heavy (HEIC and RAW go through the system decoder),
+    // so an import makes at most two thumbnails at a time.
+    let thumbs = {
+        let _slot = IMPORT_DECODE_SLOTS.acquire();
+        item.build_thumbnails()
+    };
     let _ = cache.put_small_thumb(&item.record.id, &thumbs.small_webp);
     let _ = cache.put_preview(&item.record.id, &thumbs.preview_webp);
 
@@ -1225,33 +1358,39 @@ fn upload_and_log_one_asset(
         None,
     )?;
 
-    upload_file_with_resume(
-        s4,
-        &item.primary_path,
-        &item.record.key,
-        "application/octet-stream",
-        initial_uid.as_deref(),
-        initial_parts,
-        5,
-        |uid, parts_done| {
-            let _ = store.update_import_state(
-                &path_str,
-                ImportState::Uploading,
-                Some(&item.record.id),
-                uid,
-                parts_done,
-                None,
-            );
-        },
-    )?;
+    if upload_primary {
+        upload_file_with_resume(
+            s4,
+            &item.primary_path,
+            &item.record.key,
+            "application/octet-stream",
+            Some(&item.record.id),
+            initial_uid.as_deref(),
+            initial_parts,
+            5,
+            |uid, parts_done| {
+                let _ = store.update_import_state(
+                    &path_str,
+                    ImportState::Uploading,
+                    Some(&item.record.id),
+                    uid,
+                    parts_done,
+                    None,
+                );
+            },
+        )?;
+    }
 
     // Upload Live Photo motion file if present
-    if let (Some(ref mov_path), Some(ref mov_key)) = (&item.motion_path, &item.record.motion_key) {
+    if let (true, Some(mov_path), Some(mov_key)) =
+        (upload_motion, &item.motion_path, &item.record.motion_key)
+    {
         upload_file_with_resume(
             s4,
             mov_path,
             mov_key,
             "video/quicktime",
+            item.record.motion_id.as_deref(),
             None,
             0,
             5,
@@ -1290,25 +1429,13 @@ fn upload_and_log_one_asset(
         1,
         None,
     )?;
+    set_motion_import_state(store, item, ImportState::Logged);
 
-    // Link local_path and album info so local rendering never hits web
+    // Remember where the original lives so thumbnails and viewing stay local
     let _ = store.connection().execute(
-        "UPDATE assets SET
-            local_path = ?1,
-            album_id = coalesce(album_id, ?2),
-            relative_path = coalesce(relative_path, ?3),
-            thumb_state = 'ready'
-         WHERE id = ?4",
-        rusqlite::params![path_str, album_id, item.record.filename, item.record.id],
+        "UPDATE assets SET local_path = ?1 WHERE id = ?2",
+        rusqlite::params![path_str, item.record.id],
     );
-
-    let small_path = crate::thumbs::thumb_path(&item.record.id, crate::thumbs::ThumbSize::Small);
-    if let Some(p) = small_path.parent() { let _ = std::fs::create_dir_all(p); }
-    let _ = std::fs::write(&small_path, &thumbs.small_webp);
-
-    let large_path = crate::thumbs::thumb_path(&item.record.id, crate::thumbs::ThumbSize::Large);
-    if let Some(p) = large_path.parent() { let _ = std::fs::create_dir_all(p); }
-    let _ = std::fs::write(&large_path, &thumbs.preview_webp);
 
     Ok(())
 }
@@ -1342,15 +1469,15 @@ where
     }
 
     // Step 4b: Name clash check via S4 HEAD (no lock held!)
-    let primary_clashed = s4.head_object(&item.record.key)?.is_some();
-    let motion_clashed = match item.record.motion_key.as_deref() {
-        Some(mk) => s4.head_object(mk)?.is_some(),
-        None => false,
-    };
-    item.apply_name_clash(primary_clashed, motion_clashed);
+    let (upload_primary, upload_motion) = plan_original_uploads(item, s4)?;
 
     // Step 5: Generate thumbnails outside the DB lock
-    let thumbs = item.build_thumbnails();
+    // Decoding is CPU-heavy (HEIC and RAW go through the system decoder),
+    // so an import makes at most two thumbnails at a time.
+    let thumbs = {
+        let _slot = IMPORT_DECODE_SLOTS.acquire();
+        item.build_thumbnails()
+    };
     if let Ok(mut c) = cache.lock() {
         let _ = c.put_small_thumb(&item.record.id, &thumbs.small_webp);
         let _ = c.put_preview(&item.record.id, &thumbs.preview_webp);
@@ -1371,36 +1498,42 @@ where
     on_state_change();
 
     // Step 6: Upload original without holding the DB lock across network I/O
-    upload_file_with_resume_cancel(
-        s4,
-        &item.primary_path,
-        &item.record.key,
-        "application/octet-stream",
-        initial_uid.as_deref(),
-        initial_parts,
-        5,
-        |uid, parts_done| {
-            if let Ok(mut st) = store.lock() {
-                let _ = st.update_import_state(
-                    &path_str,
-                    ImportState::Uploading,
-                    Some(&item.record.id),
-                    uid,
-                    parts_done,
-                    None,
-                );
-            }
-            on_state_change();
-        },
-        should_cancel,
-    )?;
+    if upload_primary {
+        upload_file_with_resume_cancel(
+            s4,
+            &item.primary_path,
+            &item.record.key,
+            "application/octet-stream",
+            Some(&item.record.id),
+            initial_uid.as_deref(),
+            initial_parts,
+            5,
+            |uid, parts_done| {
+                if let Ok(mut st) = store.lock() {
+                    let _ = st.update_import_state(
+                        &path_str,
+                        ImportState::Uploading,
+                        Some(&item.record.id),
+                        uid,
+                        parts_done,
+                        None,
+                    );
+                }
+                on_state_change();
+            },
+            should_cancel,
+        )?;
+    }
 
-    if let (Some(ref mov_path), Some(ref mov_key)) = (&item.motion_path, &item.record.motion_key) {
+    if let (true, Some(mov_path), Some(mov_key)) =
+        (upload_motion, &item.motion_path, &item.record.motion_key)
+    {
         upload_file_with_resume_cancel(
             s4,
             mov_path,
             mov_key,
             "video/quicktime",
+            item.record.motion_id.as_deref(),
             None,
             0,
             5,
@@ -1445,26 +1578,14 @@ where
             1,
             None,
         )?;
+        set_motion_import_state(&mut st, item, ImportState::Logged);
 
-        // Link local_path and album info so local rendering never hits web
+        // Remember where the original lives so thumbnails and viewing stay local
         let _ = st.connection().execute(
-            "UPDATE assets SET
-                local_path = ?1,
-                album_id = coalesce(album_id, ?2),
-                relative_path = coalesce(relative_path, ?3),
-                thumb_state = 'ready'
-             WHERE id = ?4",
-            rusqlite::params![path_str, album_id, item.record.filename, item.record.id],
+            "UPDATE assets SET local_path = ?1 WHERE id = ?2",
+            rusqlite::params![path_str, item.record.id],
         );
     }
-
-    let small_path = crate::thumbs::thumb_path(&item.record.id, crate::thumbs::ThumbSize::Small);
-    if let Some(p) = small_path.parent() { let _ = std::fs::create_dir_all(p); }
-    let _ = std::fs::write(&small_path, &thumbs.small_webp);
-
-    let large_path = crate::thumbs::thumb_path(&item.record.id, crate::thumbs::ThumbSize::Large);
-    if let Some(p) = large_path.parent() { let _ = std::fs::create_dir_all(p); }
-    let _ = std::fs::write(&large_path, &thumbs.preview_webp);
 
     Ok(())
 }
@@ -1473,6 +1594,32 @@ where
 // Export Originals to a Local Folder (Spec Section 2, 8, 9)
 // =============================================================================
 
+/// The LRU-cached copy of an original, downloaded first if needed. The cache
+/// is locked only to look the file up and to register it, never during the
+/// download, so thumbnails keep loading while a large export runs.
+fn cached_original(
+    cache: &Mutex<LocalCache>,
+    s4: &dyn ObjectStore,
+    id: &str,
+    filename: &str,
+    key: &str,
+) -> Result<Option<PathBuf>> {
+    let target = {
+        let mut c = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(path) = c.get_original_path(id, filename) {
+            return Ok(Some(path));
+        }
+        c.original_disk_path(id, filename)
+    };
+    if !s4.get_object_to_file(key, &target)? {
+        return Ok(None);
+    }
+    Ok(cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .register_downloaded_original(id, filename)?)
+}
+
 /// Export the original files (and Live Photo motion `.MOV` files) for `asset_ids`
 /// into `destination_dir`, reading from `cache` when available or downloading from S4.
 /// Disambiguates colliding filenames with `-<hash8>` (spec section 4) so no exported
@@ -1480,9 +1627,9 @@ where
 pub fn export_originals(
     asset_ids: &[String],
     destination_dir: impl AsRef<Path>,
-    store: &Store,
+    store: &mut impl StoreAccess,
     s4: &dyn ObjectStore,
-    cache: &mut LocalCache,
+    cache: &Mutex<LocalCache>,
 ) -> Result<Vec<PathBuf>> {
     let dest = destination_dir.as_ref();
     fs::create_dir_all(dest)?;
@@ -1490,13 +1637,11 @@ pub fn export_originals(
     let mut used_names: HashSet<String> = HashSet::new();
 
     for id in asset_ids {
-        let Some(detail) = store.get_asset(id)? else {
+        let Some(detail) = store.with(|st| st.get_asset(id))? else {
             continue;
         };
         let rec = &detail.record;
-        if let Some(cached_path) =
-            cache.get_or_fetch_original(s4, &rec.id, &rec.filename, &rec.key)?
-        {
+        if let Some(cached_path) = cached_original(cache, s4, &rec.id, &rec.filename, &rec.key)? {
             let chosen_name = if used_names.contains(&rec.filename)
                 || dest.join(&rec.filename).exists()
             {
@@ -1515,9 +1660,7 @@ pub fn export_originals(
                 .next()
                 .unwrap_or("motion.MOV")
                 .to_string();
-            if let Some(cached_mov) =
-                cache.get_or_fetch_original(s4, m_id, &mov_name, m_key)?
-            {
+            if let Some(cached_mov) = cached_original(cache, s4, m_id, &mov_name, m_key)? {
                 let chosen_mov = if used_names.contains(&mov_name)
                     || dest.join(&mov_name).exists()
                 {
@@ -1535,173 +1678,11 @@ pub fn export_originals(
     Ok(exported)
 }
 
-/// Syncs remote album listings from S4 into the local database (Task 1.2-m).
-///
-/// 1. Lists objects for every album under "albums/" (and discovers any remote-only albums).
-/// 2. Upserts by `(album_id, relative_path)`: sets `remote_key`. Never duplicates a row created by local scan.
-/// 3. Emits `on_album_synced(album_id)` as each album finishes.
-pub fn sync_remote_album_listings<F>(
-    store: &Store,
-    s4: &dyn ObjectStore,
-    on_album_synced: F,
-) -> Result<usize>
-where
-    F: FnMut(&str),
-{
-    let objects = match s4.list_objects("albums/") {
-        Ok(objs) => objs,
-        Err(e) => return Err(SyncError::S4(e)),
-    };
-    apply_remote_album_objects(store, objects, on_album_synced)
-}
-
-pub fn apply_remote_album_objects<F>(
-    store: &Store,
-    objects: Vec<crate::s4::ObjectMeta>,
-    mut on_album_synced: F,
-) -> Result<usize>
-where
-    F: FnMut(&str),
-{
-    let device_id = store.device_id().unwrap_or_else(|_| "remote".to_string());
-    let now = Utc::now();
-    let now_str = crate::store::format_utc(now);
-    let stamp = format!("{now_str}|{device_id}");
-
-    let conn = store.connection();
-    let mut album_name_to_id: HashMap<String, String> = HashMap::new();
-    let mut album_id_set: HashSet<String> = HashSet::new();
-
-    {
-        let mut stmt = conn.prepare("SELECT id, name FROM albums WHERE deleted_at IS NULL")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (id, name) = row?;
-            album_name_to_id.insert(name.to_lowercase(), id.clone());
-            album_name_to_id.insert(id.clone(), id.clone());
-            album_id_set.insert(id);
-        }
-    }
-
-    let mut album_objects: HashMap<String, Vec<crate::s4::ObjectMeta>> = HashMap::new();
-
-    for obj in objects {
-        let trimmed = obj.key.trim_start_matches('/');
-        if let Some(rest) = trimmed.strip_prefix("albums/") {
-            if let Some((album_folder, relpath)) = rest.split_once('/') {
-                if !album_folder.is_empty() && !relpath.is_empty() {
-                    album_objects
-                        .entry(album_folder.to_string())
-                        .or_default()
-                        .push(obj);
-                }
-            }
-        }
-    }
-
-    let mut total_upserted = 0usize;
-    let mut synced_album_ids: HashSet<String> = HashSet::new();
-
-    for (folder, objs) in album_objects {
-        let album_id = if let Some(existing_id) = album_name_to_id.get(&folder.to_lowercase()) {
-            existing_id.clone()
-        } else {
-            let new_album_id = if uuid::Uuid::parse_str(&folder).is_ok() {
-                folder.clone()
-            } else {
-                uuid::Uuid::new_v4().to_string()
-            };
-            conn.execute(
-                "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![new_album_id, folder, stamp, now_str],
-            )?;
-            album_name_to_id.insert(folder.to_lowercase(), new_album_id.clone());
-            album_name_to_id.insert(new_album_id.clone(), new_album_id.clone());
-            album_id_set.insert(new_album_id.clone());
-            new_album_id
-        };
-
-        for obj in objs {
-            let key_trimmed = obj.key.trim_start_matches('/');
-            let prefix = format!("albums/{folder}/");
-            let rel = key_trimmed.strip_prefix(&prefix).unwrap_or(key_trimmed);
-            let normalized_rel = crate::scan_local::normalize_relpath(rel);
-
-            if crate::scan_local::is_hidden_or_system_file(&normalized_rel) {
-                continue;
-            }
-
-            let filename = normalized_rel
-                .rsplit('/')
-                .next()
-                .unwrap_or(&normalized_rel)
-                .to_string();
-
-            let ext = Path::new(&filename)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            let kind = crate::scan_local::classify_kind(ext);
-
-            let new_id = uuid::Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO assets (
-                    id, kind, key, filename, size, taken_at, date_at, state_at,
-                    album_id, relative_path, remote_key, thumb_state
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7,
-                    ?8, ?9, ?3, 'none'
-                )
-                ON CONFLICT(album_id, relative_path) DO UPDATE SET
-                    remote_key = excluded.remote_key,
-                    key = CASE WHEN assets.key = '' THEN excluded.key ELSE assets.key END,
-                    size = CASE WHEN assets.size = 0 THEN excluded.size ELSE assets.size END",
-                rusqlite::params![
-                    new_id,
-                    kind,
-                    obj.key,
-                    filename,
-                    obj.size as i64,
-                    now_str,
-                    stamp,
-                    album_id,
-                    normalized_rel,
-                ],
-            )?;
-
-            let asset_id: String = conn.query_row(
-                "SELECT id FROM assets WHERE album_id = ?1 AND relative_path = ?2",
-                rusqlite::params![album_id, normalized_rel],
-                |r| r.get(0),
-            )?;
-
-            conn.execute(
-                "INSERT INTO album_items (album_id, asset_id, in_album, at)
-                 VALUES (?1, ?2, 1, ?3)
-                 ON CONFLICT(album_id, asset_id) DO UPDATE SET in_album = 1, at = excluded.at",
-                rusqlite::params![album_id, asset_id, stamp],
-            )?;
-
-            total_upserted += 1;
-        }
-
-        synced_album_ids.insert(album_id.clone());
-        on_album_synced(&album_id);
-    }
-
-    for id in album_id_set {
-        if !synced_album_ids.contains(&id) {
-            on_album_synced(&id);
-        }
-    }
-
-    Ok(total_upserted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::DEFAULT_CACHE_LIMIT_BYTES;
+    use crate::keys::original_key;
     use crate::media::sha256_bytes;
     use crate::ops::AssetKind;
     use crate::s4::{InMemoryObjectStore, S4Config};
@@ -1766,7 +1747,7 @@ mod tests {
 
         // Windows PC syncs from the same S4 bucket
         let mut win_store = Store::open_in_memory("win-1").unwrap();
-        let mut win_cache = LocalCache::open(&cache_dir_win.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+        let win_cache = LocalCache::open(&cache_dir_win.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
         let sync_rep = sync_once(&mut win_store, &s4, t(20)).unwrap();
         assert!(!sync_rep.offline);
         assert_eq!(sync_rep.batches_pulled, 1);
@@ -1778,7 +1759,8 @@ mod tests {
         // Windows downloads missing small thumbs in background & exports original + MOV
         let ids = vec![win_timeline[0].id.clone()];
         assert_eq!(win_cache.download_missing_small_thumbs(&s4, &ids).unwrap(), 1);
-        let exported = export_originals(&ids, &export_dir.0, &win_store, &s4, &mut win_cache).unwrap();
+        let win_cache = Mutex::new(win_cache);
+        let exported = export_originals(&ids, &export_dir.0, &mut win_store, &s4, &win_cache).unwrap();
         assert_eq!(exported.len(), 2);
 
         // Mac writes a snapshot; a brand-new rebuild loads snapshot + logs cleanly
@@ -1789,7 +1771,7 @@ mod tests {
         assert_eq!(win_store.list_timeline(None, None).unwrap().len(), 1);
 
         // Check library confirms 0 missing originals and 0 unknown S4 keys
-        let check = check_library(&win_store, &s4).unwrap();
+        let check = check_library(&mut win_store, &s4).unwrap();
         assert!(check.missing_originals.is_empty());
         assert!(check.unknown_s4_keys.is_empty());
     }
@@ -1841,7 +1823,7 @@ mod tests {
         assert_eq!(timeline.len(), 2);
         let ids: Vec<String> = timeline.into_iter().map(|a| a.id).collect();
 
-        let exported = export_originals(&ids, &export_dir.0, &store, &s4, &mut cache).unwrap();
+        let exported = export_originals(&ids, &export_dir.0, &mut store, &s4, &Mutex::new(cache)).unwrap();
         assert_eq!(exported.len(), 2);
         assert_ne!(exported[0], exported[1]);
         assert!(exported[0].exists());
@@ -1855,20 +1837,21 @@ mod tests {
     fn import_unknown_s4_keys_adds_unindexed_objects_to_library() {
         let cache_dir = TempDir::new();
         let s4 = InMemoryObjectStore::new(S4Config::default());
-        let mut store = Store::open_in_memory("mac-1").unwrap();
-        let mut cache = LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+        // The app's shared form: the store is locked only between S4 calls.
+        let store = Mutex::new(Store::open_in_memory("mac-1").unwrap());
+        let cache = Mutex::new(LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap());
 
         let key = "originals/2024/05/IMG_20240512_143022.JPG";
         let bytes = b"unindexed-s4-photo-bytes";
         s4.put_object(key, bytes, "image/jpeg").unwrap();
 
-        let check = check_library(&store, &s4).unwrap();
+        let check = check_library(&mut &store, &s4).unwrap();
         assert_eq!(check.unknown_s4_keys, vec![key.to_string()]);
 
         let added = import_unknown_s4_keys(
-            &mut store,
+            &mut &store,
             &s4,
-            &mut cache,
+            &cache,
             &check.unknown_s4_keys,
             t(50),
         )
@@ -1876,9 +1859,9 @@ mod tests {
         assert_eq!(added, 1);
 
         let expected_id = sha256_bytes(bytes);
-        assert!(store.has_active_or_trashed_asset(&expected_id).unwrap());
+        assert!(store.lock().unwrap().has_active_or_trashed_asset(&expected_id).unwrap());
 
-        let check_after = check_library(&store, &s4).unwrap();
+        let check_after = check_library(&mut &store, &s4).unwrap();
         assert!(check_after.unknown_s4_keys.is_empty());
     }
 
@@ -1959,86 +1942,291 @@ mod tests {
     }
 
     #[test]
-    fn sync_remote_album_listings_creates_remote_album_and_deduplicates_local() {
-        let store = Store::open_in_memory("mac-1").unwrap();
+    fn resume_continues_an_interrupted_import_without_duplicate_uploads() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        let names = [
+            "IMG_20240512_100000.JPG",
+            "IMG_20240512_100001.JPG",
+            "IMG_20240512_100002.JPG",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            fs::write(src_dir.0.join(name), format!("photo-{i}").as_bytes()).unwrap();
+        }
+
+        let mem = InMemoryObjectStore::new(S4Config::default());
+        let s4: Arc<dyn ObjectStore> = Arc::new(mem.clone());
+        let store = Arc::new(Mutex::new(Store::open_in_memory("mac-1").unwrap()));
+        let cache = Arc::new(Mutex::new(
+            LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap(),
+        ));
+        let control = Arc::new(ImportControl::new());
+        let run = |roots: Vec<PathBuf>| {
+            run_import_concurrent(
+                roots,
+                None,
+                Arc::clone(&store),
+                Arc::clone(&s4),
+                Arc::clone(&cache),
+                Arc::clone(&control),
+                t(10),
+                |_| {},
+            )
+            .unwrap()
+        };
+
+        // The network drops: everything is hashed, nothing is logged.
+        mem.set_offline(true);
+        assert!(run(vec![src_dir.0.clone()]).paused_offline);
+        let pending = unfinished_imports(&store.lock().unwrap()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.len(), 3);
+        mem.set_offline(false);
+
+        // Photo 0 had finished uploading just before the drop (tagged as itself);
+        // photo 1's name is taken by a different file.
+        let key0 = original_key(2024, 5, names[0]);
+        let photo0 = src_dir.0.join(names[0]);
+        mem.put_object_from_file(&key0, &photo0, "image/jpeg", Some(&sha256_file(&photo0).unwrap()))
+            .unwrap();
+        mem.put_object(&original_key(2024, 5, names[1]), b"someone else", "image/jpeg")
+            .unwrap();
+        // Photo 2 finished uploading before content tags existed.
+        mem.put_object(&original_key(2024, 5, names[2]), b"photo-2", "image/jpeg")
+            .unwrap();
+
+        let rep = resume_unfinished_imports(
+            Arc::clone(&store),
+            Arc::clone(&s4),
+            Arc::clone(&cache),
+            Arc::clone(&control),
+            t(20),
+            |_| {},
+        )
+        .unwrap()
+        .expect("there was work to resume");
+        assert_eq!(rep.imported_count, 3);
+        assert!(unfinished_imports(&store.lock().unwrap()).unwrap().is_empty());
+        assert_eq!(store.lock().unwrap().list_timeline(None, None).unwrap().len(), 3);
+
+        // Photos 0 and 2 were not uploaded a second time; photo 1 moved aside.
+        let originals: Vec<String> = mem
+            .list_objects("originals/")
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        assert_eq!(originals.len(), 4, "{originals:?}");
+        assert!(originals.contains(&key0));
+        assert_eq!(originals.iter().filter(|k| k.contains("IMG_20240512_100001")).count(), 2);
+
+        // Nothing left: a second resume is a no-op.
+        let again = resume_unfinished_imports(store, s4, cache, control, t(30), |_| {}).unwrap();
+        assert!(again.is_none());
+    }
+
+    #[test]
+    fn live_photo_pair_resumes_as_a_pair() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        let photo = src_dir.0.join("IMG_20240512_120000.HEIC");
+        let motion = src_dir.0.join("IMG_20240512_120000.MOV");
+        fs::write(&photo, b"still-bytes").unwrap();
+        fs::write(&motion, b"motion-bytes").unwrap();
+
+        let mem = InMemoryObjectStore::new(S4Config::default());
+        let s4: Arc<dyn ObjectStore> = Arc::new(mem.clone());
+        let store = Arc::new(Mutex::new(Store::open_in_memory("mac-1").unwrap()));
+        let cache = Arc::new(Mutex::new(
+            LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap(),
+        ));
+        let control = Arc::new(ImportControl::new());
+
+        mem.set_offline(true);
+        let rep = run_import_concurrent(
+            [&src_dir.0],
+            None,
+            Arc::clone(&store),
+            Arc::clone(&s4),
+            Arc::clone(&cache),
+            Arc::clone(&control),
+            t(10),
+            |_| {},
+        )
+        .unwrap();
+        assert!(rep.paused_offline);
+        // Both halves are still queued; the MOV was not written off as skipped.
+        let pending = unfinished_imports(&store.lock().unwrap()).unwrap();
+        assert_eq!(pending[0].1, vec![photo.clone(), motion.clone()]);
+
+        mem.set_offline(false);
+        resume_unfinished_imports(Arc::clone(&store), s4, cache, control, t(20), |_| {})
+            .unwrap();
+
+        let st = store.lock().unwrap();
+        let assets = st.list_timeline(None, None).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].kind, AssetKind::Live);
+        let queue = st.list_import_queue().unwrap();
+        assert!(queue.iter().all(|row| row.state == ImportState::Logged), "{queue:?}");
+    }
+
+    #[test]
+    fn cancelled_import_is_not_resumed_automatically() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        for i in 0..4 {
+            fs::write(
+                src_dir.0.join(format!("IMG_20240512_11000{i}.JPG")),
+                format!("cancel-{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        let s4: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new(S4Config::default()));
+        let store = Arc::new(Mutex::new(Store::open_in_memory("mac-1").unwrap()));
+        let cache = Arc::new(Mutex::new(
+            LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap(),
+        ));
+        let control = Arc::new(ImportControl::new());
+
+        // The user presses Cancel as soon as the run reports progress.
+        let canceller = Arc::clone(&control);
+        run_import_concurrent(
+            [&src_dir.0],
+            None,
+            Arc::clone(&store),
+            s4,
+            cache,
+            Arc::clone(&control),
+            t(10),
+            move |_| canceller.cancel(),
+        )
+        .unwrap();
+
+        let st = store.lock().unwrap();
+        assert!(unfinished_imports(&st).unwrap().is_empty());
+        let queue = st.list_import_queue().unwrap();
+        assert!(queue
+            .iter()
+            .filter(|row| row.state != ImportState::Logged)
+            .all(|row| row.state == ImportState::Failed
+                && row.error.as_deref().is_some_and(|e| e.starts_with("Cancelled"))));
+    }
+
+    /// An S4 stand-in that fails the test if the store is locked while any
+    /// S4 request is made, i.e. if a network call happens under the lock.
+    struct LockCheckingStore<'a> {
+        inner: InMemoryObjectStore,
+        store: &'a Mutex<Store>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LockCheckingStore<'_> {
+        fn check(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(self.store.try_lock().is_ok(), "S4 request made while the store was locked");
+        }
+    }
+
+    impl ObjectStore for LockCheckingStore<'_> {
+        fn head_object(&self, key: &str) -> crate::s4::Result<Option<crate::s4::ObjectMeta>> {
+            self.check();
+            self.inner.head_object(key)
+        }
+        fn get_object(&self, key: &str) -> crate::s4::Result<Option<Vec<u8>>> {
+            self.check();
+            self.inner.get_object(key)
+        }
+        fn get_object_range(&self, key: &str, start: u64, end: Option<u64>) -> crate::s4::Result<Option<Vec<u8>>> {
+            self.check();
+            self.inner.get_object_range(key, start, end)
+        }
+        fn put_object(&self, key: &str, body: &[u8], content_type: &str) -> crate::s4::Result<String> {
+            self.check();
+            self.inner.put_object(key, body, content_type)
+        }
+        fn delete_object(&self, key: &str) -> crate::s4::Result<()> {
+            self.check();
+            self.inner.delete_object(key)
+        }
+        fn list_objects(&self, prefix: &str) -> crate::s4::Result<Vec<crate::s4::ObjectMeta>> {
+            self.check();
+            self.inner.list_objects(prefix)
+        }
+        fn put_object_from_file(&self, key: &str, path: &Path, content_type: &str, sha: Option<&str>) -> crate::s4::Result<String> {
+            self.check();
+            self.inner.put_object_from_file(key, path, content_type, sha)
+        }
+        fn create_multipart_upload(&self, key: &str, content_type: &str, sha: Option<&str>) -> crate::s4::Result<String> {
+            self.check();
+            self.inner.create_multipart_upload(key, content_type, sha)
+        }
+        fn upload_part(&self, key: &str, upload_id: &str, part: u32, body: &[u8]) -> crate::s4::Result<String> {
+            self.check();
+            self.inner.upload_part(key, upload_id, part, body)
+        }
+        fn list_parts(&self, key: &str, upload_id: &str) -> crate::s4::Result<Vec<crate::s4::UploadedPart>> {
+            self.check();
+            self.inner.list_parts(key, upload_id)
+        }
+        fn complete_multipart_upload(&self, key: &str, upload_id: &str, parts: &[(u32, String)]) -> crate::s4::Result<()> {
+            self.check();
+            self.inner.complete_multipart_upload(key, upload_id, parts)
+        }
+        fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> crate::s4::Result<()> {
+            self.check();
+            self.inner.abort_multipart_upload(key, upload_id)
+        }
+        fn list_multipart_uploads(&self) -> crate::s4::Result<Vec<crate::s4::IncompleteMultipartUpload>> {
+            self.check();
+            self.inner.list_multipart_uploads()
+        }
+        fn presign_get(&self, key: &str, now: DateTime<Utc>, expires_secs: u64) -> crate::s4::Result<String> {
+            self.inner.presign_get(key, now, expires_secs)
+        }
+        fn config(&self) -> &S4Config {
+            self.inner.config()
+        }
+    }
+
+    #[test]
+    fn sync_check_and_trash_never_hold_the_store_lock_during_s4_calls() {
+        let src_dir = TempDir::new();
+        let cache_dir = TempDir::new();
+        fs::write(src_dir.0.join("IMG_20240512_150000.JPG"), b"from-the-pc").unwrap();
         let s4 = InMemoryObjectStore::new(S4Config::default());
 
-        let local_album_id = "album-local-1";
-        store.connection().execute(
-            "INSERT INTO albums (id, name, name_at, created_at) VALUES (?1, 'Vacation', 'now', 'now')",
-            rusqlite::params![local_album_id],
-        ).unwrap();
+        // The other computer imports a photo and logs it.
+        let mut win = Store::open_in_memory("win-1").unwrap();
+        let mut win_cache = LocalCache::open(&cache_dir.0, DEFAULT_CACHE_LIMIT_BYTES).unwrap();
+        run_import([&src_dir.0], None, &mut win, &s4, &mut win_cache, t(10)).unwrap();
 
-        let asset_id = crate::scan_local::upsert_local_asset(
-            store.connection(),
-            local_album_id,
-            "beach.jpg",
-            "/local/disk/Vacation/beach.jpg",
-            "beach.jpg",
-            12345,
-            Utc::now(),
-            "mac-1",
-        ).unwrap();
+        // This computer has a local change waiting in its outbox.
+        let mac = Mutex::new(Store::open_in_memory("mac-1").unwrap());
+        mac.lock().unwrap().create_album("alb-1".into(), "Trip".into(), t(11)).unwrap();
+        let checking = LockCheckingStore {
+            inner: s4,
+            store: &mac,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
 
-        s4.put_object("albums/Vacation/beach.jpg", b"fake-jpg", "image/jpeg").unwrap();
-        s4.put_object("albums/Vacation/sunset.jpg", b"fake-jpg-2", "image/jpeg").unwrap();
-        s4.put_object("albums/Vacation/island.jpg", b"fake-jpg-slash", "image/jpeg").unwrap();
-        s4.put_object("albums/Remote Only/pyramids.jpg", b"fake-jpg-3", "image/jpeg").unwrap();
+        let rep = sync_once(&mut &mac, &checking, t(12)).unwrap();
+        assert_eq!(rep.batches_pushed, 1);
+        assert!(rep.batches_pulled >= 1);
+        let ids: Vec<String> = mac
+            .lock()
+            .unwrap()
+            .list_timeline(None, None)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids.len(), 1);
 
-        let mut synced_albums = Vec::new();
-        let upserted = sync_remote_album_listings(&store, &s4, |alb_id| {
-            synced_albums.push(alb_id.to_string());
-        }).unwrap();
-
-        assert_eq!(upserted, 4);
-        assert!(synced_albums.contains(&local_album_id.to_string()));
-
-        let beach_row: (String, Option<String>, Option<String>, String) = store.connection().query_row(
-            "SELECT id, local_path, remote_key, key FROM assets WHERE album_id = ?1 AND relative_path = 'beach.jpg'",
-            rusqlite::params![local_album_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        ).unwrap();
-        assert_eq!(beach_row.0, asset_id);
-        assert_eq!(beach_row.1.as_deref(), Some("/local/disk/Vacation/beach.jpg"));
-        assert_eq!(beach_row.2.as_deref(), Some("albums/Vacation/beach.jpg"));
-        assert_eq!(beach_row.3, "albums/Vacation/beach.jpg");
-
-        let sunset_row: (Option<String>, Option<String>) = store.connection().query_row(
-            "SELECT local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'sunset.jpg'",
-            rusqlite::params![local_album_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
-        assert!(sunset_row.0.is_none());
-        assert_eq!(sunset_row.1.as_deref(), Some("albums/Vacation/sunset.jpg"));
-
-        let island_row: (Option<String>, Option<String>) = store.connection().query_row(
-            "SELECT local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'island.jpg'",
-            rusqlite::params![local_album_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
-        assert_eq!(island_row.1.as_deref(), Some("albums/Vacation/island.jpg"));
-
-        let remote_album: (String, String) = store.connection().query_row(
-            "SELECT id, name FROM albums WHERE name = 'Remote Only'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
-        assert_eq!(remote_album.1, "Remote Only");
-
-        let pyramid_row: (Option<String>, Option<String>) = store.connection().query_row(
-            "SELECT local_path, remote_key FROM assets WHERE album_id = ?1 AND relative_path = 'pyramids.jpg'",
-            rusqlite::params![remote_album.0],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
-        assert!(pyramid_row.0.is_none());
-        assert_eq!(pyramid_row.1.as_deref(), Some("albums/Remote Only/pyramids.jpg"));
-
-        // Verify debug_album reflects metrics with with_both > 0
-        let dbg = store.debug_album(local_album_id).unwrap();
-        assert_eq!(dbg.total, 3);
-        assert_eq!(dbg.with_local, 1);
-        assert_eq!(dbg.with_remote, 3);
-        assert_eq!(dbg.with_both, 1);
-        assert!(dbg.with_both > 0, "with_both must be > 0 for album existing in both places");
+        check_library(&mut &mac, &checking).unwrap();
+        mac.lock().unwrap().trash_assets(ids, t(13)).unwrap();
+        let purged = crate::trash::empty_trash(&mut &mac, &checking, t(14)).unwrap();
+        assert_eq!(purged.purged_asset_ids.len(), 1);
+        assert!(checking.calls.load(Ordering::SeqCst) > 5);
     }
 }

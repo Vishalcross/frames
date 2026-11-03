@@ -14,51 +14,33 @@
     'July', 'August', 'September', 'October', 'November', 'December'
   ];
 
-  const monthCards = $derived.by(() => {
-    const monthGroups = tauriRepo.getMonthGroups().filter((mg) => mg.year === year);
-    const assets = tauriRepo.getAssets().filter((a) => a.year === year);
+  // Three more thumbnails per month for the mosaic, fetched per month
+  // (positions 1-3; position 0 is the month's cover).
+  let mosaicIds = $state<Record<number, string[]>>({});
 
-    // If monthGroups has items for this year
-    if (monthGroups.length > 0) {
-      return monthGroups
-        .sort((a, b) => b.month - a.month)
-        .map((mg) => {
-          const monthAssets = assets.filter((a) => a.month === mg.month);
-          const largeThumb = mg.key_asset_id ? getAssetUrl('preview', mg.key_asset_id) : '';
-          const smallThumbs = monthAssets
-            .filter((a) => a.id !== mg.key_asset_id)
-            .slice(0, 3)
-            .map((a) => getAssetUrl('thumb', a.id));
-
-          return {
-            month: mg.month,
-            name: monthNames[mg.month - 1] || `Month ${mg.month}`,
-            count: mg.count,
-            largeThumb,
-            smallThumbs
-          };
-        });
+  $effect(() => {
+    const y = year;
+    mosaicIds = {};
+    for (const mg of tauriRepo.getMonthGroups().filter((g) => g.year === y)) {
+      tauriRepo.range({ year: y, month: mg.month }, 1, 3).then((assets) => {
+        if (year === y) mosaicIds = { ...mosaicIds, [mg.month]: assets.map((a) => a.id) };
+      });
     }
-
-    // Fallback: group assets by month
-    const map = new Map<number, typeof assets>();
-    for (const a of assets) {
-      const m = a.month || (new Date(a.takenAt).getMonth() + 1);
-      const list = map.get(m) || [];
-      list.push(a);
-      map.set(m, list);
-    }
-
-    return Array.from(map.entries())
-      .sort((a, b) => b[0] - a[0])
-      .map(([m, list]) => ({
-        month: m,
-        name: monthNames[m - 1] || `Month ${m}`,
-        count: list.length,
-        largeThumb: list[0] ? getAssetUrl('preview', list[0].id) : '',
-        smallThumbs: list.slice(1, 4).map((a) => getAssetUrl('thumb', a.id))
-      }));
   });
+
+  const monthCards = $derived(
+    tauriRepo
+      .getMonthGroups()
+      .filter((mg) => mg.year === year)
+      .sort((a, b) => b.month - a.month)
+      .map((mg) => ({
+        month: mg.month,
+        name: monthNames[mg.month - 1] || `Month ${mg.month}`,
+        count: mg.count,
+        largeThumb: mg.key_asset_id ? getAssetUrl('preview', mg.key_asset_id) : '',
+        smallThumbs: (mosaicIds[mg.month] ?? []).map((id) => getAssetUrl('thumb', id))
+      }))
+  );
 </script>
 
 <div class="months-view-container">

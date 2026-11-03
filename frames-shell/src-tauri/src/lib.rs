@@ -2,15 +2,13 @@
 //! to `frames-core` (`store`, `s4`, `sync`, `importer`, `media`, `player`, `cache`, `trash`).
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::http::{header, Response, StatusCode};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -20,8 +18,8 @@ use frames_core::media::{encode_webp_lossless, RgbImage};
 use frames_core::media::spawn_hidden_command;
 use frames_core::ops::{AssetKind, AssetRecord};
 use frames_core::player::{
-    detect_best_h264_encoder, H264Encoder, LoopbackStreamServer, PlaybackDecision,
-    PlayerCapabilities, VideoPlaybackPlan,
+    decide_playback, detect_best_h264_encoder, H264Encoder, LoopbackStreamServer,
+    PlaybackDecision, PlayerCapabilities, UrlRefresher, VideoPlaybackPlan,
 };
 use frames_core::s4::{
     load_secret_from_os_keychain, save_secret_in_os_keychain, InMemoryObjectStore, ObjectStore,
@@ -32,20 +30,18 @@ use frames_core::store::{
     SearchFilter, SearchSuggestions, Store, TrashItem,
 };
 use frames_core::sync::{
-    check_library, export_originals, import_unknown_s4_keys, rebuild_from_s4,
-    run_import_concurrent, sync_once, ImportControl, ImportRunReport, LibraryCheckReport,
-    SyncReport,
+    check_library, export_originals, flush_outbox, import_unknown_s4_keys, rebuild_from_s4,
+    resume_unfinished_imports, run_import_concurrent, sync_once, unfinished_imports,
+    ImportControl, ImportRunReport, LibraryCheckReport, SyncReport,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use frames_core::keys::{thumb_preview_key, thumb_small_key};
+use frames_core::thumbnails::ThumbService;
 use frames_core::trash::{
-    delete_trash_items_now, empty_trash, purge_expired_trash_concurrent, trash_summary,
+    delete_trash_items_now, empty_trash, purge_expired_trash, trash_summary,
     PurgeReport, TrashSummary,
 };
-use frames_core::rusqlite::params;
 
 pub mod adaptive_commands;
+mod protocol;
 pub use adaptive_commands::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +109,15 @@ pub struct TimelinePayload {
     pub month_groups: Vec<MonthGroup>,
 }
 
+/// The timeline at startup: its size and months, not its assets. Grids fetch
+/// assets a page at a time (`query_assets`), so startup and every refresh
+/// stay small however large the library grows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineSummary {
+    pub total_assets: usize,
+    pub month_groups: Vec<MonthGroup>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrashPayload {
     pub items: Vec<TrashItem>,
@@ -131,7 +136,7 @@ pub struct ImportStatusView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapPayload {
     pub device_id: String,
-    pub timeline: TimelinePayload,
+    pub timeline: TimelineSummary,
     pub albums: Vec<AlbumSummary>,
     pub trash: TrashPayload,
     pub import_progress: ImportProgress,
@@ -148,21 +153,20 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub store: Arc<Mutex<Store>>,
     pub cache: Arc<Mutex<LocalCache>>,
+    pub thumbs: Arc<ThumbService>,
     pub settings: Mutex<PersistedSettings>,
     pub demo_s4: InMemoryObjectStore,
     pub secret_override: Mutex<Option<String>>,
+    /// Built once from settings and the keychain; cleared when settings change.
+    s4_client: RwLock<Option<Arc<dyn ObjectStore>>>,
     pub player_server: LoopbackStreamServer,
     pub player_error: Option<String>,
     pub h264_encoder: H264Encoder,
     pub offline_mode: Mutex<bool>,
     pub db_damaged: Mutex<Option<String>>,
     pub import_control: Arc<ImportControl>,
-    pub thumb_sync_running: Arc<AtomicBool>,
-    pub thumb_worker: Arc<frames_core::thumb_worker::ThumbWorker>,
-    pub upload_worker: Arc<frames_core::UploadWorker>,
-    pub remote_fetcher: Arc<Mutex<Option<frames_core::RemoteFetcher>>>,
-    pub thumb_started: AtomicBool,
-    pub upload_started: AtomicBool,
+    /// Wakes the thread that uploads local edits (see `push_edits_soon`).
+    edit_pusher: OnceLock<mpsc::Sender<()>>,
 }
 
 impl AppState {
@@ -183,7 +187,7 @@ impl AppState {
             .unwrap_or_default();
 
         let db_path = data_dir.join("frames.sqlite3");
-        let (store, db_damaged_err) = match Store::open(&db_path) {
+        let (mut store, db_damaged_err) = match Store::open(&db_path) {
             Ok(s) => (s, None),
             Err(err) => {
                 let fallback = Store::open_in_memory("mac-recovery")
@@ -196,6 +200,10 @@ impl AppState {
                 )
             }
         };
+        // One-time move to content-addressed assets; a full copy is kept first.
+        let _ = store.remove_legacy_folder_assets(
+            &data_dir.join("frames.sqlite3.before-content-addressed.bak"),
+        );
 
         let cache_limit = settings.cache_limit_gb.max(1) * 1_000_000_000;
         let cache = LocalCache::open(&settings.cache_location, cache_limit).unwrap_or_else(|_| {
@@ -205,6 +213,8 @@ impl AppState {
             )
             .expect("failed to open fallback cache")
         });
+        let cache = Arc::new(Mutex::new(cache));
+        let thumbs = ThumbService::new(Arc::clone(&cache), &db_path);
 
         let s4_cfg = S4Config {
             endpoint: settings.endpoint.clone(),
@@ -228,46 +238,49 @@ impl AppState {
 
         // Do NOT run trash purge synchronously on startup so launching the app
         // while offline never blocks the window from opening (Blocker 5).
-        Self {
+        let state = Self {
             data_dir,
             store: Arc::new(Mutex::new(store)),
-            cache: Arc::new(Mutex::new(cache)),
+            cache,
+            thumbs,
             settings: Mutex::new(settings),
             demo_s4,
             secret_override: Mutex::new(None),
+            s4_client: RwLock::new(None),
             player_server,
             player_error,
             h264_encoder,
             offline_mode: Mutex::new(false),
             db_damaged: Mutex::new(db_damaged_err),
             import_control: Arc::new(ImportControl::new()),
-            thumb_sync_running: Arc::new(AtomicBool::new(false)),
-            thumb_worker: Arc::new(frames_core::thumb_worker::ThumbWorker::new()),
-            upload_worker: Arc::new(frames_core::UploadWorker::new()),
-            remote_fetcher: Arc::new(Mutex::new(None)),
-            thumb_started: AtomicBool::new(false),
-            upload_started: AtomicBool::new(false),
-        }
-    }
-
-    pub fn get_or_create_remote_fetcher(&self) -> Option<frames_core::RemoteFetcher> {
-        let mut guard = self.remote_fetcher.lock().ok()?;
-        if let Some(fetcher) = guard.as_ref() {
-            return Some(fetcher.clone());
-        }
-        if let Ok(s4) = self.require_s4() {
-            let fetcher = frames_core::RemoteFetcher::new(s4);
-            *guard = Some(fetcher.clone());
-            Some(fetcher)
-        } else {
-            None
-        }
+            edit_pusher: OnceLock::new(),
+        };
+        // Hand the thumbnail service its S4 client if settings already allow one.
+        let _ = state.require_s4();
+        state
     }
 
     /// Resolve the active S4 object store, or return an explicit error if
     /// `use_real_s4` is enabled without valid MEGA S4 credentials.
     /// NEVER silently falls back to `demo_s4` when `use_real_s4` is `true` (Blocker 1).
     pub fn require_s4(&self) -> Result<Arc<dyn ObjectStore>, String> {
+        if let Some(s4) = self.s4_client.read().unwrap().as_ref() {
+            return Ok(Arc::clone(s4));
+        }
+        let s4 = self.build_s4()?;
+        *self.s4_client.write().unwrap() = Some(Arc::clone(&s4));
+        self.thumbs.set_s4(Some(Arc::clone(&s4)));
+        Ok(s4)
+    }
+
+    /// Forget the cached S4 client after a settings change.
+    fn reset_s4(&self) {
+        *self.s4_client.write().unwrap() = None;
+        self.thumbs.set_s4(None);
+        let _ = self.require_s4();
+    }
+
+    fn build_s4(&self) -> Result<Arc<dyn ObjectStore>, String> {
         let st = self.settings.lock().unwrap().clone();
         if !st.use_real_s4 {
             return Ok(Arc::new(self.demo_s4.clone()));
@@ -315,10 +328,6 @@ impl AppState {
             ..Default::default()
         };
         Ok(Arc::new(S4Client::new(cfg)))
-    }
-
-    pub fn is_s4_ready_for_purge(&self) -> bool {
-        self.require_s4().is_ok()
     }
 
     fn settings_view(&self, device_id: String) -> SettingsView {
@@ -369,945 +378,99 @@ impl AppState {
         SpaceUsage::compute(used_bytes, limit_bytes)
     }
 
-    /// Spawn a non-blocking background worker to download any missing `s.webp`
-    /// small thumbnails from S4 without holding `cache.lock()` across network I/O
-    /// (Spec Section 10: "A new computer downloads small thumbnails in the background").
-    pub fn spawn_background_small_thumb_sync(&self) {
-        let Ok(s4) = self.require_s4() else {
-            return;
-        };
-        if self
-            .thumb_sync_running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
+    /// Fill in missing `s.webp` thumbnails in the background (spec section 10),
+    /// telling the UI as each one lands. Safe to call repeatedly.
+    /// Upload local edits (albums, trash, dates) once they pause, rather than
+    /// at the next background sync.
+    pub fn push_edits_soon(&self) {
+        if let Some(edits) = self.edit_pusher.get() {
+            let _ = edits.send(());
         }
-        let store_arc = Arc::clone(&self.store);
-        let cache_arc = Arc::clone(&self.cache);
-        let running_flag = Arc::clone(&self.thumb_sync_running);
+    }
 
-        let _ = std::thread::Builder::new()
-            .name("frames-bg-small-thumbs".into())
-            .spawn(move || {
-                let all_ids: Vec<String> = {
-                    let Ok(st) = store_arc.lock() else {
-                        running_flag.store(false, Ordering::SeqCst);
-                        return;
-                    };
-                    st.list_timeline(None, None)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|a| a.id)
-                        .collect()
-                };
-                let missing: Vec<String> = {
-                    let Ok(c) = cache_arc.lock() else {
-                        running_flag.store(false, Ordering::SeqCst);
-                        return;
-                    };
-                    c.missing_small_thumbs(&all_ids)
-                };
-                for id in missing {
-                    let key = thumb_small_key(&id);
-                    match s4.get_object(&key) {
-                        Ok(Some(bytes)) => {
-                            if let Ok(c) = cache_arc.lock() {
-                                let _ = c.put_small_thumb(&id, &bytes);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(_) => break,
-                    }
-                }
-                running_flag.store(false, Ordering::SeqCst);
-            });
+    pub fn start_thumb_backfill(&self, app: &AppHandle) {
+        let app = app.clone();
+        self.thumbs.start_backfill(Some(Arc::new(move |id: &str| {
+            let _ = app.emit("thumb-ready", serde_json::json!({ "asset_id": id }));
+        })));
     }
 }
 
-/// Fetch `s.webp` small thumbnail path, releasing `cache.lock()` before any S4 download.
-fn fetch_small_thumb_unlocked(
-    cache_mutex: &Mutex<LocalCache>,
-    s4: Option<&dyn ObjectStore>,
-    id: &str,
-) -> Option<PathBuf> {
-    if let Ok(c) = cache_mutex.lock() {
-        if let Some(p) = c.get_small_thumb_path(id) {
-            return Some(p);
+/// How often the library syncs with S4 and unfinished imports are retried
+/// (spec section 6: "every 5 minutes and after coming back online").
+const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Quiet time after the last edit before it is uploaded (spec section 6:
+/// "local edits flush after a ~2 s debounce").
+const EDIT_PUSH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Upload local edits a moment after they stop, so a burst of them (adding
+/// photos one by one, say) becomes one log batch. Offline, they wait for the
+/// background sync.
+fn push_edits_when_quiet(app: AppHandle, edits: mpsc::Receiver<()>) {
+    while edits.recv().is_ok() {
+        while edits.recv_timeout(EDIT_PUSH_DEBOUNCE).is_ok() {}
+        let state = app.state::<AppState>();
+        if *state.offline_mode.lock().unwrap() {
+            continue;
         }
-    }
-    let s4 = s4?;
-    let bytes = s4.get_object(&thumb_small_key(id)).ok().flatten()?;
-    let c = cache_mutex.lock().ok()?;
-    c.put_small_thumb(id, &bytes).ok()
-}
-
-/// Fetch `m.webp` preview path, releasing `cache.lock()` before any S4 download.
-fn fetch_preview_unlocked(
-    cache_mutex: &Mutex<LocalCache>,
-    s4: Option<&dyn ObjectStore>,
-    id: &str,
-) -> Option<PathBuf> {
-    if let Ok(mut c) = cache_mutex.lock() {
-        if let Some(p) = c.get_preview_path(id) {
-            return Some(p);
+        if let Ok(s4) = state.require_s4() {
+            let _ = flush_outbox(&mut &*state.store, s4.as_ref(), Utc::now());
         }
-    }
-    if let Some(s4_store) = s4 {
-        if let Ok(Some(bytes)) = s4_store.get_object(&thumb_preview_key(id)) {
-            if let Ok(mut c) = cache_mutex.lock() {
-                if let Ok(p) = c.put_preview(id, &bytes) {
-                    return Some(p);
-                }
-            }
-        }
-    }
-    fetch_small_thumb_unlocked(cache_mutex, s4, id)
-}
-
-/// Fetch original file path, releasing `cache.lock()` before streaming from S4 to disk.
-#[allow(dead_code)]
-fn fetch_original_unlocked(
-    cache_mutex: &Mutex<LocalCache>,
-    s4: Option<&dyn ObjectStore>,
-    id: &str,
-    filename: &str,
-    s4_key: &str,
-) -> Option<PathBuf> {
-    let target_disk_path = {
-        let mut c = cache_mutex.lock().ok()?;
-        if let Some(p) = c.get_original_path(id, filename) {
-            return Some(p);
-        }
-        c.original_disk_path(id, filename)
-    };
-    let s4_store = s4?;
-    if s4_store.get_object_to_file(s4_key, &target_disk_path).ok()? {
-        let mut c = cache_mutex.lock().ok()?;
-        return c.register_downloaded_original(id, filename).ok().flatten();
-    }
-    None
-}
-
-fn serve_file_with_range(
-    file_path: &Path,
-    request_headers: &tauri::http::HeaderMap,
-    method: &tauri::http::Method,
-) -> Response<Vec<u8>> {
-    let metadata = match fs::metadata(file_path) {
-        Ok(m) => m,
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Vec::new())
-                .unwrap();
-        }
-    };
-
-    let file_len = metadata.len();
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let content_type = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "heic" | "heif" => "image/heic",
-        "tif" | "tiff" => "image/tiff",
-        "mp4" => "video/mp4",
-        "mov" => "video/quicktime",
-        "m4v" => "video/x-m4v",
-        "avi" => "video/x-msvideo",
-        "mkv" => "video/x-matroska",
-        "webm" => "video/webm",
-        _ => "application/octet-stream",
-    };
-
-    if file_len == 0 {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, "0")
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(Vec::new())
-            .unwrap();
-    }
-
-    if let Some(range_hdr) = request_headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        if let Some(spec) = range_hdr.strip_prefix("bytes=") {
-            let spec = spec.trim();
-            let (s_str, e_str) = spec.split_once('-').unwrap_or((spec, ""));
-            let s_str = s_str.trim();
-            let e_str = e_str.trim();
-
-            let (start, end) = if s_str.is_empty() {
-                // Suffix byte range: bytes=-500 (last 500 bytes)
-                let suffix: u64 = match e_str.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                            .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
-                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .body(Vec::new())
-                            .unwrap();
-                    }
-                };
-                let suffix = suffix.min(file_len);
-                (file_len - suffix, file_len - 1)
-            } else if e_str.is_empty() {
-                // Prefix / open-ended range: bytes=500- (full range for images; 8MB chunk for videos)
-                let start: u64 = match s_str.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                            .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
-                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .body(Vec::new())
-                            .unwrap();
-                    }
-                };
-                let end = if content_type.starts_with("image/") {
-                    file_len - 1
-                } else {
-                    let max_chunk: u64 = 8 * 1024 * 1024;
-                    (start + max_chunk - 1).min(file_len - 1)
-                };
-                (start, end)
-            } else {
-                let start: u64 = match s_str.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                            .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
-                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .body(Vec::new())
-                            .unwrap();
-                    }
-                };
-                let end: u64 = match e_str.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        return Response::builder()
-                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                            .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
-                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .body(Vec::new())
-                            .unwrap();
-                    }
-                };
-                (start, end.min(file_len - 1))
-            };
-
-            if start > end || start >= file_len {
-                return Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header(header::CONTENT_RANGE, format!("bytes */{file_len}"))
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .body(Vec::new())
-                    .unwrap();
-            }
-
-            let chunk_len = (end - start + 1) as usize;
-            if method == tauri::http::Method::HEAD {
-                return Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header(header::CONTENT_TYPE, content_type)
-                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_len}"))
-                    .header(header::CONTENT_LENGTH, chunk_len.to_string())
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .body(Vec::new())
-                    .unwrap();
-            }
-
-            let mut f = match fs::File::open(file_path) {
-                Ok(f) => f,
-                Err(_) => {
-                    return Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .body(Vec::new())
-                        .unwrap();
-                }
-            };
-
-            if f.seek(SeekFrom::Start(start)).is_ok() {
-                let mut buf = vec![0u8; chunk_len];
-                if f.read_exact(&mut buf).is_ok() {
-                    return Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header(header::CONTENT_TYPE, content_type)
-                        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{file_len}"))
-                        .header(header::CONTENT_LENGTH, chunk_len.to_string())
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .body(buf)
-                        .unwrap();
-                }
-            }
-        }
-    }
-
-    if method == tauri::http::Method::HEAD {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, file_len.to_string())
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .header(header::CACHE_CONTROL, "public, max-age=3600")
-            .body(Vec::new())
-            .unwrap();
-    }
-
-    match fs::read(file_path) {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, file_len.to_string())
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .header(header::CACHE_CONTROL, "public, max-age=3600")
-            .body(bytes)
-            .unwrap(),
-        Err(_) => Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(Vec::new())
-            .unwrap(),
     }
 }
 
-/// Attempts to locate the original media file on local disk for an asset.
-/// Checks:
-/// 1. `assets.local_path`
-/// 2. `import_queue` path
-/// 3. Matched local album folders in configured roots and picture dir
-/// 4. Direct files in configured roots
-fn resolve_local_media_path(state: &AppState, id: &str) -> Option<PathBuf> {
-    let store_guard = state.store.lock().ok()?;
-    let conn = store_guard.connection();
-
-    // 1. Direct local_path from assets table
-    let asset_row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = conn
-        .query_row(
-            "SELECT local_path, album_id, relative_path, filename FROM assets WHERE id = ?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .ok();
-
-    if let Some((Some(ref lp), _, _, _)) = asset_row {
-        let p = PathBuf::from(lp);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-
-    // 2. Check import_queue table
-    let import_row: Option<String> = conn
-        .query_row(
-            "SELECT path FROM import_queue WHERE asset_id = ?1 AND path IS NOT NULL ORDER BY mtime DESC LIMIT 1",
-            [id],
-            |r| r.get(0),
-        )
-        .ok();
-
-    if let Some(ip) = import_row {
-        let p = PathBuf::from(&ip);
-        if p.is_file() {
-            let _ = conn.execute(
-                "UPDATE assets SET local_path = ?1 WHERE id = ?2",
-                params![ip, id],
-            );
-            return Some(p);
-        }
-    }
-
-    // 3. Search in matched local album folders
-    let (_, album_id_opt, rel_path_opt, filename_opt) = asset_row?;
-    let filename = filename_opt.unwrap_or_default();
-    let rel_path = rel_path_opt.unwrap_or_default();
-
-    let target_album_id = album_id_opt.or_else(|| {
-        conn.query_row(
-            "SELECT album_id FROM album_items WHERE asset_id = ?1 AND in_album = 1 LIMIT 1",
-            [id],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
-    });
-
-    let mut roots = store_guard.get_local_roots().unwrap_or_default();
-    if roots.is_empty() {
-        if let Some(pic_dir) = dirs::picture_dir() {
-            if pic_dir.exists() {
-                roots.push(pic_dir.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    if let Some(aid) = target_album_id {
-        let album_name: Option<String> = conn
-            .query_row("SELECT name FROM albums WHERE id = ?1", [&aid], |r| r.get(0))
-            .ok();
-
-        if let Some(aname) = album_name {
-            for root in &roots {
-                let root_dir = Path::new(root);
-                if !root_dir.exists() {
-                    continue;
-                }
-
-                let is_root_album = root_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.eq_ignore_ascii_case(&aname))
-                    .unwrap_or(false);
-
-                let mut candidate_folders = Vec::new();
-                if is_root_album {
-                    candidate_folders.push(root_dir.to_path_buf());
-                }
-                candidate_folders.push(root_dir.join(&aname));
-
-                if let Ok(entries) = fs::read_dir(root_dir) {
-                    for entry in entries.flatten() {
-                        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                            if entry.file_name().to_string_lossy().eq_ignore_ascii_case(&aname) {
-                                candidate_folders.push(entry.path());
-                            }
-                        }
-                    }
-                }
-
-                for folder in candidate_folders {
-                    if !folder.is_dir() {
-                        continue;
-                    }
-
-                    if !rel_path.is_empty() {
-                        let cand1 = folder.join(&rel_path);
-                        if cand1.is_file() {
-                            let lp_str = cand1.to_string_lossy().to_string();
-                            let _ = conn.execute(
-                                "UPDATE assets SET local_path = ?1 WHERE id = ?2",
-                                params![lp_str, id],
-                            );
-                            return Some(cand1);
-                        }
-                    }
-
-                    if !filename.is_empty() {
-                        let cand2 = folder.join(&filename);
-                        if cand2.is_file() {
-                            let lp_str = cand2.to_string_lossy().to_string();
-                            let _ = conn.execute(
-                                "UPDATE assets SET local_path = ?1 WHERE id = ?2",
-                                params![lp_str, id],
-                            );
-                            return Some(cand2);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Try checking if filename or rel_path exists in any root
-    if !filename.is_empty() {
-        for root in &roots {
-            let root_path = Path::new(root);
-            if !root_path.exists() {
-                continue;
-            }
-
-            let cand = root_path.join(&filename);
-            if cand.is_file() {
-                let lp_str = cand.to_string_lossy().to_string();
-                let _ = conn.execute(
-                    "UPDATE assets SET local_path = ?1 WHERE id = ?2",
-                    params![lp_str, id],
-                );
-                return Some(cand);
-            }
-
-            if !rel_path.is_empty() {
-                let cand_rel = root_path.join(&rel_path);
-                if cand_rel.is_file() {
-                    let lp_str = cand_rel.to_string_lossy().to_string();
-                    let _ = conn.execute(
-                        "UPDATE assets SET local_path = ?1 WHERE id = ?2",
-                        params![lp_str, id],
-                    );
-                    return Some(cand_rel);
-                }
-            }
-
-            // Quick recursive search up to depth 3
-            for entry in walkdir::WalkDir::new(root_path).max_depth(3).into_iter().flatten() {
-                if entry.file_type().is_file() && entry.file_name().to_string_lossy().eq_ignore_ascii_case(&filename) {
-                    let cand = entry.path().to_path_buf();
-                    let lp_str = cand.to_string_lossy().to_string();
-                    let _ = conn.execute(
-                        "UPDATE assets SET local_path = ?1 WHERE id = ?2",
-                        params![lp_str, id],
-                    );
-                    return Some(cand);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// RAII concurrency limiter for bounded background image/video decode threads.
-struct ConcurrencyLimiter {
-    permits: std::sync::Mutex<usize>,
-    cvar: std::sync::Condvar,
-    max: usize,
-}
-
-impl ConcurrencyLimiter {
-    pub const fn new(max: usize) -> Self {
-        Self {
-            permits: std::sync::Mutex::new(0),
-            cvar: std::sync::Condvar::new(),
-            max,
-        }
-    }
-
-    pub fn acquire_timeout(&self, timeout: std::time::Duration) -> Option<Permit<'_>> {
-        let start = std::time::Instant::now();
-        let mut count = self.permits.lock().unwrap();
-        while *count >= self.max {
-            let elapsed = start.elapsed();
-            if elapsed >= timeout {
-                return None;
-            }
-            let remaining = timeout - elapsed;
-            let (next_count, timeout_result) = self.cvar.wait_timeout(count, remaining).unwrap();
-            count = next_count;
-            if timeout_result.timed_out() && *count >= self.max {
-                return None;
-            }
-        }
-        *count += 1;
-        Some(Permit { limiter: self })
-    }
-}
-
-struct Permit<'a> {
-    limiter: &'a ConcurrencyLimiter,
-}
-
-impl<'a> Drop for Permit<'a> {
-    fn drop(&mut self) {
-        let mut count = self.limiter.permits.lock().unwrap();
-        *count -= 1;
-        self.limiter.cvar.notify_one();
-    }
-}
-
-/// Serve a thumbnail or preview response for an asset with local-first priority.
-fn serve_thumbnail_response(
-    state: &AppState,
-    s4_ref: Option<&dyn ObjectStore>,
-    id: &str,
-    size: frames_core::thumbs::ThumbSize,
-    method: &tauri::http::Method,
-) -> Response<Vec<u8>> {
-    let empty_body = *method == tauri::http::Method::HEAD;
-
-    // 1. Check disk thumbnail cache at thumbs/<size>/<id>.webp
-    let thumb_file = frames_core::thumbs::thumb_path(id, size);
-    if thumb_file.is_file() {
-        if let Ok(bytes) = fs::read(&thumb_file) {
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "image/webp")
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                .body(if empty_body { Vec::new() } else { bytes })
-                .unwrap();
-        }
-    }
-
-    // 2. Check LocalCache
-    if size == frames_core::thumbs::ThumbSize::Small {
-        if let Some(p) = fetch_small_thumb_unlocked(&state.cache, None, id) {
-            if let Ok(bytes) = fs::read(&p) {
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/webp")
-                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                    .body(if empty_body { Vec::new() } else { bytes })
-                    .unwrap();
-            }
-        }
-    } else if let Some(p) = fetch_preview_unlocked(&state.cache, None, id) {
-        if let Ok(bytes) = fs::read(&p) {
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "image/webp")
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                .body(if empty_body { Vec::new() } else { bytes })
-                .unwrap();
-        }
-    }
-
-    // 3. Resolve from local disk and generate on the fly with concurrency guard
-    static DECODE_LIMITER: ConcurrencyLimiter = ConcurrencyLimiter::new(3);
-
-    if let Some(src) = resolve_local_media_path(state, id) {
-        state.thumb_worker.prioritize(vec![id.to_string()]);
-
-        if let Some(_permit) = DECODE_LIMITER.acquire_timeout(std::time::Duration::from_secs(8)) {
-            // Re-check disk thumbnail cache: another thread or background worker may have generated it while waiting!
-            if thumb_file.is_file() {
-                if let Ok(bytes) = fs::read(&thumb_file) {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "image/webp")
-                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                        .body(if empty_body { Vec::new() } else { bytes })
-                        .unwrap();
-                }
-            }
-
-            let kind = {
-                let store = state.store.lock().ok();
-                store.and_then(|s| {
-                    s.connection()
-                        .query_row("SELECT kind FROM assets WHERE id = ?1", [id], |r| r.get::<_, String>(0))
-                        .ok()
-                }).unwrap_or_else(|| "photo".to_string())
-            };
-
-            let gen_res = if kind == "video" {
-                frames_core::thumbs::generate_video_thumb(&src, id, size)
-            } else {
-                frames_core::thumbs::generate_image_thumb(&src, id, size)
-            };
-
-            if let Ok(p) = gen_res {
-                if let Ok(store) = state.store.lock() {
-                    frames_core::thumbs::update_thumb_state(store.connection(), id, "ready");
-                }
-                if let Ok(bytes) = fs::read(&p) {
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "image/webp")
-                        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                        .body(if empty_body { Vec::new() } else { bytes })
-                        .unwrap();
-                }
-            }
-        }
-    }
-
-    // 4. Remote fetch fallback
-    if let Some(fetcher) = state.get_or_create_remote_fetcher() {
-        let (kind, remote_key, album_id, rel_path): (String, Option<String>, Option<String>, Option<String>) = {
-            let store = state.store.lock().ok();
-            store.and_then(|s| {
-                s.connection()
-                    .query_row(
-                        "SELECT kind, coalesce(remote_key, NULLIF(key, '')), album_id, relative_path FROM assets WHERE id = ?1",
-                        [id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                    )
-                    .ok()
-            }).unwrap_or_else(|| ("photo".to_string(), None, None, None))
-        };
-
-        let resolved_remote_key = remote_key.or_else(|| {
-            if let (Some(aid), Some(rel)) = (album_id, rel_path) {
-                let store = state.store.lock().ok()?;
-                let aname: String = store.connection()
-                    .query_row("SELECT name FROM albums WHERE id = ?1", [&aid], |r| r.get(0))
-                    .ok()?;
-                Some(format!("albums/{aname}/{rel}"))
-            } else {
-                None
-            }
-        });
-
-        let remote_asset = frames_core::RemoteAsset {
-            id: id.to_string(),
-            kind,
-            remote_key: resolved_remote_key,
-        };
-
-        if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_thumb(&remote_asset, size)) {
-            if let Ok(store) = state.store.lock() {
-                frames_core::thumbs::update_thumb_state(store.connection(), id, "ready");
-                if size == frames_core::thumbs::ThumbSize::Small {
-                    let _ = frames_core::palette::compute_and_store_palette(store.connection(), id);
-                }
-            }
-            if let Ok(bytes) = fs::read(&p) {
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/webp")
-                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                    .body(if empty_body { Vec::new() } else { bytes })
-                    .unwrap();
-            }
-        }
-    }
-
-    // 5. Fallback via cache & S4 ref
-    if size == frames_core::thumbs::ThumbSize::Small {
-        if let Some(p) = fetch_small_thumb_unlocked(&state.cache, s4_ref, id) {
-            if let Ok(bytes) = fs::read(p) {
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/webp")
-                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                    .body(if empty_body { Vec::new() } else { bytes })
-                    .unwrap();
-            }
-        }
-    } else if let Some(p) = fetch_preview_unlocked(&state.cache, s4_ref, id) {
-        if let Ok(bytes) = fs::read(p) {
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "image/webp")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-                .body(if empty_body { Vec::new() } else { bytes })
-                .unwrap();
-        }
-    }
-
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(Vec::new())
-        .unwrap()
-}
-
-fn url_decode(s: &str) -> String {
-    let mut result = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&result).into_owned()
-}
-
-/// Serve `frames://localhost/<kind>/<id>` custom protocol requests asynchronously
-/// on a worker thread without holding `cache.lock()` across S4 downloads (Blocker 4).
-fn handle_frames_protocol(app: &AppHandle, request: tauri::http::Request<Vec<u8>>) -> Response<Vec<u8>> {
+/// One background round: push local changes, pull the other computer's, tell
+/// the UI if anything arrived or the connection changed, then carry on with
+/// unfinished imports. The store is only locked between S4 calls.
+fn background_sync(app: &AppHandle) {
     let state = app.state::<AppState>();
-
-    // Support CORS preflight
-    if request.method() == tauri::http::Method::OPTIONS {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-            .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
-            .body(Vec::new())
-            .unwrap();
+    if let Ok(s4) = state.require_s4() {
+        if let Ok(rep) = sync_once(&mut &*state.store, s4.as_ref(), Utc::now()) {
+            let was_offline =
+                std::mem::replace(&mut *state.offline_mode.lock().unwrap(), rep.offline);
+            if rep.batches_pulled > 0 {
+                state.start_thumb_backfill(app);
+            }
+            if rep.batches_pulled > 0 || was_offline != rep.offline {
+                let _ = app.emit("library-changed", &rep);
+            }
+        }
     }
+    resume_imports_in_background(app);
+}
 
-    let uri = request.uri();
-    let raw_path = uri.path().trim_start_matches('/');
-    let host = uri.host().unwrap_or("");
-    let is_local_host = host.is_empty()
-        || host == "localhost"
-        || host == "127.0.0.1"
-        || host.ends_with(".localhost")
-        || host == "frames";
-
-    let combined = if !is_local_host {
-        format!("{host}/{raw_path}")
-    } else {
-        raw_path.to_string()
+/// Carry on with imports an earlier run left unfinished, if S4 is usable and
+/// no import is running. Reports through the usual `frames://import-progress`
+/// events, so the Imports view and sidebar show it like any other import.
+fn resume_imports_in_background(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.import_control.is_running() {
+        return;
+    }
+    let Ok(s4) = state.require_s4() else {
+        return;
     };
-
-    let segments: Vec<&str> = combined.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.len() < 2 {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(Vec::new())
-            .unwrap();
+    let has_work = state
+        .store
+        .lock()
+        .ok()
+        .and_then(|st| unfinished_imports(&st).ok())
+        .is_some_and(|groups| !groups.is_empty());
+    if !has_work {
+        return;
     }
-
-    let kind = segments[0];
-    let decoded_id = url_decode(segments[1]);
-    let id = decoded_id.as_str();
-
-    let s4_opt = state.require_s4().ok();
-    let s4_ref = s4_opt.as_deref();
-
-    match kind {
-        "thumb" => {
-            let size = match segments.get(2).copied() {
-                Some("1024") => frames_core::thumbs::ThumbSize::Large,
-                _ => frames_core::thumbs::ThumbSize::Small,
-            };
-            serve_thumbnail_response(&state, s4_ref, id, size, request.method())
-        }
-        "preview" => {
-            serve_thumbnail_response(&state, s4_ref, id, frames_core::thumbs::ThumbSize::Large, request.method())
-        }
-        "photo" | "original" => {
-            let empty_body = *request.method() == tauri::http::Method::HEAD;
-            // 1. Try local media path first
-            if let Some(src) = resolve_local_media_path(&state, id) {
-                let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                let is_raw = frames_core::media::is_raw_extension(&ext) || ext == "raw" || ext == "tif" || ext == "tiff";
-                if is_raw {
-                    if let Some((bytes, mime)) = frames_core::media::prepare_photo_bytes_for_webview(&src) {
-                        return Response::builder()
-                            .status(StatusCode::OK)
-                            .header(header::CONTENT_TYPE, mime)
-                            .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                            .header(header::CACHE_CONTROL, "public, max-age=3600")
-                            .body(if empty_body { Vec::new() } else { bytes })
-                            .unwrap();
-                    }
-                    return serve_thumbnail_response(&state, s4_ref, id, frames_core::thumbs::ThumbSize::Large, request.method());
-                }
-                return serve_file_with_range(&src, request.headers(), request.method());
-            }
-
-            // 2. Check cached originals on disk
-            let cached_orig = frames_core::thumbs::app_cache_dir().join("originals").join(id);
-            if cached_orig.is_file() {
-                let ext = cached_orig.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                let is_raw = frames_core::media::is_raw_extension(&ext) || ext == "raw" || ext == "tif" || ext == "tiff";
-                if is_raw {
-                    if let Some((bytes, mime)) = frames_core::media::prepare_photo_bytes_for_webview(&cached_orig) {
-                        return Response::builder()
-                            .status(StatusCode::OK)
-                            .header(header::CONTENT_TYPE, mime)
-                            .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                            .header(header::CACHE_CONTROL, "public, max-age=3600")
-                            .body(if empty_body { Vec::new() } else { bytes })
-                            .unwrap();
-                    }
-                    return serve_thumbnail_response(&state, s4_ref, id, frames_core::thumbs::ThumbSize::Large, request.method());
-                }
-                return serve_file_with_range(&cached_orig, request.headers(), request.method());
-            }
-
-            // 3. Remote fetch from S4
-            if let Some(fetcher) = state.get_or_create_remote_fetcher() {
-                let (kind, remote_key, album_id, rel_path, filename): (String, Option<String>, Option<String>, Option<String>, Option<String>) = {
-                    let store = state.store.lock().ok();
-                    store.and_then(|s| {
-                        s.connection()
-                            .query_row(
-                                "SELECT kind, coalesce(remote_key, NULLIF(key, '')), album_id, relative_path, filename FROM assets WHERE id = ?1",
-                                [id],
-                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                            )
-                            .ok()
-                    }).unwrap_or_else(|| ("photo".to_string(), None, None, None, None))
-                };
-
-                let target_aid = album_id.or_else(|| {
-                    let store = state.store.lock().ok()?;
-                    store.connection()
-                        .query_row("SELECT album_id FROM album_items WHERE asset_id = ?1 AND in_album = 1 LIMIT 1", [id], |r| r.get(0))
-                        .ok()
-                });
-
-                let resolved_remote_key = remote_key.or_else(|| {
-                    if let Some(aid) = target_aid {
-                        let store = state.store.lock().ok()?;
-                        let aname: String = store.connection()
-                            .query_row("SELECT name FROM albums WHERE id = ?1", [&aid], |r| r.get(0))
-                            .ok()?;
-                        let rel = rel_path.or(filename).unwrap_or_else(|| id.to_string());
-                        Some(format!("albums/{aname}/{rel}"))
-                    } else {
-                        None
-                    }
-                });
-
-                let remote_asset = frames_core::RemoteAsset {
-                    id: id.to_string(),
-                    kind,
-                    remote_key: resolved_remote_key,
-                };
-
-                if let Ok(p) = tauri::async_runtime::block_on(fetcher.fetch_remote_original(&remote_asset)) {
-                    if p.is_file() {
-                        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                        let is_raw = frames_core::media::is_raw_extension(&ext) || ext == "raw" || ext == "tif" || ext == "tiff";
-                        if is_raw {
-                            if let Some((bytes, mime)) = frames_core::media::prepare_photo_bytes_for_webview(&p) {
-                                return Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(header::CONTENT_TYPE, mime)
-                                    .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                                    .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                                    .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-                                    .header(header::CACHE_CONTROL, "public, max-age=3600")
-                                    .body(if empty_body { Vec::new() } else { bytes })
-                                    .unwrap();
-                            }
-                            return serve_thumbnail_response(&state, s4_ref, id, frames_core::thumbs::ThumbSize::Large, request.method());
-                        }
-                        return serve_file_with_range(&p, request.headers(), request.method());
-                    }
-                }
-            }
-
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Vec::new())
-                .unwrap()
-        }
-        _ => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(Vec::new())
-            .unwrap(),
-    }
+    let store = Arc::clone(&state.store);
+    let cache = Arc::clone(&state.cache);
+    let control = Arc::clone(&state.import_control);
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter = app.clone();
+        let _ = resume_unfinished_imports(store, s4, cache, control, Utc::now(), move |rep| {
+            let _ = emitter.emit("frames://import-progress", rep);
+        });
+        app.state::<AppState>().start_thumb_backfill(&app);
+    });
 }
 
 #[derive(Serialize)]
@@ -1326,7 +489,7 @@ fn check_core_status(filename: &str) -> CoreStatus {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, String> {
     let now = Utc::now();
     let payload = {
@@ -1334,7 +497,6 @@ fn get_app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, Str
         let cache = state.cache.lock().map_err(|e| e.to_string())?;
 
         let device_id = store.device_id().map_err(|e| e.to_string())?;
-        let assets = store.list_timeline(None, None).map_err(|e| e.to_string())?;
         let month_groups = store.timeline_month_groups().map_err(|e| e.to_string())?;
         let albums = store.list_albums().map_err(|e| e.to_string())?;
         let trash_items = store.list_trash(now).map_err(|e| e.to_string())?;
@@ -1356,8 +518,8 @@ fn get_app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, Str
 
         BootstrapPayload {
             device_id,
-            timeline: TimelinePayload {
-                assets,
+            timeline: TimelineSummary {
+                total_assets: month_groups.iter().map(|g| g.count).sum(),
                 month_groups,
             },
             albums,
@@ -1376,11 +538,10 @@ fn get_app_bootstrap(state: State<'_, AppState>) -> Result<BootstrapPayload, Str
         }
     };
 
-    state.spawn_background_small_thumb_sync();
     Ok(payload)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_timeline(
     limit: Option<usize>,
     offset: Option<usize>,
@@ -1397,99 +558,127 @@ fn get_timeline(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_asset_detail(id: String, state: State<'_, AppState>) -> Result<Option<AssetDetail>, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.get_asset(&id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn get_thumbnail_data_url(
+async fn get_thumbnail_data_url(
     id: String,
     preview: bool,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let size = if preview {
-        frames_core::thumbs::ThumbSize::Large
-    } else {
-        frames_core::thumbs::ThumbSize::Small
-    };
-
-    let s4_opt = state.require_s4().ok();
-    let resp = serve_thumbnail_response(&state, s4_opt.as_deref(), &id, size, &tauri::http::Method::GET);
-    if resp.status() == StatusCode::OK {
-        let bytes = resp.into_body();
-        if !bytes.is_empty() {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            return Ok(Some(format!("data:image/webp;base64,{b64}")));
-        }
-    }
-    Ok(None)
+    let thumbs = Arc::clone(&state.thumbs);
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = if preview { thumbs.preview(&id) } else { thumbs.small(&id) };
+        path.and_then(|p| fs::read(p).ok()).map(|bytes| {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            format!("data:image/webp;base64,{b64}")
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+/// How the viewer plays a video or a Live Photo's motion (spec section 8).
+/// `PlayDirect` comes back without a URL: the web view loads the file through
+/// `frames://` (this computer first, S4 ranges otherwise). Anything else gets
+/// a loopback stream that repackages or converts, reading the local file when
+/// there is one and S4 otherwise. `force_convert` is the retry after the web
+/// view failed to play a file it said it supports.
+#[tauri::command(async)]
 fn get_video_playback(
     id: String,
     supports_hevc: bool,
+    force_convert: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<VideoPlaybackPlan, String> {
-    let detail = {
+    let rec = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         store
             .get_asset(&id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Asset not found: {id}"))?
-    };
-
-    let s4 = state.require_s4()?;
-    let target_key = if detail.record.kind == AssetKind::Live {
-        detail
             .record
-            .motion_key
-            .clone()
-            .unwrap_or_else(|| detail.record.key.clone())
-    } else {
-        detail.record.key.clone()
     };
-    let presigned = s4
-        .presign_get(&target_key, Utc::now(), 3600)
-        .map_err(|e| e.to_string())?;
+    let is_live = rec.kind == AssetKind::Live;
 
+    // A Live Photo's motion codecs are not indexed. It is an iPhone MOV, HEVC
+    // on any recent iPhone, so the Mac plays it as is and Windows without the
+    // HEVC add-on converts it.
+    let (container, video_codec, audio_codec) = if is_live {
+        (Some("mov"), Some("hevc"), Some("aac"))
+    } else {
+        (
+            rec.container.as_deref(),
+            rec.video_codec.as_deref(),
+            rec.audio_codec.as_deref(),
+        )
+    };
     let caps = PlayerCapabilities {
         supports_hevc,
         ..Default::default()
     };
-
-    let s4_for_refresher = Arc::clone(&s4);
-    let key_for_refresher = target_key.clone();
-    let refresher = Arc::new(move || {
-        s4_for_refresher
-            .presign_get(&key_for_refresher, Utc::now(), 3600)
-            .ok()
-    });
-
-    let plan = state.player_server.create_playback_plan_with_refresher(
-        &id,
-        &presigned,
-        Some(refresher),
-        detail.record.container.as_deref(),
-        detail.record.video_codec.as_deref(),
-        detail.record.audio_codec.as_deref(),
-        detail.record.duration_ms,
-        &caps,
-        state.h264_encoder,
-    );
-
-    if plan.decision != PlaybackDecision::PlayDirect {
-        if let Some(ref srv_err) = state.player_error {
-            return Err(srv_err.clone());
+    let decision = if force_convert.unwrap_or(false) {
+        PlaybackDecision::Convert {
+            copy_video: false,
+            copy_audio: false,
         }
+    } else {
+        decide_playback(container, video_codec, audio_codec, &caps)
+    };
+    if decision == PlaybackDecision::PlayDirect {
+        return Ok(VideoPlaybackPlan {
+            asset_id: id,
+            decision,
+            playback_url: String::new(),
+            duration_ms: rec.duration_ms,
+            can_seek_via_query: false,
+        });
+    }
+    if let Some(ref srv_err) = state.player_error {
+        return Err(srv_err.clone());
     }
 
-    Ok(plan)
+    let local = if is_live {
+        state.thumbs.local_motion(&id)
+    } else {
+        state.thumbs.local_original(&id)
+    };
+    let (source, refresher): (String, Option<UrlRefresher>) = match local {
+        Some(path) => (path.to_string_lossy().to_string(), None),
+        None => {
+            let key = if is_live {
+                rec.motion_key
+                    .clone()
+                    .ok_or_else(|| "This Live Photo has no motion file.".to_string())?
+            } else {
+                rec.key.clone()
+            };
+            let s4 = state.require_s4()?;
+            let url = s4
+                .presign_get(&key, Utc::now(), 3600)
+                .map_err(|e| e.to_string())?;
+            // Long sessions re-sign before each seek; links last an hour.
+            let refresher: UrlRefresher =
+                Arc::new(move || s4.presign_get(&key, Utc::now(), 3600).ok());
+            (url, Some(refresher))
+        }
+    };
+
+    Ok(state.player_server.create_stream_session(
+        &id,
+        &source,
+        refresher,
+        decision,
+        rec.duration_ms,
+        state.h264_encoder,
+    ))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_video_seek_url(
     base_url: String,
     seek_seconds: f64,
@@ -1498,7 +687,7 @@ fn get_video_seek_url(
     Ok(state.player_server.build_seek_url(&base_url, seek_seconds))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn adjust_asset_date(
     id: String,
     new_taken_iso: String,
@@ -1511,6 +700,7 @@ fn adjust_asset_date(
     store
         .set_asset_date(&id, parsed, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.get_asset(&id).map_err(|e| e.to_string())
 }
 
@@ -1525,10 +715,9 @@ async fn export_assets(
     let s4 = state.require_s4()?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = store_arc.lock().map_err(|e| e.to_string())?;
-        let mut cache = cache_arc.lock().map_err(|e| e.to_string())?;
-        let paths = export_originals(&ids, &destination_folder, &store, s4.as_ref(), &mut cache)
-            .map_err(|e| e.to_string())?;
+        let paths =
+            export_originals(&ids, &destination_folder, &mut &*store_arc, s4.as_ref(), &cache_arc)
+                .map_err(|e| e.to_string())?;
         Ok(paths
             .into_iter()
             .map(|p| p.to_string_lossy().to_string())
@@ -1601,19 +790,19 @@ async fn pick_folder_dialog(prompt: Option<String>) -> Result<Option<String>, St
 // Album Commands
 // =============================================================================
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_albums(state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn album_asset_count(album_id: String, state: State<'_, AppState>) -> Result<usize, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.album_asset_count(&album_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_album_assets(
     album_id: String,
     offset: Option<usize>,
@@ -1626,7 +815,7 @@ fn get_album_assets(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn debug_album(
     album_id: String,
     state: State<'_, AppState>,
@@ -1635,21 +824,32 @@ fn debug_album(
     store.debug_album(&album_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn create_album(name: String, state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> {
+#[tauri::command(async)]
+/// Create an album, optionally holding `asset_ids` from the start (New Album
+/// from a selection).
+fn create_album(
+    name: String,
+    asset_ids: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<Vec<AlbumSummary>, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("Album name cannot be empty".into());
     }
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     let id = Uuid::new_v4().to_string();
+    let now = Utc::now();
     store
-        .create_album(id, trimmed.to_string(), Utc::now())
+        .create_album(id.clone(), trimmed.to_string(), now)
         .map_err(|e| e.to_string())?;
+    if let Some(ids) = asset_ids.filter(|ids| !ids.is_empty()) {
+        store.add_to_album(&id, ids, now).map_err(|e| e.to_string())?;
+    }
+    state.push_edits_soon();
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_album(
     album_id: String,
     name: String,
@@ -1663,19 +863,21 @@ fn rename_album(
     store
         .rename_album(&album_id, trimmed.to_string(), Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_album(album_id: String, state: State<'_, AppState>) -> Result<Vec<AlbumSummary>, String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store
         .delete_album(&album_id, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_to_album(
     album_id: String,
     asset_ids: Vec<String>,
@@ -1685,10 +887,11 @@ fn add_to_album(
     store
         .add_to_album(&album_id, asset_ids, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.list_albums().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_from_album(
     album_id: String,
     asset_ids: Vec<String>,
@@ -1698,10 +901,11 @@ fn remove_from_album(
     store
         .remove_from_album(&album_id, asset_ids, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store.list_album_assets(&album_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn move_to_album(
     from_album_id: String,
     to_album_id: String,
@@ -1712,6 +916,7 @@ fn move_to_album(
     store
         .move_to_album(&from_album_id, &to_album_id, asset_ids, Utc::now())
         .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
     store
         .list_album_assets(&from_album_id)
         .map_err(|e| e.to_string())
@@ -1721,7 +926,7 @@ fn move_to_album(
 // Search Commands
 // =============================================================================
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_search_suggestions(
     query: String,
     state: State<'_, AppState>,
@@ -1730,7 +935,27 @@ fn get_search_suggestions(
     store.search_suggestions(&query).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+/// One page of the assets matching `filter`, newest first.
+#[tauri::command(async)]
+fn query_assets(
+    filter: SearchFilter,
+    offset: usize,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<AssetSummary>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .query_assets(&filter, offset, limit.min(1000))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn count_assets(filter: SearchFilter, state: State<'_, AppState>) -> Result<usize, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.count_assets(&filter).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 fn search_assets(
     filter: SearchFilter,
     state: State<'_, AppState>,
@@ -1743,7 +968,7 @@ fn search_assets(
 // Trash Commands
 // =============================================================================
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_trash(state: State<'_, AppState>) -> Result<TrashPayload, String> {
     let now = Utc::now();
     let store = state.store.lock().map_err(|e| e.to_string())?;
@@ -1752,34 +977,46 @@ fn get_trash(state: State<'_, AppState>) -> Result<TrashPayload, String> {
     Ok(TrashPayload { items, summary })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn trash_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store
         .trash_assets(ids, Utc::now())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
+    Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn restore_assets(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
     let mut store = state.store.lock().map_err(|e| e.to_string())?;
     store
         .restore_assets(ids, Utc::now())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    state.push_edits_soon();
+    Ok(())
 }
 
 #[tauri::command]
-fn delete_trash_now(ids: Vec<String>, state: State<'_, AppState>) -> Result<PurgeReport, String> {
+async fn delete_trash_now(ids: Vec<String>, state: State<'_, AppState>) -> Result<PurgeReport, String> {
     let s4 = state.require_s4()?;
-    let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    delete_trash_items_now(&mut store, s4.as_ref(), &ids, Utc::now()).map_err(|e| e.to_string())
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_trash_items_now(&mut &*store, s4.as_ref(), &ids, Utc::now()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn empty_all_trash(state: State<'_, AppState>) -> Result<PurgeReport, String> {
+async fn empty_all_trash(state: State<'_, AppState>) -> Result<PurgeReport, String> {
     let s4 = state.require_s4()?;
-    let mut store = state.store.lock().map_err(|e| e.to_string())?;
-    empty_trash(&mut store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        empty_trash(&mut &*store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // =============================================================================
@@ -1802,7 +1039,7 @@ async fn import_from_paths(
     let control = Arc::clone(&state.import_control);
 
     tauri::async_runtime::spawn_blocking(move || {
-        run_import_concurrent(
+        let report = run_import_concurrent(
             paths,
             album_id.as_deref(),
             store_arc,
@@ -1814,37 +1051,40 @@ async fn import_from_paths(
                 let _ = app.emit("frames://import-progress", rep);
             },
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+        // New photos get their grid placeholders.
+        app.state::<AppState>().start_thumb_backfill(&app);
+        report
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pause_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     state.import_control.pause();
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resume_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     state.import_control.resume();
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn cancel_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     state.import_control.cancel();
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reset_import(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     state.import_control.force_reset();
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_import_queue(all: Option<bool>, state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     {
         let mut store = state.store.lock().map_err(|e| e.to_string())?;
@@ -1857,7 +1097,7 @@ fn clear_import_queue(all: Option<bool>, state: State<'_, AppState>) -> Result<I
     get_import_status(state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_import_status(state: State<'_, AppState>) -> Result<ImportStatusView, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let progress = store.import_progress().map_err(|e| e.to_string())?;
@@ -1871,7 +1111,12 @@ fn get_import_status(state: State<'_, AppState>) -> Result<ImportStatusView, Str
     })
 }
 
-#[tauri::command]
+/// Sample assets get content-addressed ids like real ones (spec section 4).
+fn sample_id(name: &str) -> String {
+    frames_core::media::sha256_bytes(name.as_bytes())
+}
+
+#[tauri::command(async)]
 fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
     // Explicitly switch to Local Sandbox Mode when seeding the demo library if real S4 is unconfigured
     {
@@ -1894,7 +1139,7 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
     let samples: Vec<(AssetRecord, [u8; 3], Option<&str>)> = vec![
         (
             AssetRecord {
-                id: "a101_bali_sunset_heic".into(),
+                id: sample_id("a101_bali_sunset_heic"),
                 kind: AssetKind::Live,
                 key: "originals/2024/05/IMG_4821.HEIC".into(),
                 filename: "IMG_4821.HEIC".into(),
@@ -1910,7 +1155,7 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
                 audio_codec: None,
                 camera_make: Some("Apple".into()),
                 camera_model: Some("iPhone 15 Pro".into()),
-                motion_id: Some("m101_bali_sunset_mov".into()),
+                motion_id: Some(sample_id("m101_bali_sunset_mov")),
                 motion_key: Some("originals/2024/05/IMG_4821.MOV".into()),
                 motion_size: Some(6_120_400),
                 thumb_failed: false,
@@ -1920,7 +1165,7 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
         ),
         (
             AssetRecord {
-                id: "a102_bali_surf_video".into(),
+                id: sample_id("a102_bali_surf_video"),
                 kind: AssetKind::Video,
                 key: "originals/2024/05/IMG_4855.MOV".into(),
                 filename: "IMG_4855.MOV".into(),
@@ -1946,7 +1191,7 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
         ),
         (
             AssetRecord {
-                id: "a103_rice_terraces_dng".into(),
+                id: sample_id("a103_rice_terraces_dng"),
                 kind: AssetKind::Photo,
                 key: "originals/2024/05/DSC01942.ARW".into(),
                 filename: "DSC01942.ARW".into(),
@@ -1972,7 +1217,7 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
         ),
         (
             AssetRecord {
-                id: "a104_april_garden_jpg".into(),
+                id: sample_id("a104_april_garden_jpg"),
                 kind: AssetKind::Photo,
                 key: "originals/2024/04/IMG_3910.JPG".into(),
                 filename: "IMG_3910.JPG".into(),
@@ -1998,7 +1243,7 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
         ),
         (
             AssetRecord {
-                id: "a105_family_dinner_mkv".into(),
+                id: sample_id("a105_family_dinner_mkv"),
                 kind: AssetKind::Video,
                 key: "originals/2023/12/MVI_0921.MKV".into(),
                 filename: "MVI_0921.MKV".into(),
@@ -2024,7 +1269,7 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
         ),
         (
             AssetRecord {
-                id: "a106_old_scan_guessed".into(),
+                id: sample_id("a106_old_scan_guessed"),
                 kind: AssetKind::Photo,
                 key: "originals/2022/08/SCAN_0012.TIFF".into(),
                 filename: "SCAN_0012.TIFF".into(),
@@ -2076,7 +1321,9 @@ fn seed_sample_library(state: State<'_, AppState>) -> Result<usize, String> {
         added += 1;
     }
 
-    let _ = sync_once(&mut store, s4.as_ref(), now);
+    drop(cache);
+    drop(store);
+    let _ = sync_once(&mut &*state.store, s4.as_ref(), now);
     Ok(added)
 }
 
@@ -2117,15 +1364,14 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncRepo
     };
 
     let rep = tauri::async_runtime::spawn_blocking(move || {
-        let mut store = store_arc.lock().map_err(|e| e.to_string())?;
-        sync_once(&mut store, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
+        sync_once(&mut &*store_arc, s4.as_ref(), Utc::now()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
 
     *state.offline_mode.lock().unwrap() = rep.offline;
     if !rep.offline {
-        state.spawn_background_small_thumb_sync();
+        state.start_thumb_backfill(&app);
 
         // Check if any album's file count changed by > 10% after sync (Task 4-f #7)
         if let Ok(store) = state.store.lock() {
@@ -2139,10 +1385,11 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncRepo
                 if changed {
                     let app_handle = app.clone();
                     let store_arc_clone = Arc::clone(&state.store);
+                    let cache_root = state.thumbs.cache_root().to_path_buf();
                     let alb_id_clone = alb_id.clone();
                     tauri::async_runtime::spawn_blocking(move || {
                         if let Ok(store) = store_arc_clone.lock() {
-                            if frames_core::album_palette::generate_and_save_album_palette(store.connection(), &alb_id_clone).is_ok() {
+                            if frames_core::album_palette::generate_and_save_album_palette(store.connection(), &cache_root, &alb_id_clone).is_ok() {
                                 let _ = app_handle.emit("album-palette-ready", serde_json::json!({ "album_id": alb_id_clone }));
                             }
                         }
@@ -2154,14 +1401,14 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncRepo
     Ok(rep)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn toggle_offline_mode(offline: bool, state: State<'_, AppState>) -> Result<bool, String> {
     state.demo_s4.set_offline(offline);
     *state.offline_mode.lock().unwrap() = offline;
     Ok(offline)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_settings(
     input: SettingsInput,
     app: AppHandle,
@@ -2212,86 +1459,40 @@ fn save_settings(
     }
 
     *state.settings.lock().unwrap() = new_settings;
-    // Drop any fetcher built from the previous credentials.
-    *state.remote_fetcher.lock().unwrap() = None;
-
-    // Start the upload worker now if the new credentials make S4 usable.
-    let app_for_workers = app.clone();
-    tauri::async_runtime::spawn_blocking(move || start_background_workers(&app_for_workers));
+    state.reset_s4();
+    state.start_thumb_backfill(&app);
+    resume_imports_in_background(&app);
 
     let store = state.store.lock().map_err(|e| e.to_string())?;
     let dev_id = store.device_id().map_err(|e| e.to_string())?;
     Ok(state.settings_view(dev_id))
 }
 
-#[tauri::command]
-fn set_local_roots(paths: Vec<String>, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        store.set_local_roots(paths).map_err(|e| e.to_string())?;
-    }
-    let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = handle.state::<AppState>();
-        if let Ok(store) = state.store.lock() {
-            let count = frames_core::scan_local::scan_all_local_roots(&store).unwrap_or(0);
-            let _ = handle.emit("scan-finished", serde_json::json!({ "count": count }));
-        }
-        start_background_workers(&handle);
-    });
-    Ok(())
-}
-
-#[tauri::command]
-fn get_local_roots(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    store.get_local_roots().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn scan_local_library(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<usize, String> {
-    let count = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        frames_core::scan_local::scan_all_local_roots(&store).map_err(|e| e.to_string())?
-    };
-    start_background_workers(&app);
-    let _ = app.emit("scan-finished", serde_json::json!({ "count": count }));
-    Ok(count)
-}
-
-#[tauri::command]
-fn prioritize(asset_ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
-    state.thumb_worker.prioritize(asset_ids);
-    Ok(())
-}
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct WorkerStatus {
     pub uploading_count: usize,
     pub thumb_generating_count: usize,
+    pub import_running: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_worker_status(state: State<'_, AppState>) -> Result<WorkerStatus, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    let uploading_count = frames_core::upload_worker::get_active_upload_count(store.connection())
-        .unwrap_or(0);
-    let thumb_generating_count = frames_core::thumb_worker::get_pending_thumb_count(store.connection())
-        .unwrap_or(0);
+    let uploading_count = if state.import_control.is_running() {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let p = store.import_progress().map_err(|e| e.to_string())?;
+        p.total_files
+            .saturating_sub(p.completed_files + p.skipped_duplicates + p.failed_files)
+    } else {
+        0
+    };
     Ok(WorkerStatus {
         uploading_count,
-        thumb_generating_count,
+        thumb_generating_count: state.thumbs.pending_count(),
+        import_running: state.import_control.is_running(),
     })
 }
 
-#[tauri::command]
-fn queue_upload(asset_id: String, state: State<'_, AppState>) -> Result<String, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    frames_core::upload_worker::enqueue_asset_upload(store.connection(), &asset_id)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_local_cache(state: State<'_, AppState>) -> Result<(u64, CacheStats), String> {
     let mut cache = state.cache.lock().map_err(|e| e.to_string())?;
     let freed = cache.clear_lru_cache().map_err(|e| e.to_string())?;
@@ -2304,8 +1505,7 @@ async fn run_check_library(state: State<'_, AppState>) -> Result<LibraryCheckRep
     let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || {
-        let store = store_arc.lock().map_err(|e| e.to_string())?;
-        check_library(&store, s4.as_ref()).map_err(|e| e.to_string())
+        check_library(&mut &*store_arc, s4.as_ref()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2320,9 +1520,7 @@ async fn add_unknown_s4_files(
     let store_arc = Arc::clone(&state.store);
     let cache_arc = Arc::clone(&state.cache);
     tauri::async_runtime::spawn_blocking(move || {
-        let mut store = store_arc.lock().map_err(|e| e.to_string())?;
-        let mut cache = cache_arc.lock().map_err(|e| e.to_string())?;
-        import_unknown_s4_keys(&mut store, s4.as_ref(), &mut cache, &keys, Utc::now())
+        import_unknown_s4_keys(&mut &*store_arc, s4.as_ref(), &cache_arc, &keys, Utc::now())
             .map_err(|e| e.to_string())
     })
     .await
@@ -2330,61 +1528,28 @@ async fn add_unknown_s4_files(
 }
 
 #[tauri::command]
-async fn run_rebuild_database(state: State<'_, AppState>) -> Result<SyncReport, String> {
+async fn run_rebuild_database(app: AppHandle, state: State<'_, AppState>) -> Result<SyncReport, String> {
     let s4 = state.require_s4()?;
     let store_arc = Arc::clone(&state.store);
     let rep = tauri::async_runtime::spawn_blocking(move || {
-        let mut store = store_arc.lock().map_err(|e| e.to_string())?;
-        rebuild_from_s4(&mut store, s4.as_ref()).map_err(|e| e.to_string())
+        rebuild_from_s4(&mut &*store_arc, s4.as_ref()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
 
     *state.db_damaged.lock().unwrap() = None;
-    state.spawn_background_small_thumb_sync();
+    state.start_thumb_backfill(&app);
     Ok(rep)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-/// Start the thumbnail worker (always) and the upload worker (once S4 is usable).
-/// Must be called from a tokio runtime context. Safe to call repeatedly.
-fn start_background_workers(handle: &AppHandle) {
-    let state = handle.state::<AppState>();
-    let db_path = state.data_dir.join("frames.sqlite3");
-
-    if !state.thumb_started.swap(true, Ordering::SeqCst) {
-        let handle_events = handle.clone();
-        let on_ready: frames_core::thumb_worker::ThumbReadyCallback =
-            Arc::new(move |asset_id: &str| {
-                let _ = handle_events.emit("thumb-ready", serde_json::json!({ "asset_id": asset_id }));
-            });
-        Arc::clone(&state.thumb_worker).start_worker_pool(db_path.clone(), Some(on_ready));
-    }
-
-    if !state.upload_started.load(Ordering::SeqCst) {
-        if let Ok(s4) = state.require_s4() {
-            state.upload_started.store(true, Ordering::SeqCst);
-            let handle_up = handle.clone();
-            let on_progress: frames_core::upload_worker::UploadProgressCallback =
-                Arc::new(move |job_id: &str, st: &str| {
-                    let _ = handle_up.emit(
-                        "upload-progress",
-                        serde_json::json!({ "job_id": job_id, "state": st }),
-                    );
-                });
-            Arc::clone(&state.upload_worker).start_worker_pool(db_path, s4, Some(on_progress));
-        }
-    }
-}
-
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::init())
         .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
             let handle = ctx.app_handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
-                let response = handle_frames_protocol(&handle, request);
-                responder.respond(response);
+                responder.respond(protocol::handle(&handle, request));
             });
         })
         .setup(|app| {
@@ -2395,52 +1560,47 @@ pub fn run() {
             std::thread::Builder::new()
                 .name("frames-daily-trash-purge".into())
                 .spawn(move || {
+                    frames_core::qos::set_current_thread(frames_core::qos::WorkClass::Background);
                     std::thread::sleep(Duration::from_secs(5));
                     loop {
                         let state = handle.state::<AppState>();
                         if let Ok(s4) = state.require_s4() {
-                            let _ = purge_expired_trash_concurrent(
-                                &state.store,
-                                s4.as_ref(),
-                                Utc::now(),
-                            );
+                            let _ = purge_expired_trash(&mut &*state.store, s4.as_ref(), Utc::now());
                         }
                         std::thread::sleep(Duration::from_secs(24 * 3600));
                     }
                 })
                 .ok();
 
-            // Background local library scanner & thumbnail worker (Task 1.2-c, 1.2-g)
-            // NOTE: must run on the tokio blocking pool (not a bare std::thread):
-            // the worker pools call `tokio::spawn`, which panics without a runtime context.
-            let handle_scan = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                let state = handle_scan.state::<AppState>();
+            app.state::<AppState>().start_thumb_backfill(app.handle());
 
-                // 1. Start background workers immediately so thumbnails generate right away
-                start_background_workers(&handle_scan);
+            let (edits, edits_rx) = mpsc::channel();
+            let _ = app.state::<AppState>().edit_pusher.set(edits);
+            let handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("frames-edit-push".into())
+                .spawn(move || {
+                    // Utility, not Background: macOS throttles background network traffic.
+                    frames_core::qos::set_current_thread(frames_core::qos::WorkClass::Utility);
+                    push_edits_when_quiet(handle, edits_rx);
+                })
+                .ok();
 
-                // 2. Scan all local roots first for immediate local availability
-                if let Ok(store) = state.store.lock() {
-                    let count = frames_core::scan_local::scan_all_local_roots(&store).unwrap_or(0);
-                    let _ = handle_scan.emit("scan-finished", serde_json::json!({ "count": count }));
-                };
-
-                // 3. For remote sync: list objects outside store lock so local UI is never blocked
-                if let Ok(s4) = state.require_s4() {
-                    let s4_clone = Arc::clone(&s4);
-                    if let Ok(objs) = s4_clone.list_objects("albums/") {
-                        if let Ok(store) = state.store.lock() {
-                            let handle_alb = handle_scan.clone();
-                            let _ = frames_core::sync::apply_remote_album_objects(&store, objs, move |album_id| {
-                                let _ = handle_alb.emit("album-synced", serde_json::json!({ "album_id": album_id }));
-                            });
-                            let _ = frames_core::scan_local::scan_all_local_roots(&store);
-                        }
+            // The UI syncs once at launch; this picks up unfinished imports
+            // shortly after, then keeps syncing every few minutes.
+            let handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("frames-background-sync".into())
+                .spawn(move || {
+                    frames_core::qos::set_current_thread(frames_core::qos::WorkClass::Background);
+                    std::thread::sleep(Duration::from_secs(5));
+                    resume_imports_in_background(&handle);
+                    loop {
+                        std::thread::sleep(BACKGROUND_SYNC_INTERVAL);
+                        background_sync(&handle);
                     }
-                }
-            });
-
+                })
+                .ok();
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -2467,6 +1627,8 @@ pub fn run() {
             move_to_album,
             get_search_suggestions,
             search_assets,
+            query_assets,
+            count_assets,
             get_trash,
             trash_assets,
             restore_assets,
@@ -2483,12 +1645,7 @@ pub fn run() {
             sync_now,
             toggle_offline_mode,
             save_settings,
-            set_local_roots,
-            get_local_roots,
-            scan_local_library,
-            prioritize,
             get_worker_status,
-            queue_upload,
             clear_local_cache,
             run_check_library,
             add_unknown_s4_files,
@@ -2508,116 +1665,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_uri_parsing_for_frames_protocol() {
-        let req1: tauri::http::Request<Vec<u8>> = tauri::http::Request::builder()
-            .uri("frames://thumb/317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d/256")
-            .body(Vec::new())
-            .unwrap();
-        let uri1 = req1.uri();
-        let raw_path1 = uri1.path().trim_start_matches('/');
-        let host1 = uri1.host().unwrap_or("");
-        let combined1 = if !host1.is_empty() && host1 != "localhost" && host1 != "frames.localhost" {
-            format!("{host1}/{raw_path1}")
-        } else {
-            raw_path1.to_string()
-        };
-        let segs1: Vec<&str> = combined1.split('/').filter(|s| !s.is_empty()).collect();
-        assert_eq!(segs1[0], "thumb");
-        assert_eq!(segs1[1], "317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d");
-        assert_eq!(segs1[2], "256");
-
-        let req2: tauri::http::Request<Vec<u8>> = tauri::http::Request::builder()
-            .uri("frames://localhost/photo/317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d")
-            .body(Vec::new())
-            .unwrap();
-        let uri2 = req2.uri();
-        let raw_path2 = uri2.path().trim_start_matches('/');
-        let host2 = uri2.host().unwrap_or("");
-        let combined2 = if !host2.is_empty() && host2 != "localhost" && host2 != "frames.localhost" {
-            format!("{host2}/{raw_path2}")
-        } else {
-            raw_path2.to_string()
-        };
-        let segs2: Vec<&str> = combined2.split('/').filter(|s| !s.is_empty()).collect();
-        assert_eq!(segs2[0], "photo");
-        assert_eq!(segs2[1], "317a28b060bbddd335621ac1934bf3446b32a772d159429480bce3c453a2154d");
-    }
-
-    #[test]
-    fn test_serve_file_with_range_behaviors() {
-        let tmp = std::env::temp_dir().join(format!("range-test-{}", fastrand::u64(..)));
-        fs::write(&tmp, b"0123456789abcdefghij").unwrap(); // 20 bytes
-
-        // 1. Regular GET request
-        let mut headers = tauri::http::HeaderMap::new();
-        let resp = serve_file_with_range(&tmp, &headers, &tauri::http::Method::GET);
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.body().len(), 20);
-
-        // 2. Standard byte range
-        headers.insert(header::RANGE, "bytes=0-4".parse().unwrap());
-        let resp = serve_file_with_range(&tmp, &headers, &tauri::http::Method::GET);
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(resp.body().as_slice(), b"01234");
-        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 0-4/20");
-
-        // 3. Suffix byte range: last 5 bytes
-        headers.insert(header::RANGE, "bytes=-5".parse().unwrap());
-        let resp = serve_file_with_range(&tmp, &headers, &tauri::http::Method::GET);
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(resp.body().as_slice(), b"fghij");
-        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 15-19/20");
-
-        // 4. Unsatisfiable range -> 416
-        headers.insert(header::RANGE, "bytes=50-100".parse().unwrap());
-        let resp = serve_file_with_range(&tmp, &headers, &tauri::http::Method::GET);
-        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes */20");
-
-        // 5. Open-ended image range: bytes=0- should return entire 20 bytes
-        let img_tmp = std::env::temp_dir().join(format!("range-img-test-{}.jpg", fastrand::u64(..)));
-        fs::write(&img_tmp, b"0123456789abcdefghij").unwrap();
-        let mut img_headers = tauri::http::HeaderMap::new();
-        img_headers.insert(header::RANGE, "bytes=0-".parse().unwrap());
-        let resp = serve_file_with_range(&img_tmp, &img_headers, &tauri::http::Method::GET);
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(resp.body().len(), 20);
-        assert_eq!(resp.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 0-19/20");
-        let _ = fs::remove_file(&img_tmp);
-
-        let _ = fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn test_resolve_local_media_path_checks_import_queue_without_sql_error() {
-        let tmp = std::env::temp_dir().join(format!("frames-resolve-test-{}", fastrand::u64(..)));
-        let state = AppState::init_with_dir(tmp.clone());
-        let photo_file = tmp.join("imported.jpg");
-        fs::write(&photo_file, b"testphoto").unwrap();
-
-        let asset_id = "test-asset-resolve-1";
-        {
-            let store = state.store.lock().unwrap();
-            let conn = store.connection();
-            conn.execute(
-                "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, thumb_state)
-                 VALUES (?1, 'photo', 'imported.jpg', 9, 'now', 'now', 'now', 'none')",
-                [asset_id],
-            ).unwrap();
-            conn.execute(
-                "INSERT INTO import_queue (path, size, mtime, state, asset_id)
-                 VALUES (?1, 9, 123456789, 'pending', ?2)",
-                [photo_file.to_str().unwrap(), asset_id],
-            ).unwrap();
-        }
-
-        let resolved = resolve_local_media_path(&state, asset_id);
-        assert_eq!(resolved, Some(photo_file));
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
     fn app_state_initialises_in_isolated_temp_dir_and_rejects_unconfigured_real_s4() {
         let tmp = std::env::temp_dir().join(format!("frames-shell-test-{}", fastrand::u64(..)));
         let state = AppState::init_with_dir(tmp.clone());
@@ -2632,6 +1679,7 @@ mod tests {
 
         // Explicitly switching `use_real_s4 = false` (Local Sandbox Mode) enables `demo_s4`.
         state.settings.lock().unwrap().use_real_s4 = false;
+        state.reset_s4();
         assert!(state.require_s4().is_ok());
         assert!(state.settings_view(dev_id).s4_configured);
 

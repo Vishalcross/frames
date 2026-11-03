@@ -3,7 +3,7 @@
   import Badge from '$lib/components/surface/Badge.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import VirtualGrid from '$lib/components/grid/VirtualGrid.svelte';
-  import type { Asset, Query } from '$lib/types';
+  import type { Asset, OpenPhoto, Query } from '$lib/types';
 
   let {
     searchQuery = $bindable(''),
@@ -13,7 +13,7 @@
   }: {
     searchQuery: string;
     activeScope?: 'all' | 'dates' | 'albums' | 'videos';
-    onopenphoto?: (asset: Asset) => void;
+    onopenphoto?: OpenPhoto;
     onclosesearch?: () => void;
   } = $props();
 

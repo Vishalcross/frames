@@ -110,18 +110,18 @@ pub fn derive_album_palette(palettes: &[Palette], tone: Tone) -> Palette {
 
 /// Query album assets, sample up to 60, extract/cache their palettes,
 /// generate the automatic album palette and persist it into the auto_* columns.
-pub fn generate_and_save_album_palette(conn: &Connection, album_id: &str) -> rusqlite::Result<Palette> {
-    // 1. Take the album's assets sorted by date using indexed UNION
+/// `cache_root` is the local cache root; palettes are read from its `s.webp` files.
+pub fn generate_and_save_album_palette(
+    conn: &Connection,
+    cache_root: &std::path::Path,
+    album_id: &str,
+) -> rusqlite::Result<Palette> {
+    // 1. Take the album's assets sorted by date
     let mut stmt = conn.prepare(
-        "SELECT a.id FROM (
-            SELECT s.id, s.taken_at FROM assets s
-            WHERE s.album_id = ?1 AND s.trashed_at IS NULL AND s.purged_at IS NULL
-            UNION
-            SELECT s.id, s.taken_at FROM album_items ai
-            JOIN assets s ON s.id = ai.asset_id
-            WHERE ai.album_id = ?1 AND ai.in_album = 1 AND s.trashed_at IS NULL AND s.purged_at IS NULL
-         ) a
-         ORDER BY a.taken_at DESC, a.id ASC",
+        "SELECT s.id FROM album_items ai
+         JOIN assets s ON s.id = ai.asset_id
+         WHERE ai.album_id = ?1 AND ai.in_album = 1 AND s.trashed_at IS NULL AND s.purged_at IS NULL
+         ORDER BY s.taken_at DESC, s.id ASC",
     )?;
     let asset_ids: Vec<String> = stmt
         .query_map([album_id], |r| r.get(0))?
@@ -170,9 +170,9 @@ pub fn generate_and_save_album_palette(conn: &Connection, album_id: &str) -> rus
         if let Ok(Some(pal)) = get_palette_from_db(conn, &id) {
             picked_palettes.push(pal);
         } else {
-            let thumb = crate::thumbs::thumb_path(&id, crate::thumbs::ThumbSize::Small);
+            let thumb = crate::cache::small_thumb_path_in(cache_root, &id);
             if thumb.exists() {
-                if let Ok(pal) = crate::palette::compute_and_store_palette(conn, &id) {
+                if let Ok(pal) = crate::palette::compute_and_store_palette(conn, cache_root, &id) {
                     picked_palettes.push(pal);
                 }
             }
@@ -251,7 +251,7 @@ mod tests {
         crate::store::Store::run_migrations(&conn).unwrap();
 
         // Empty album
-        let pal = generate_and_save_album_palette(&conn, "empty_album").expect("must not crash");
+        let pal = generate_and_save_album_palette(&conn, &std::env::temp_dir(), "empty_album").expect("must not crash");
         let fallback = fallback_palette(Tone::Dark);
         assert_eq!(pal.accent, fallback.accent);
         assert_eq!(pal.bg, fallback.bg);

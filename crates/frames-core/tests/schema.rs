@@ -77,17 +77,13 @@ fn fresh_db_migrations_run_twice_succeeds() {
     assert!(cols.contains("album_id"));
     assert!(cols.contains("relative_path"));
 
-    // Verify unique index on (album_id, relative_path) rejects duplicates
-    conn.execute(
-        "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, album_id, relative_path)
-         VALUES ('a1', 'photo', 'img1.jpg', 10, '2026-01-01T00:00:00Z', 'stamp', 'stamp', 'alb1', 'sub/img1.jpg')",
-        [],
-    ).unwrap();
-
-    let dup = conn.execute(
-        "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, album_id, relative_path)
-         VALUES ('a2', 'photo', 'img1.jpg', 10, '2026-01-01T00:00:00Z', 'stamp', 'stamp', 'alb1', 'sub/img1.jpg')",
-        [],
-    );
-    assert!(dup.is_err(), "Unique constraint on (album_id, relative_path) must reject duplicates");
+    // Two different files with one name in one folder are two assets
+    // (content-addressed ids); nothing keyed on the path may reject the second.
+    for id in ["a1", "a2"] {
+        conn.execute(
+            "INSERT INTO assets (id, kind, filename, size, taken_at, date_at, state_at, album_id, relative_path)
+             VALUES (?1, 'photo', 'img1.jpg', 10, '2026-01-01T00:00:00Z', 'stamp', 'stamp', 'alb1', 'sub/img1.jpg')",
+            [id],
+        ).unwrap();
+    }
 }

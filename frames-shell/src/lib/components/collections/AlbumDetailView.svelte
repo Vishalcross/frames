@@ -1,6 +1,6 @@
 <script lang="ts">
   import VirtualGrid from '$lib/components/grid/VirtualGrid.svelte';
-  import type { AlbumItem, Asset, Query, AssetRepo } from '$lib/types';
+  import type { AlbumItem, Query, AssetRepo, OpenPhoto } from '$lib/types';
   import { tauriRepo, getAssetUrl, isTauriAvailable } from '$lib/services/tauriRepo';
   import { focusAsset } from '$lib/theme/engine.svelte';
 
@@ -11,24 +11,44 @@
     isFill = $bindable(true),
     selectedIds = $bindable<Set<string>>(new Set()),
     onopenphoto,
-    onselectionchange
+    onselectionchange,
+    ondelete,
+    version = 0
   }: {
     album: AlbumItem;
     repo?: AssetRepo;
     zoomLevelIndex?: number;
     isFill?: boolean;
     selectedIds?: Set<string>;
-    onopenphoto?: (asset: Asset) => void;
+    onopenphoto?: OpenPhoto;
     onselectionchange?: (ids: Set<string>) => void;
+    /** Asks the page to confirm and delete this album. */
+    ondelete?: (album: AlbumItem) => void;
+    /** Bump to refresh the grid in place (see VirtualGrid). */
+    version?: number;
   } = $props();
 
   import { onMount } from 'svelte';
   import AlbumThemeSettings from './AlbumThemeSettings.svelte';
+  import ContextMenu from '$lib/components/surface/ContextMenu.svelte';
+  import type { MenuItem } from '$lib/components/surface/Menu.svelte';
+  import Icon from '$lib/components/icons/Icon.svelte';
   import { handleViewedPhotoChange } from '$lib/adaptive';
 
   let heroFallback = $state<string | null>(null);
   let countOverride = $state<number | null>(null);
   let settingsOpen = $state(false);
+  let moreMenuOpen = $state(false);
+  // The menu opens below the button's right edge; it lives at the top level so
+  // the hero's overflow cannot clip it.
+  let moreMenuAt = $state({ x: 0, y: 0 });
+  const moreMenuItems: MenuItem[] = [
+    { id: 'delete', label: 'Delete Album', icon: 'trash', danger: true }
+  ];
+
+  function handleMoreSelect(item: MenuItem) {
+    if (item.id === 'delete') ondelete?.(album);
+  }
   const assetCount = $derived(countOverride ?? album.assetCount);
 
   $effect(() => {
@@ -71,20 +91,11 @@
     let unlistens: Array<() => void> = [];
 
     import('@tauri-apps/api/event').then(({ listen }) => {
-      listen<{ album_id?: string }>('album-synced', (ev) => {
-        if (!ev.payload?.album_id || ev.payload.album_id === album.id) {
-          tauriRepo.getAlbumAssetCount(album.id).then((cnt) => {
-            countOverride = cnt;
-          });
-          logDebugIfEnabled(album.id);
-        }
-      }).then((un) => unlistens.push(un));
-
-      listen('scan-finished', () => {
+      // Imports add to albums while they run; keep the count current.
+      listen('frames://import-progress', () => {
         tauriRepo.getAlbumAssetCount(album.id).then((cnt) => {
           countOverride = cnt;
         });
-        logDebugIfEnabled(album.id);
       }).then((un) => unlistens.push(un));
     });
 
@@ -147,6 +158,32 @@
           >
             🎨 Theme
           </button>
+          {#if ondelete}
+            <div class="more-menu-wrap">
+              <button
+                type="button"
+                class="album-settings-btn"
+                aria-label="More album actions"
+                aria-haspopup="menu"
+                aria-expanded={moreMenuOpen}
+                onclick={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  moreMenuAt = { x: r.right, y: r.bottom + 6 };
+                  moreMenuOpen = !moreMenuOpen;
+                }}
+              >
+                <Icon name="more-horizontal" size={16} />
+              </button>
+              <ContextMenu
+                items={moreMenuItems}
+                bind:open={moreMenuOpen}
+                x={moreMenuAt.x}
+                y={moreMenuAt.y}
+                align="right"
+                onselect={handleMoreSelect}
+              />
+            </div>
+          {/if}
         </div>
       </div>
     </div>
@@ -162,6 +199,7 @@
       bind:selectedIds
       {onopenphoto}
       {onselectionchange}
+      {version}
     />
   </div>
 
@@ -285,6 +323,16 @@
 
   .album-settings-btn:hover {
     background: rgba(255, 255, 255, 0.3);
+  }
+
+  .hero-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .more-menu-wrap {
+    position: relative;
   }
 
   .settings-popover-backdrop {

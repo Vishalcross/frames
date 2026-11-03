@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::keys::{thumb_preview_key, thumb_small_key};
+use crate::keys::thumb_small_key;
 use crate::s4::{ObjectStore, Result as S4Result};
 
 /// Default LRU cap for `m.webp` previews and originals: 10 GB (spec section 9 & 10).
@@ -31,6 +31,28 @@ pub struct CacheStats {
     pub lru_entry_count: usize,
     pub lru_used_bytes: u64,
     pub lru_limit_bytes: u64,
+}
+
+/// Path of the permanent `s.webp` for `id` under a cache `root`
+/// (`thumbs_s/<first two chars>/<id>.webp`). A pure function, so readers never
+/// need the cache mutex to check for or serve a small thumbnail.
+pub fn small_thumb_path_in(root: &Path, id: &str) -> PathBuf {
+    let prefix: String = id.chars().take(2).collect();
+    let sub = if prefix.is_empty() { "00" } else { &prefix };
+    root.join("thumbs_s").join(sub).join(format!("{id}.webp"))
+}
+
+/// Write through a temp file and rename, so a crash or a concurrent reader
+/// never sees a half-written thumbnail.
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp{}", fastrand::u64(..)));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 pub struct LocalCache {
@@ -81,6 +103,11 @@ impl LocalCache {
                     continue;
                 }
                 let fname = entry.file_name().to_string_lossy().to_string();
+                if entry.path().extension().is_some_and(|e| e.to_string_lossy().starts_with("tmp")) {
+                    // Left behind by a write interrupted before its rename.
+                    let _ = fs::remove_file(entry.path());
+                    continue;
+                }
                 let rel_path = format!("{sub}/{fname}");
                 let size_bytes = meta.len();
                 self.access_counter += 1;
@@ -103,9 +130,7 @@ impl LocalCache {
     // =========================================================================
 
     fn small_thumb_path(&self, id: &str) -> PathBuf {
-        let prefix: String = id.chars().take(2).collect();
-        let sub = if prefix.is_empty() { "00" } else { &prefix };
-        self.root.join("thumbs_s").join(sub).join(format!("{id}.webp"))
+        small_thumb_path_in(&self.root, id)
     }
 
     pub fn has_small_thumb(&self, id: &str) -> bool {
@@ -123,10 +148,7 @@ impl LocalCache {
 
     pub fn put_small_thumb(&self, id: &str, bytes: &[u8]) -> io::Result<PathBuf> {
         let path = self.small_thumb_path(id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, bytes)?;
+        write_atomically(&path, bytes)?;
         Ok(path)
     }
 
@@ -188,19 +210,6 @@ impl LocalCache {
         self.put_lru_entry(&rel, bytes)
     }
 
-    /// Fetch `m.webp` from local LRU cache, or download from S4 and cache it on demand.
-    pub fn get_or_fetch_preview(&mut self, s4: &dyn ObjectStore, id: &str) -> S4Result<Option<PathBuf>> {
-        if let Some(p) = self.get_preview_path(id) {
-            return Ok(Some(p));
-        }
-        let key = thumb_preview_key(id);
-        if let Some(bytes) = s4.get_object(&key)? {
-            let p = self.put_preview(id, &bytes)?;
-            return Ok(Some(p));
-        }
-        Ok(None)
-    }
-
     pub fn get_original_path(&mut self, id: &str, filename: &str) -> Option<PathBuf> {
         let rel = Self::original_rel_path(id, filename);
         self.touch_lru(&rel)
@@ -247,25 +256,6 @@ impl LocalCache {
         self.put_lru_entry(&rel, bytes)
     }
 
-    /// Fetch an original file from local LRU cache, or stream it directly from S4
-    /// (`s4_key`) to disk without buffering the entire file in RAM.
-    pub fn get_or_fetch_original(
-        &mut self,
-        s4: &dyn ObjectStore,
-        id: &str,
-        filename: &str,
-        s4_key: &str,
-    ) -> S4Result<Option<PathBuf>> {
-        if let Some(p) = self.get_original_path(id, filename) {
-            return Ok(Some(p));
-        }
-        let full = self.original_disk_path(id, filename);
-        if s4.get_object_to_file(s4_key, &full)? {
-            return Ok(self.register_downloaded_original(id, filename)?);
-        }
-        Ok(None)
-    }
-
     fn touch_lru(&mut self, rel_path: &str) -> Option<PathBuf> {
         let full = self.root.join(rel_path);
         if !full.is_file() {
@@ -290,10 +280,7 @@ impl LocalCache {
         self.evict_until_within(new_size)?;
 
         let full = self.root.join(rel_path);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&full, bytes)?;
+        write_atomically(&full, bytes)?;
 
         self.access_counter += 1;
         self.lru_used_bytes += new_size;

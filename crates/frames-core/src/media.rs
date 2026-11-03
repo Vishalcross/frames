@@ -11,10 +11,10 @@
 //!   duration, and Apple Live Photo `ContentIdentifier`), supplemented by
 //!   `ffprobe` when available on the system.
 //! - Embedded JPEG preview extraction from RAW files (TIFF/DNG/CR2/NEF/ARW/CR3).
-//! - EXIF orientation transformation (`1..=8`), aspect-preserving resize for
-//!   `s.webp` (short edge ~300 px) and `m.webp` (long edge ~1600 px), WebP
-//!   encoding (`ffmpeg` when present, pure-Rust VP8L lossless WebP fallback),
-//!   and placeholder thumbnail generation (`thumb_failed = true`) on decode failure.
+//! - Thumbnails: in-process decode with EXIF orientation, aspect-preserving
+//!   resize for `s.webp` (short edge ~300 px) and `m.webp` (long edge ~1600 px),
+//!   lossy WebP via libwebp; `ffmpeg` for HEIC and video frames; placeholder
+//!   thumbnails (`thumb_failed = true`) on decode failure.
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -97,6 +97,16 @@ pub fn is_heic_extension(ext: &str) -> bool {
 /// 4. Platform-specific fallback paths (macOS `/opt/homebrew/bin`, Windows standard paths).
 /// 5. System `PATH`.
 pub fn resolve_tool_binary(tool: &str) -> std::path::PathBuf {
+    resolve_tool_binary_with_env(tool, |name| std::env::var(name).ok())
+}
+
+/// [`resolve_tool_binary`] with the environment lookup passed in, so tests can
+/// supply an override without changing the process environment that other,
+/// concurrently running tests resolve `ffmpeg` from.
+fn resolve_tool_binary_with_env(
+    tool: &str,
+    env_var: impl Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
     // If an existing file path was passed directly, return it immediately.
     let direct_path = std::path::Path::new(tool);
     if direct_path.is_file() {
@@ -112,7 +122,7 @@ pub fn resolve_tool_binary(tool: &str) -> std::path::PathBuf {
     };
 
     let env_var_name = format!("FRAMES_{}_PATH", clean_tool.to_ascii_uppercase());
-    if let Ok(val) = std::env::var(&env_var_name) {
+    if let Some(val) = env_var(&env_var_name) {
         let p = std::path::PathBuf::from(val);
         if p.is_file() {
             return p;
@@ -259,14 +269,42 @@ pub fn resolve_tool_binary(tool: &str) -> std::path::PathBuf {
 /// and setting `CREATE_NO_WINDOW` (`0x0800_0000`) on Windows so console windows never flash.
 pub fn spawn_hidden_command(tool: &str) -> Command {
     let bin = resolve_tool_binary(tool);
+    // A tool launched for background work (an import's decoder, the
+    // thumbnail backfill's ffmpeg) runs at that work's priority, not the UI's.
+    let class = crate::qos::current();
+    #[cfg(target_os = "macos")]
+    let cmd = match class {
+        Some(class) => {
+            // taskpolicy applies the clamp and then execs the tool in place.
+            let mut cmd = Command::new("/usr/sbin/taskpolicy");
+            cmd.arg("-c")
+                .arg(match class {
+                    crate::qos::WorkClass::Utility => "utility",
+                    crate::qos::WorkClass::Background => "background",
+                })
+                .arg(bin);
+            cmd
+        }
+        None => Command::new(bin),
+    };
+    #[cfg(not(target_os = "macos"))]
     #[allow(unused_mut)]
     let mut cmd = Command::new(bin);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+        let priority = match class {
+            Some(crate::qos::WorkClass::Utility) => BELOW_NORMAL_PRIORITY_CLASS,
+            Some(crate::qos::WorkClass::Background) => IDLE_PRIORITY_CLASS,
+            None => 0,
+        };
+        cmd.creation_flags(CREATE_NO_WINDOW | priority);
     }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = class;
     cmd
 }
 
@@ -519,6 +557,12 @@ fn parse_webp(bytes: &[u8], meta: &mut MediaMetadata) {
             let bits = LittleEndian::read_u32(&data[1..5]);
             let w = (bits & 0x3FFF) + 1;
             let h = ((bits >> 14) & 0x3FFF) + 1;
+            meta.width.get_or_insert(w);
+            meta.height.get_or_insert(h);
+        } else if chunk_id == b"VP8 " && data.len() >= 10 && data[3..6] == [0x9d, 0x01, 0x2a] {
+            // Lossy key frame: 3-byte frame tag, start code, then 14-bit sizes.
+            let w = u32::from(LittleEndian::read_u16(&data[6..8]) & 0x3FFF);
+            let h = u32::from(LittleEndian::read_u16(&data[8..10]) & 0x3FFF);
             meta.width.get_or_insert(w);
             meta.height.get_or_insert(h);
         } else if chunk_id == b"EXIF" {
@@ -1674,8 +1718,10 @@ pub fn decode_png_rgb(bytes: &[u8]) -> Option<RgbImage> {
 }
 
 /// Generate `s.webp` and `m.webp` thumbnails for `path` (spec section 7, step 5):
-/// 1. Try pure-Rust PNG decode (or embedded RAW JPEG preview + `ffmpeg`).
-/// 2. Try `ffmpeg` (extracting frame at ~1 s for videos, applying orientation).
+/// 1. Photos the `image` crate can read (JPEG, PNG, WebP, TIFF, GIF, and a RAW
+///    file's embedded JPEG) are decoded once in-process, oriented, resized to
+///    both sizes and encoded as lossy WebP.
+/// 2. Everything else (HEIC, video, undecodable files) goes through `ffmpeg`.
 /// 3. Fall back to `placeholder_thumbnails()` with `thumb_failed = true`.
 pub fn generate_thumbnails(
     path: impl AsRef<Path>,
@@ -1683,31 +1729,18 @@ pub fn generate_thumbnails(
     meta: &MediaMetadata,
 ) -> ThumbnailPair {
     let path = path.as_ref();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
 
-    // 1. Try pure-Rust PNG path first only for PNG photos (never read multi-GB videos into RAM!)
-    if kind == AssetKind::Photo && ext == "png" {
-        if let Ok(bytes) = std::fs::read(path) {
-            if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                if let Some(raw_img) = decode_png_rgb(&bytes) {
-                    let oriented = apply_exif_orientation(&raw_img, meta.orientation);
-                    let small_img = resize_short_edge(&oriented, SMALL_THUMB_SHORT_EDGE);
-                    let preview_img = resize_long_edge(&oriented, PREVIEW_THUMB_LONG_EDGE);
-                    return ThumbnailPair {
-                        small_webp: encode_webp_lossless(&small_img),
-                        preview_webp: encode_webp_lossless(&preview_img),
-                        thumb_failed: false,
-                    };
-                }
-            }
+    if kind != AssetKind::Video {
+        // Decoders run on arbitrary files; a panic on a corrupt one falls
+        // through to ffmpeg and the placeholder instead of ending the app.
+        let decoded = std::panic::catch_unwind(|| {
+            decode_photo_oriented(path, meta.orientation).map(|img| thumbnails_from_image(&img))
+        });
+        if let Ok(Some(pair)) = decoded {
+            return pair;
         }
     }
 
-    // 2. Try ffmpeg for photos/videos
     if let Some((small_webp, preview_webp)) = generate_thumbnails_via_ffmpeg(path, kind, meta) {
         return ThumbnailPair {
             small_webp,
@@ -1716,8 +1749,134 @@ pub fn generate_thumbnails(
         };
     }
 
-    // 3. Fallback placeholder with thumb_failed = true
     placeholder_thumbnails()
+}
+
+/// WebP quality for both thumbnail sizes. 80 keeps `s.webp` near the spec's
+/// ~25 KB estimate (section 10).
+const THUMB_WEBP_QUALITY: f32 = 80.0;
+
+/// Decode a photo with the `image` crate and apply its orientation. The
+/// decoder's own EXIF orientation wins; `fallback_orientation` (from
+/// [`read_metadata`]) covers RAW previews, whose orientation lives in the RAW
+/// container rather than the embedded JPEG. HEIC, and RAW files without an
+/// embedded preview, go through the system decoder on macOS. Returns `None`
+/// for what none of these can read, so the caller can fall back to `ffmpeg`.
+fn decode_photo_oriented(path: &Path, fallback_orientation: u16) -> Option<image::DynamicImage> {
+    use image::ImageReader;
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_heic_extension(&ext) {
+        return decode_with_system(path);
+    }
+    if is_raw_extension(&ext) {
+        let raw_bytes = std::fs::read(path).ok()?;
+        let preview = extract_embedded_jpeg(&raw_bytes)
+            .and_then(|jpeg| ImageReader::new(io::Cursor::new(jpeg)).with_guessed_format().ok())
+            .and_then(|reader| decode_reader_oriented(reader, fallback_orientation));
+        // Phone DNGs often carry no usable preview (only lossless-JPEG sensor
+        // data). Developing the RAW is slow, tens of seconds for 100 MB, but
+        // happens once per photo.
+        return preview.or_else(|| decode_with_system(path));
+    }
+    let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    decode_reader_oriented(reader, fallback_orientation)
+}
+
+fn decode_reader_oriented<R: io::BufRead + io::Seek>(
+    reader: image::ImageReader<R>,
+    fallback_orientation: u16,
+) -> Option<image::DynamicImage> {
+    use image::{metadata::Orientation, DynamicImage, ImageDecoder};
+
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = match decoder.orientation() {
+        Ok(o) if o != Orientation::NoTransforms => o,
+        _ => u8::try_from(fallback_orientation)
+            .ok()
+            .and_then(Orientation::from_exif)
+            .unwrap_or(Orientation::NoTransforms),
+    };
+    let mut img = DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    Some(img)
+}
+
+/// Decode with the operating system's image stack. iPhone HEIC photos are
+/// grids of HEVC tiles that ffmpeg (6.x, and 8.x's command line) does not
+/// reassemble: it returns one 512 px tile. macOS decodes HEIC and RAW with
+/// ImageIO, reached through `sips`, which writes a JPEG at preview size that
+/// keeps the EXIF orientation. Other systems return `None`.
+fn decode_with_system(path: &Path) -> Option<image::DynamicImage> {
+    #[cfg(target_os = "macos")]
+    {
+        let tmp = std::env::temp_dir().join(format!("frames-heic-{}.jpg", fastrand::u64(..)));
+        let converted = spawn_hidden_command("/usr/bin/sips")
+            .args(["-s", "format", "jpeg", "-s", "formatOptions", "92", "-Z"])
+            .arg(PREVIEW_THUMB_LONG_EDGE.to_string())
+            .arg(path)
+            .arg("--out")
+            .arg(&tmp)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let img = converted
+            .then(|| image::ImageReader::open(&tmp).ok()?.with_guessed_format().ok())
+            .flatten()
+            .and_then(|reader| decode_reader_oriented(reader, 1));
+        let _ = std::fs::remove_file(&tmp);
+        img
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Resize an oriented photo to `m.webp` (long edge 1600) and `s.webp` (short
+/// edge 300), never upscaling, and encode both as lossy WebP.
+fn thumbnails_from_image(img: &image::DynamicImage) -> ThumbnailPair {
+    use image::imageops::FilterType;
+
+    let (w, h) = (img.width().max(1), img.height().max(1));
+
+    // Area-averaging `thumbnail` is fast for the big first step down.
+    let preview = if w.max(h) > PREVIEW_THUMB_LONG_EDGE {
+        img.thumbnail(PREVIEW_THUMB_LONG_EDGE, PREVIEW_THUMB_LONG_EDGE)
+    } else {
+        img.clone()
+    };
+
+    let (pw, ph) = (preview.width().max(1), preview.height().max(1));
+    let short = pw.min(ph);
+    let small = if short > SMALL_THUMB_SHORT_EDGE {
+        let scale = f64::from(SMALL_THUMB_SHORT_EDGE) / f64::from(short);
+        let sw = ((f64::from(pw) * scale).round() as u32).max(1);
+        let sh = ((f64::from(ph) * scale).round() as u32).max(1);
+        preview.resize_exact(sw, sh, FilterType::Triangle)
+    } else {
+        preview.clone()
+    };
+
+    ThumbnailPair {
+        small_webp: encode_webp_lossy(&small),
+        preview_webp: encode_webp_lossy(&preview),
+        thumb_failed: false,
+    }
+}
+
+fn encode_webp_lossy(img: &image::DynamicImage) -> Vec<u8> {
+    let rgb = img.to_rgb8();
+    webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+        .encode(THUMB_WEBP_QUALITY)
+        .to_vec()
 }
 
 fn generate_thumbnails_via_ffmpeg(
@@ -2161,6 +2320,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn tools_launched_from_background_work_inherit_its_priority() {
+        let program = std::thread::spawn(|| {
+            crate::qos::set_current_thread(crate::qos::WorkClass::Background);
+            spawn_hidden_command("/bin/echo").get_program().to_owned()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(program, "/usr/sbin/taskpolicy");
+        // Interactive work (this test thread) launches tools directly.
+        assert_eq!(spawn_hidden_command("/bin/echo").get_program(), "/bin/echo");
+    }
+
+    #[test]
     fn resolve_tool_binary_finds_bundled_ffmpeg_and_ffprobe() {
         let ffmpeg = resolve_tool_binary("ffmpeg");
         assert!(
@@ -2181,12 +2354,13 @@ mod tests {
     fn resolve_tool_binary_respects_env_override() {
         let dummy = std::env::temp_dir().join(format!("dummy-ffmpeg-{}", fastrand::u64(..)));
         std::fs::write(&dummy, b"dummy binary").unwrap();
-        std::env::set_var("FRAMES_FFMPEG_PATH", &dummy);
+        let env = |name: &str| {
+            (name == "FRAMES_FFMPEG_PATH").then(|| dummy.to_string_lossy().to_string())
+        };
 
-        let resolved = resolve_tool_binary("ffmpeg");
+        let resolved = resolve_tool_binary_with_env("ffmpeg", env);
         assert_eq!(resolved, dummy);
 
-        std::env::remove_var("FRAMES_FFMPEG_PATH");
         let _ = std::fs::remove_file(&dummy);
     }
 

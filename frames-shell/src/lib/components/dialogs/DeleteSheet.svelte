@@ -2,15 +2,23 @@
   import Surface from '$lib/components/surface/Surface.svelte';
   import Button from '$lib/components/surface/Button.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
+  import { portal } from '$lib/actions/portal';
 
   let {
     open = $bindable(false),
     count = 1,
+    title,
+    description = 'This item will be deleted from all your synced devices and moved to Recently Deleted, where it will remain for 30 days before being permanently removed from MEGA S4.',
+    confirmLabel = 'Delete from All Devices',
     onconfirm,
     oncancel
   }: {
     open: boolean;
     count?: number;
+    /** Overrides the default "Delete N Photos?" heading. */
+    title?: string;
+    description?: string;
+    confirmLabel?: string;
     onconfirm?: () => void;
     oncancel?: () => void;
   } = $props();
@@ -27,7 +35,7 @@
 </script>
 
 {#if open}
-  <div class="sheet-modal-backdrop" onclick={(e) => { if (e.target === e.currentTarget) handleCancel(); }} role="presentation">
+  <div use:portal class="sheet-modal-backdrop" onclick={(e) => { if (e.target === e.currentTarget) handleCancel(); }} role="presentation">
     <div class="sheet-container" role="dialog" aria-modal="true" tabindex="-1">
       <Surface kind="sheet" class="delete-sheet-surface">
         <div class="delete-sheet-icon">
@@ -35,16 +43,14 @@
         </div>
 
         <h3 class="delete-sheet-title">
-          Delete {count} {count === 1 ? 'Photo' : 'Photos'}?
+          {title ?? `Delete ${count} ${count === 1 ? 'Photo' : 'Photos'}?`}
         </h3>
 
-        <p class="delete-sheet-desc">
-          This item will be deleted from all your synced devices and moved to Recently Deleted, where it will remain for 30 days before being permanently removed from MEGA S4.
-        </p>
+        <p class="delete-sheet-desc">{description}</p>
 
         <div class="delete-sheet-actions">
           <Button variant="danger" onclick={handleConfirm}>
-            Delete from All Devices
+            {confirmLabel}
           </Button>
           <Button variant="ghost" onclick={handleCancel}>
             Cancel

@@ -11,11 +11,14 @@ import type {
 } from '$lib/types';
 import {
   computeTonalRoles,
+  rolesFromPhotoPalette,
+  rolesFromPhotoSeeds,
   selectSeedAndSecondary,
-  oklchToCss
+  oklchToCss,
+  type ComputedPaletteRoles,
+  type PhotoPalette
 } from './palette';
 import { detectGlassTier, resolveGlassForeground, setForceGovernorLevel } from './glass';
-import { clearAdaptivePalette, restoreAdaptivePalette } from '$lib/adaptive';
 
 /**
  * Theme Engine (§5.4)
@@ -90,6 +93,29 @@ export function registerAssetPalette(id: string, swatches: OklchColor[], lum: nu
   assetPaletteCache.set(id, { swatches, lum });
 }
 
+// The open photo's (or album's) palette for the Adaptive appearance. While
+// set it is the only source of colour; null means the neutral palette.
+let photoPalette: PhotoPalette | null = null;
+
+/** Give the Adaptive appearance a photo or album palette, or `null` for the neutral one. */
+export function setPhotoPalette(p: PhotoPalette | null): void {
+  photoPalette = p;
+  syncDOM();
+}
+
+// Browsing focus ("Viewer and browsing"): the photo under the pointer or at
+// the centre of the scroll. The palette lookup lives in $lib/adaptive.
+let browsingFocusHandler: ((assetId: string) => void) | null = null;
+
+export function onBrowsingFocus(handler: (assetId: string) => void): void {
+  browsingFocusHandler = handler;
+}
+
+function browsingFocus(id: string): void {
+  if (theme.appearance !== 'adaptive' || theme.colourSource !== 'both' || activeViewerAssetId) return;
+  browsingFocusHandler?.(id);
+}
+
 let activeViewerAssetId: string | null = null;
 let activeDetailAssetId: string | null = null;
 let hoverDwellTimer: any = null;
@@ -105,6 +131,25 @@ export function focusAsset(
 ): void {
   if (opts.swatches) {
     registerAssetPalette(id || 'temp', opts.swatches, opts.lum ?? 0.5);
+  }
+  // Without swatches cached here, the real palette comes from the backend:
+  // the viewer's through $lib/adaptive, browsing's through browsingFocus.
+  if (!id || !assetPaletteCache.has(id)) {
+    if (opts.source === 'viewer') activeViewerAssetId = id;
+    if (!id || activeViewerAssetId) return;
+    if (opts.source === 'hover') {
+      if (hoverDwellTimer) clearTimeout(hoverDwellTimer);
+      // Rest on a photo before the app takes its colour (§7.6 #3).
+      hoverDwellTimer = setTimeout(() => browsingFocus(id), 400);
+    } else if (opts.source === 'scroll') {
+      const now = performance.now();
+      // Follow the scroll at most every 800 ms so colours do not strobe.
+      if (now - lastScrollSeedTimestamp >= 800) {
+        lastScrollSeedTimestamp = now;
+        browsingFocus(id);
+      }
+    }
+    return;
   }
 
   if (opts.source === 'viewer') {
@@ -205,6 +250,11 @@ export function syncDOM(): void {
   } else if (theme.scheme === 'light' || theme.scheme === 'dark') {
     resolved.scheme = theme.scheme;
   }
+  // Colours chosen for an album bring their own background, so their scheme
+  // decides; photo palettes are re-toned to the scheme instead.
+  const fromPhoto =
+    theme.appearance === 'adaptive' && photoPalette?.exact ? rolesFromPhotoPalette(photoPalette) : null;
+  if (fromPhoto) resolved.scheme = fromPhoto.scheme;
 
   // Detect Tier
   resolved.tier = detectGlassTier();
@@ -234,69 +284,58 @@ export function syncDOM(): void {
   }
 }
 
+/** Theme tokens the Adaptive appearance writes inline, and the role behind each. */
+const ADAPTIVE_TOKENS: [string, keyof ComputedPaletteRoles][] = [
+  ['--bg-canvas', 'bgCanvas'],
+  ['--bg-sidebar', 'bgSidebar'],
+  ['--sidebar-bg', 'bgSidebar'],
+  ['--sidebar-border', 'separator'],
+  ['--bg-viewer', 'bgViewer'],
+  ['--surface-raised', 'surfaceRaised'],
+  ['--surface-overlay', 'surfaceOverlay'],
+  ['--fill-1', 'fill1'],
+  ['--fill-2', 'fill2'],
+  ['--fill-3', 'fill3'],
+  ['--text-1', 'text1'],
+  ['--text-2', 'text2'],
+  ['--text-3', 'text3'],
+  ['--separator', 'separator'],
+  ['--accent', 'accent'],
+  ['--accent-fg', 'accentFg'],
+  ['--ad-ambient-1', 'ambient1'],
+  ['--ad-ambient-2', 'ambient2']
+];
+
 function syncDOMTokens(): void {
   if (typeof document === 'undefined') return;
   const root = document.documentElement;
 
   if (theme.appearance === 'adaptive') {
-    restoreAdaptivePalette();
-    const hasAdaptiveBg = root.style.getPropertyValue('--adaptive-bg');
-    if (!hasAdaptiveBg && resolved.palette) {
+    // One source for every token: the photo palette when there is one,
+    // otherwise the seed's tonal roles for the resolved scheme.
+    const highContrast = root.getAttribute('data-contrast') === 'more';
+    let roles: ComputedPaletteRoles | null = null;
+    if (photoPalette?.exact) {
+      roles = rolesFromPhotoPalette(photoPalette)?.roles ?? null;
+    } else if (photoPalette) {
+      roles = rolesFromPhotoSeeds(photoPalette, resolved.scheme, theme.intensity, highContrast);
+    }
+    if (!roles && resolved.palette) {
       const isBrowsingOnly = theme.colourSource === 'viewer' && !activeViewerAssetId;
-      const intensity = isBrowsingOnly ? 'subtle' : theme.intensity;
-      const highContrast = root.getAttribute('data-contrast') === 'more';
-
-      const roles = computeTonalRoles(
+      roles = computeTonalRoles(
         resolved.palette.seed,
         resolved.palette.secondary,
         resolved.scheme,
-        intensity,
+        isBrowsingOnly ? 'subtle' : theme.intensity,
         highContrast
       );
-
-      // Apply variables to root for smooth CSS transition
-      root.style.setProperty('--bg-canvas', roles.bgCanvas);
-      root.style.setProperty('--bg-sidebar', roles.bgSidebar);
-      root.style.setProperty('--sidebar-bg', roles.bgSidebar);
-      root.style.setProperty('--sidebar-border', roles.separator);
-      root.style.setProperty('--bg-viewer', roles.bgViewer);
-      root.style.setProperty('--surface-raised', roles.surfaceRaised);
-      root.style.setProperty('--surface-overlay', roles.surfaceOverlay);
-      root.style.setProperty('--fill-1', roles.fill1);
-      root.style.setProperty('--fill-2', roles.fill2);
-      root.style.setProperty('--fill-3', roles.fill3);
-      root.style.setProperty('--text-1', roles.text1);
-      root.style.setProperty('--text-2', roles.text2);
-      root.style.setProperty('--text-3', roles.text3);
-      root.style.setProperty('--separator', roles.separator);
-      root.style.setProperty('--accent', roles.accent);
-      root.style.setProperty('--accent-fg', roles.accentFg);
-      root.style.setProperty('--ad-ambient-1', roles.ambient1);
-      root.style.setProperty('--ad-ambient-2', roles.ambient2);
+    }
+    if (roles) {
+      for (const [token, role] of ADAPTIVE_TOKENS) root.style.setProperty(token, roles[role]);
     }
   } else {
-    // When not in adaptive mode, remove all five adaptive variables (Task 4-h #6)
-    clearAdaptivePalette();
-
     // Reset inline overrides so stylesheet tokens apply cleanly
-    root.style.removeProperty('--bg-canvas');
-    root.style.removeProperty('--bg-sidebar');
-    root.style.removeProperty('--sidebar-bg');
-    root.style.removeProperty('--sidebar-border');
-    root.style.removeProperty('--bg-viewer');
-    root.style.removeProperty('--surface-raised');
-    root.style.removeProperty('--surface-overlay');
-    root.style.removeProperty('--fill-1');
-    root.style.removeProperty('--fill-2');
-    root.style.removeProperty('--fill-3');
-    root.style.removeProperty('--text-1');
-    root.style.removeProperty('--text-2');
-    root.style.removeProperty('--text-3');
-    root.style.removeProperty('--separator');
-    root.style.removeProperty('--accent');
-    root.style.removeProperty('--accent-fg');
-    root.style.removeProperty('--ad-ambient-1');
-    root.style.removeProperty('--ad-ambient-2');
+    for (const [token] of ADAPTIVE_TOKENS) root.style.removeProperty(token);
   }
 
   if (theme.appearance === 'glass') {

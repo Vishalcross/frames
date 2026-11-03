@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::AppState;
 use frames_core::{AlbumTheme, Palette};
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_palette(
     state: State<'_, AppState>,
     asset_id: String,
@@ -19,9 +19,9 @@ pub fn get_palette(
     }
 
     // 2. If row is missing and thumbnail exists, compute now and store
-    let thumb = frames_core::thumbs::thumb_path(&asset_id, frames_core::thumbs::ThumbSize::Small);
-    if thumb.exists() {
-        if let Ok(pal) = frames_core::palette::compute_and_store_palette(conn, &asset_id) {
+    let cache_root = state.thumbs.cache_root();
+    if state.thumbs.small_thumb_path(&asset_id).exists() {
+        if let Ok(pal) = frames_core::palette::compute_and_store_palette(conn, cache_root, &asset_id) {
             return Ok(Some(pal));
         }
     }
@@ -30,7 +30,7 @@ pub fn get_palette(
     Ok(None)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_album_theme(
     state: State<'_, AppState>,
     album_id: String,
@@ -40,7 +40,7 @@ pub fn get_album_theme(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_asset_album_id(
     state: State<'_, AppState>,
     asset_id: String,
@@ -61,7 +61,7 @@ pub fn get_asset_album_id(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_album_theme(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -88,9 +88,10 @@ pub fn set_album_theme(
         let app_handle = app.clone();
         let alb_id = album_id.clone();
         let store_arc = Arc::clone(&state.store);
+        let cache_root = state.thumbs.cache_root().to_path_buf();
         tauri::async_runtime::spawn_blocking(move || {
             if let Ok(store) = store_arc.lock() {
-                if frames_core::album_palette::generate_and_save_album_palette(store.connection(), &alb_id).is_ok() {
+                if frames_core::album_palette::generate_and_save_album_palette(store.connection(), &cache_root, &alb_id).is_ok() {
                     let _ = app_handle.emit("album-palette-ready", serde_json::json!({ "album_id": alb_id }));
                 }
             }
@@ -100,7 +101,7 @@ pub fn set_album_theme(
     Ok(theme)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn regenerate_album_palette(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -120,10 +121,11 @@ pub fn regenerate_album_palette(
     let app_handle = app.clone();
     let alb_id = album_id.clone();
     let store_arc = Arc::clone(&state.store);
+    let cache_root = state.thumbs.cache_root().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
         let is_ok = {
             if let Ok(store) = store_arc.lock() {
-                frames_core::album_palette::generate_and_save_album_palette(store.connection(), &alb_id).is_ok()
+                frames_core::album_palette::generate_and_save_album_palette(store.connection(), &cache_root, &alb_id).is_ok()
             } else {
                 false
             }

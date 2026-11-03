@@ -72,8 +72,23 @@ Inside `Frames.app/Contents/MacOS/`:
 - `ffmpeg` (Bundled static transcoder)
 - `ffprobe` (Bundled static media inspector)
 
+### Signing, requirements and checks
+- The bundle is ad-hoc signed (`bundle.macOS.signingIdentity: "-"`), so its
+  signature seals the whole app. Check it with
+  `codesign --verify --deep --strict target/release/bundle/macos/Frames.app`.
+  Without this, a copied or downloaded app is reported as "damaged".
+- macOS 11 or later: thumbnails are WebP, which the macOS web view shows from 11.
+- The default build is for the Mac it runs on (Apple silicon here). For Intel
+  Macs too, `rustup target add x86_64-apple-darwin` and build with
+  `npm run tauri build -- --target universal-apple-darwin`.
+- HEIC and preview-less RAW (phone DNG) thumbnails use macOS's own decoder,
+  because the bundled ffmpeg cannot assemble HEIC tile grids. Import on the
+  Mac: Windows has no such decoder here and would store placeholders.
+- `scripts/prepare-binaries.js` pins each sidecar's SHA-256 and refuses
+  anything else.
+
 ### Gatekeeper / macOS Unidentified Developer Tip
-If macOS displays an alert saying the app is damaged or from an unidentified developer (because it is unsigned or self-signed):
+Ad-hoc signing is not notarisation. On another Mac, macOS warns that the app is from an unidentified developer:
 1. Right-click `Frames.app` in Finder, choose **Open**, and click **Open** in the confirmation dialog.
 2. Alternatively, remove the quarantine attribute via terminal:
    ```bash

@@ -324,9 +324,13 @@ pub fn extract_palette(thumb: &Path, tone: Tone) -> Palette {
     normalise_roles(&bg_hex, &sidebar_hex, &accent_hex, tone)
 }
 
-/// Compute palette from the 256px thumbnail for asset_id and store in photo_palettes.
-pub fn compute_and_store_palette(conn: &rusqlite::Connection, asset_id: &str) -> Result<Palette, String> {
-    let thumb_file = crate::thumbs::thumb_path(asset_id, crate::thumbs::ThumbSize::Small);
+/// Compute palette from the asset's `s.webp` under `cache_root` and store in photo_palettes.
+pub fn compute_and_store_palette(
+    conn: &rusqlite::Connection,
+    cache_root: &std::path::Path,
+    asset_id: &str,
+) -> Result<Palette, String> {
+    let thumb_file = crate::cache::small_thumb_path_in(cache_root, asset_id);
     if !thumb_file.exists() {
         return Err(format!("thumbnail does not exist for asset {asset_id}"));
     }

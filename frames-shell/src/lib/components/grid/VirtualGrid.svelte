@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
   import Tile from './Tile.svelte';
-  import type { Asset, AssetRepo, Query } from '$lib/types';
+  import type { Asset, AssetRepo, OpenPhoto, Query } from '$lib/types';
   import { tauriRepo } from '$lib/services/tauriRepo';
   import { focusAsset } from '$lib/theme/engine.svelte';
 
@@ -14,15 +14,18 @@
     isFill = $bindable(true),
     selectedIds = $bindable<Set<string>>(new Set()),
     onopenphoto,
-    onselectionchange
+    onselectionchange,
+    version = 0
   }: {
     query?: Query;
     repo?: AssetRepo;
     zoomLevelIndex?: number;
     isFill?: boolean;
     selectedIds?: Set<string>;
-    onopenphoto?: (asset: Asset) => void;
+    onopenphoto?: OpenPhoto;
     onselectionchange?: (ids: Set<string>) => void;
+    /** Bump to refetch the current query in place, keeping the scroll position. */
+    version?: number;
   } = $props();
 
   let containerRef: HTMLDivElement | null = $state(null);
@@ -37,6 +40,9 @@
   let loadedPages = new Set<number>();
   let inFlightPages = new Set<number>();
   let activeQueryKey = '';
+  let activeVersion = 0;
+  // Read by the page loader so a refresh can refetch pages already loaded.
+  let refreshTick = $state(0);
 
   export function getAsset(index: number): Asset | undefined {
     const pageIdx = Math.floor(index / PAGE_SIZE);
@@ -71,11 +77,17 @@
   const totalGridHeight = $derived(totalRows * rowHeight);
 
   // Visible window range calculation with 2 viewports overscan (§11)
-  const overscanRows = 8;
+  // Prefetch mostly in the direction of travel (Google Photos and PhotoKit
+  // both preheat ahead of the scroll, not behind it).
+  const OVERSCAN_AHEAD = 10;
+  const OVERSCAN_BEHIND = 3;
+  let scrollDirection = $state(1);
+  const overscanBefore = $derived(scrollDirection < 0 ? OVERSCAN_AHEAD : OVERSCAN_BEHIND);
+  const overscanAfter = $derived(scrollDirection < 0 ? OVERSCAN_BEHIND : OVERSCAN_AHEAD);
   const startRow = $derived(
-    totalRows <= 0 ? 0 : Math.max(0, Math.min(Math.max(0, totalRows - 1), Math.floor(scrollTop / rowHeight) - overscanRows))
+    totalRows <= 0 ? 0 : Math.max(0, Math.min(Math.max(0, totalRows - 1), Math.floor(scrollTop / rowHeight) - overscanBefore))
   );
-  const visibleRowCount = $derived(Math.ceil(containerHeight / rowHeight) + overscanRows * 2);
+  const visibleRowCount = $derived(Math.ceil(containerHeight / rowHeight) + overscanBefore + overscanAfter);
   const endRow = $derived(
     totalRows <= 0 ? 0 : Math.max(startRow, Math.min(totalRows, startRow + visibleRowCount))
   );
@@ -103,8 +115,25 @@
     }
   });
 
+  // Library changed underneath (import, sync): recount and refetch in place.
+  // Loaded pages stay on screen until their replacements arrive.
+  $effect(() => {
+    const v = version;
+    if (v === activeVersion) return;
+    activeVersion = v;
+    const key = activeQueryKey;
+    repo.count(query).then((cnt) => {
+      if (activeQueryKey !== key) return;
+      loadedPages.clear();
+      inFlightPages.clear();
+      totalAssets = cnt;
+      refreshTick++;
+    });
+  });
+
   // Load pages of 200 assets covering visible rows
   $effect(() => {
+    void refreshTick;
     if (totalAssets <= 0) return;
     const s = startIndex;
     const e = Math.min(totalAssets, endIndex);
@@ -168,15 +197,31 @@
     resizeObserver?.disconnect();
   });
 
-  // Handle scroll events: Sticky date pill & center tile focus (§4.3, §7.6)
-  let scrollRafId: number | null = null;
-  function handleScroll(e: Event) {
-    const target = e.target as HTMLDivElement;
-    scrollTop = target.scrollTop;
+  // Fast scrolling: tiles that only flash past should not start loading
+  // thumbnails (Google Photos skips full images while flinging or scrubbing).
+  // More than a screen every quarter second counts as fast.
+  let fastScrolling = $state(false);
+  let lastScrollTop = 0;
+  let lastScrollTime = 0;
+  let settleTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Handle scroll events: Sticky date pill & center tile focus (§4.3, §7.6).
+  // Scroll events can fire several times a frame; work happens once per frame.
+  let scrollRafId: number | null = null;
+  function handleScroll() {
     if (scrollRafId !== null) return;
-    scrollRafId = requestAnimationFrame(() => {
+    scrollRafId = requestAnimationFrame((now) => {
       scrollRafId = null;
+      const top = containerRef?.scrollTop ?? 0;
+      const dy = top - lastScrollTop;
+      const dt = Math.max(1, now - lastScrollTime);
+      if (dy !== 0) scrollDirection = Math.sign(dy);
+      fastScrolling = isDraggingScrubber || Math.abs(dy) / dt > containerHeight / 250;
+      lastScrollTop = top;
+      lastScrollTime = now;
+      scrollTop = top;
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => (fastScrolling = false), 120);
 
       // Show date pill and reset fade timer (1.2s fade, §4.3)
       datePillVisible = true;
@@ -270,8 +315,8 @@
     onselectionchange?.(newSelection);
   }
 
-  function handleTileDoubleClick(asset: Asset) {
-    onopenphoto?.(asset);
+  function handleTileDoubleClick(index: number, asset: Asset) {
+    onopenphoto?.(asset, { query, index });
   }
 
   // Hover dwell adaptive focus (§7.6 #3)
@@ -371,8 +416,9 @@
                 size={actualTileSize}
                 {isFill}
                 isSelected={selectedIds.has(asset.id)}
+                deferLoad={fastScrolling}
                 onclick={(e) => handleTileClick(itemIndex, asset, e)}
-                ondblclick={() => handleTileDoubleClick(asset)}
+                ondblclick={() => handleTileDoubleClick(itemIndex, asset)}
                 onpointerenter={() => handleTileHover(asset)}
               />
             {:else}

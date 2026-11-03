@@ -40,7 +40,8 @@ CREATE TABLE assets (
   local_path    TEXT,
   remote_key    TEXT,
   thumb_state   TEXT NOT NULL DEFAULT 'none' CHECK (thumb_state IN ('none', 'queued', 'ready', 'failed')),
-  content_hash  TEXT
+  content_hash  TEXT,
+  thumbhash     TEXT                              -- [+] local-only grid placeholder (base64 ThumbHash)
 );
 
 -- Timeline: visible assets by date.
@@ -49,11 +50,6 @@ CREATE INDEX assets_timeline ON assets (taken_at)
 -- Trash view and the daily purge.
 CREATE INDEX assets_trash ON assets (trashed_at)
   WHERE trashed_at IS NOT NULL AND purged_at IS NULL;
--- Unique asset per album and relative path.
-CREATE UNIQUE INDEX IF NOT EXISTS assets_album_relpath ON assets (album_id, relative_path);
--- Fast indexed album querying sorted by date.
-CREATE INDEX IF NOT EXISTS assets_album_id ON assets (album_id, taken_at DESC, id ASC)
-  WHERE trashed_at IS NULL AND purged_at IS NULL;
 -- Fast timeline sorted query index.
 CREATE INDEX IF NOT EXISTS assets_taken_desc ON assets (taken_at DESC, id ASC)
   WHERE trashed_at IS NULL AND purged_at IS NULL;

@@ -34,7 +34,7 @@ export interface ThemeConfig {
 
 export interface Asset {
   id: string;
-  kind: 'photo' | 'video';
+  kind: 'photo' | 'video' | 'live';
   takenAt: number; // timestamp ms
   w: number;
   h: number;
@@ -77,6 +77,9 @@ export interface Query {
   month?: number; // 1..12
   filter?: 'all' | 'favorites' | 'videos' | 'photos';
 }
+
+/** Open the viewer on `asset`; `at` places it in the grid query it came from. */
+export type OpenPhoto = (asset: Asset, at?: { query: Query; index: number }) => void;
 
 export interface AssetRepo {
   count(q: Query): Promise<number>;

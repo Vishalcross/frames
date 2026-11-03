@@ -4,6 +4,7 @@
  * and debounced transitions.
  */
 import { invoke } from '@tauri-apps/api/core';
+import { onBrowsingFocus, setPhotoPalette } from '$lib/theme/engine.svelte';
 
 export interface AdaptivePalette {
   bg: string;
@@ -11,6 +12,8 @@ export interface AdaptivePalette {
   accent: string;
   on_bg: string;
   on_sidebar: string;
+  /** Chosen by hand for an album, so shown exactly rather than re-toned. */
+  exact?: boolean;
 }
 
 export interface BackendAlbumTheme {
@@ -49,6 +52,12 @@ let currentAppliedPalette: AdaptivePalette | null = null;
 let requestCounter = 0;
 let debounceTimer: any = null;
 let isListeningToPaletteReady = false;
+// The album page being browsed, if any (set when no photo is open).
+let pageAlbumId: string | null = null;
+
+// "Viewer and browsing": the photo under the pointer or centred in the scroll
+// colours the app like an open one, under the same album rules.
+onBrowsingFocus((assetId) => handleViewedPhotoChange(assetId, pageAlbumId));
 
 /**
  * Setup Tauri event listener for album-palette-ready
@@ -124,7 +133,8 @@ export async function resolvePalette(
           sidebar: theme.sidebar,
           accent: theme.accent,
           on_bg: theme.on_bg || '#FFFFFF',
-          on_sidebar: theme.on_sidebar || '#FFFFFF'
+          on_sidebar: theme.on_sidebar || '#FFFFFF',
+          exact: true
         };
       }
       return null;
@@ -160,61 +170,21 @@ export async function resolvePalette(
 }
 
 /**
- * Determine contrast text colour (#FFFFFF or #111111) for accent.
- */
-export function getContrastTextColor(hex: string): string {
-  try {
-    const clean = hex.startsWith('#') ? hex.slice(1) : hex;
-    const r = parseInt(clean.slice(0, 2), 16) / 255;
-    const g = parseInt(clean.slice(2, 4), 16) / 255;
-    const b = parseInt(clean.slice(4, 6), 16) / 255;
-    const toLinear = (c: number) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
-    const L = 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
-    const crWhite = (1.0 + 0.05) / (L + 0.05);
-    const crBlack = (L + 0.05) / 0.05;
-    return crBlack > crWhite ? '#111111' : '#FFFFFF';
-  } catch {
-    return '#FFFFFF';
-  }
-}
-
-/**
- * Apply the 5 CSS variables to document.documentElement (Task 4-h #1).
+ * Use this palette for the Adaptive appearance. The theme engine derives every
+ * token from it (Task 4-h #1); it is kept, not shown, in other appearances.
  */
 export function applyPalette(p: AdaptivePalette): void {
-  if (typeof document === 'undefined' || !p) return;
+  if (!p) return;
   currentAppliedPalette = p;
-  const root = document.documentElement;
-
-  root.style.setProperty('--adaptive-bg', p.bg);
-  root.style.setProperty('--adaptive-sidebar', p.sidebar);
-  root.style.setProperty('--adaptive-accent', p.accent);
-  root.style.setProperty('--adaptive-on-bg', p.on_bg);
-  root.style.setProperty('--adaptive-on-sidebar', p.on_sidebar);
-  root.style.setProperty('--adaptive-on-accent', getContrastTextColor(p.accent));
+  setPhotoPalette(p);
 }
 
 /**
- * Clear the 5 CSS variables from document.documentElement (Task 4-h #6).
+ * Back to the neutral Adaptive palette (Task 4-h #6).
  */
 export function clearAdaptivePalette(): void {
-  if (typeof document === 'undefined') return;
-  const root = document.documentElement;
-  root.style.removeProperty('--adaptive-bg');
-  root.style.removeProperty('--adaptive-sidebar');
-  root.style.removeProperty('--adaptive-accent');
-  root.style.removeProperty('--adaptive-on-bg');
-  root.style.removeProperty('--adaptive-on-sidebar');
-  root.style.removeProperty('--adaptive-on-accent');
-}
-
-/**
- * Restore current palette when switching back to Adaptive (Task 4-h #6).
- */
-export function restoreAdaptivePalette(): void {
-  if (currentAppliedPalette) {
-    applyPalette(currentAppliedPalette);
-  }
+  currentAppliedPalette = null;
+  setPhotoPalette(null);
 }
 
 /**
@@ -234,6 +204,7 @@ export function handleViewedPhotoChange(
   if (debounceTimer) {
     clearTimeout(debounceTimer);
   }
+  if (!assetId) pageAlbumId = albumId ?? null;
 
   const reqId = ++requestCounter;
   debounceTimer = setTimeout(async () => {

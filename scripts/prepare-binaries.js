@@ -4,6 +4,7 @@ import https from 'node:https';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
+import crypto from 'node:crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,41 +17,57 @@ if (!fs.existsSync(binariesDir)) {
 
 const BASE_URL = 'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1';
 
+// Each sidecar is pinned to the SHA-256 of its unpacked binary, so a changed
+// or tampered download (or a stray file in /tmp) is never bundled.
 const BINARIES = [
   {
     remoteGz: 'ffmpeg-darwin-arm64.gz',
     target: 'ffmpeg-aarch64-apple-darwin',
+    sha256: 'a90e3db6a3fd35f6074b013f948b1aa45b31c6375489d39e572bea3f18336584',
     executable: true
   },
   {
     remoteGz: 'ffprobe-darwin-arm64.gz',
     target: 'ffprobe-aarch64-apple-darwin',
+    sha256: 'bb2db6f5d8cef919da12fbf592119a987202a8c060a886f3cab091f9cab90b64',
     executable: true
   },
   {
     remoteGz: 'ffmpeg-darwin-x64.gz',
     target: 'ffmpeg-x86_64-apple-darwin',
+    sha256: 'ebdddc936f61e14049a2d4b549a412b8a40deeff6540e58a9f2a2da9e6b18894',
     executable: true
   },
   {
     remoteGz: 'ffprobe-darwin-x64.gz',
     target: 'ffprobe-x86_64-apple-darwin',
+    sha256: 'fa3add0ce901f7241abe0dfc0155d958fc834aca3f8ce61f87cc712ae669c1e0',
     executable: true
   },
   {
     remoteGz: 'ffmpeg-win32-x64.gz',
     target: 'ffmpeg-x86_64-pc-windows-msvc.exe',
+    sha256: '04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00',
     executable: false
   },
   {
     remoteGz: 'ffprobe-win32-x64.gz',
     target: 'ffprobe-x86_64-pc-windows-msvc.exe',
+    sha256: '3a7e2dc003dc2cd1472827e4c7c4f056ae1ae0ae7c5bbc580c99b49827351ba4',
     executable: false
   }
 ];
 
-function downloadAndGunzip(url, destPath, isExecutable) {
+function sha256Of(file) {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function downloadAndGunzip(url, destPath, isExecutable, expectedSha256) {
   return new Promise((resolve, reject) => {
+    if (fs.existsSync(destPath) && sha256Of(destPath) !== expectedSha256) {
+      console.warn(`[re-download] ${path.basename(destPath)} does not match its pinned SHA-256`);
+      fs.unlinkSync(destPath);
+    }
     if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000000) {
       console.log(`[skip] Already exists: ${path.basename(destPath)} (${fs.statSync(destPath).size} bytes)`);
       if (isExecutable) {
@@ -78,6 +95,12 @@ function downloadAndGunzip(url, destPath, isExecutable) {
 
         fileStream.on('finish', () => {
           fileStream.close(() => {
+            const actual = sha256Of(destPath);
+            if (actual !== expectedSha256) {
+              fs.unlinkSync(destPath);
+              reject(new Error(`SHA-256 mismatch for ${path.basename(destPath)}: got ${actual}`));
+              return;
+            }
             if (isExecutable) {
               try { fs.chmodSync(destPath, 0o755); } catch {}
             }
@@ -128,7 +151,7 @@ async function main() {
     const destPath = path.join(binariesDir, bin.target);
     const url = `${BASE_URL}/${bin.remoteGz}`;
     try {
-      await downloadAndGunzip(url, destPath, bin.executable);
+      await downloadAndGunzip(url, destPath, bin.executable, bin.sha256);
     } catch (e) {
       console.error(`Error downloading ${bin.target}:`, e.message);
       process.exitCode = 1;

@@ -14,20 +14,16 @@ pub mod media;
 pub mod ops;
 pub mod palette;
 pub mod player;
+pub mod qos;
 pub mod s4;
 pub mod store;
 pub mod sync;
 pub mod trash;
-pub mod scan_local;
-pub mod thumbs;
-pub mod thumb_worker;
-pub mod upload_worker;
+pub mod thumbnails;
 
 pub use rusqlite;
 pub use walkdir;
-pub use store::{AlbumDebugInfo, MatchedAlbumFolder};
-pub use s4::{RemoteAsset, RemoteFetcher};
-pub use upload_worker::UploadWorker;
+pub use store::AlbumDebugInfo;
 pub use palette::{
     extract_palette, get_album_theme, get_palette_from_db, normalise_roles, set_album_theme,
     AlbumTheme, Palette, Tone,

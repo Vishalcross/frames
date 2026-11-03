@@ -28,6 +28,9 @@
   import ConnectionPane from '$lib/components/settings/ConnectionPane.svelte';
   import KitGallery from '$lib/components/settings/KitGallery.svelte';
   import DeleteSheet from '$lib/components/dialogs/DeleteSheet.svelte';
+  import NewAlbumSheet from '$lib/components/dialogs/NewAlbumSheet.svelte';
+  import ContextMenu from '$lib/components/surface/ContextMenu.svelte';
+  import type { MenuItem } from '$lib/components/surface/Menu.svelte';
   import ImportOverlay from '$lib/components/dialogs/ImportOverlay.svelte';
   import Toast, { type ToastMessage } from '$lib/components/dialogs/Toast.svelte';
 
@@ -44,6 +47,9 @@
   // Real Backend State
   const isTauri = isTauriAvailable();
   let gridKey = $state(0);
+  // Bumped when the library changes underneath (import, sync); grids refetch
+  // in place instead of remounting, so the scroll position survives.
+  let libraryVersion = $state(0);
   let albums = $state<AlbumItem[]>([]);
   let isSyncing = $state(false);
   let outboxPending = $state(0);
@@ -69,6 +75,8 @@
   let connectionOpen = $state(false);
   let connectionHint = $state('');
   let deleteSheetOpen = $state(false);
+  let albumPendingDelete = $state<AlbumItem | null>(null);
+  let albumDeleteSheetOpen = $state(false);
   let importDragging = $state(false);
 
   // Search & Filters State
@@ -149,18 +157,24 @@
     if (viewerOpen && activeViewerAsset) return activeViewerAsset.favorite;
     if (selectedIds.size === 1) {
       const firstId = Array.from(selectedIds)[0];
-      const found = tauriRepo.getAssets().find((a) => a.id === firstId);
+      const found = tauriRepo.getAsset(firstId);
       return found ? found.favorite : false;
     }
     return false;
   });
 
   async function loadLibraryData() {
+    await refreshLibraryData();
+    gridKey++;
+  }
+
+  /** Reload library data and refresh the visible grid where it stands. */
+  async function refreshLibraryData() {
     await tauriRepo.loadBootstrap();
     albums = tauriRepo.getAlbums();
     outboxPending = tauriRepo.outboxPending;
     isOffline = tauriRepo.offline;
-    gridKey++;
+    libraryVersion++;
   }
 
   async function handleSyncNow() {
@@ -172,7 +186,7 @@
     toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Syncing with MEGA S4 cloud…' }];
     const rep = await tauriRepo.syncNow();
     isSyncing = false;
-    await loadLibraryData();
+    await refreshLibraryData();
     if (rep?.error) {
       toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Sync status: ${rep.error}` }];
     } else if (rep) {
@@ -213,23 +227,24 @@
     let unlistens: Array<() => void> = [];
     if (isTauri) {
       import('@tauri-apps/api/event').then(({ listen }) => {
-        listen('album-synced', async () => {
-          await loadLibraryData();
-        }).then((un) => unlistens.push(un));
-
-        listen('scan-finished', async () => {
-          await loadLibraryData();
-        }).then((un) => unlistens.push(un));
-
         let importRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-        listen('frames://import-progress', () => {
+        // Progress fires for every hashed and uploaded file; the library only
+        // changes when an import adds a photo.
+        let lastImported = -1;
+        listen<{ imported_count?: number }>('frames://import-progress', (event) => {
+          const imported = event.payload?.imported_count ?? 0;
+          if (imported === lastImported) return;
+          lastImported = imported;
           if (!importRefreshTimer) {
             importRefreshTimer = setTimeout(async () => {
               importRefreshTimer = null;
-              await loadLibraryData();
-            }, 1000);
+              await refreshLibraryData();
+            }, 2000);
           }
         }).then((un) => unlistens.push(un));
+
+        // The background sync pulled changes from another computer.
+        listen('library-changed', () => refreshLibraryData()).then((un) => unlistens.push(un));
       });
     }
 
@@ -287,8 +302,14 @@
   }
 
   // Photo viewer open/close
-  function openPhoto(asset: Asset) {
+  // Where the open photo sits, so the viewer's arrows walk the same grid.
+  let viewerQuery = $state<Query | null>(null);
+  let viewerIndex = $state(0);
+
+  function openPhoto(asset: Asset, at?: { query: Query; index: number }) {
     activeViewerAsset = asset;
+    viewerQuery = at?.query ?? null;
+    viewerIndex = at?.index ?? 0;
     viewerOpen = true;
   }
 
@@ -338,6 +359,98 @@
     ];
     selectedIds = new Set();
     gridKey++;
+  }
+
+  // New Album: from the sidebar or Albums page (empty), or from a selection.
+  let newAlbumOpen = $state(false);
+  let newAlbumAssetIds = $state<string[]>([]);
+
+  function openNewAlbum(assetIds: string[] = []) {
+    newAlbumAssetIds = assetIds;
+    newAlbumOpen = true;
+  }
+
+  async function handleCreateAlbum(name: string) {
+    const ids = newAlbumAssetIds;
+    newAlbumAssetIds = [];
+    const before = new Set(albums.map((a) => a.id));
+    try {
+      albums = await tauriRepo.createAlbum(name, ids);
+      const created = albums.find((a) => !before.has(a.id));
+      if (ids.length > 0) selectedIds = new Set();
+      const added = ids.length > 0 ? ` with ${ids.length} ${ids.length === 1 ? 'item' : 'items'}` : '';
+      toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Created album “${name}”${added}` }];
+      if (created) navigate('album-detail', created.id);
+    } catch (e: any) {
+      toasts = [
+        ...toasts,
+        { id: Date.now().toString(), type: 'error', text: `Could not create album: ${e?.toString() || e}` }
+      ];
+    }
+  }
+
+  // Add to Album, from the selection bar: every album, plus New Album with the selection.
+  let addToAlbumOpen = $state(false);
+  let addToAlbumAt = $state({ x: 0, y: 0 });
+  const addToAlbumItems = $derived<MenuItem[]>([
+    { id: '__new', label: 'New Album…', icon: 'plus' },
+    ...(albums.length > 0 ? [{ id: '__sep', label: '', separator: true }] : []),
+    ...albums.map((a) => ({ id: a.id, label: a.title, icon: 'album' }))
+  ]);
+
+  function openAddToAlbum(e: MouseEvent) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    addToAlbumAt = { x: r.left, y: r.top };
+    addToAlbumOpen = true;
+  }
+
+  async function handleAddToAlbum(item: MenuItem) {
+    const ids = Array.from(selectedIds);
+    if (item.id === '__new') {
+      openNewAlbum(ids);
+      return;
+    }
+    try {
+      albums = await tauriRepo.addToAlbum(item.id, ids);
+      selectedIds = new Set();
+      if (currentRoute === 'album-detail' && currentAlbumId === item.id) libraryVersion++;
+      toasts = [
+        ...toasts,
+        {
+          id: Date.now().toString(),
+          type: 'info',
+          text: `Added ${ids.length} ${ids.length === 1 ? 'item' : 'items'} to “${item.label}”`
+        }
+      ];
+    } catch (e: any) {
+      toasts = [
+        ...toasts,
+        { id: Date.now().toString(), type: 'error', text: `Could not add to album: ${e?.toString() || e}` }
+      ];
+    }
+  }
+
+  function handleDeleteAlbumPrompt(album: AlbumItem) {
+    albumPendingDelete = album;
+    albumDeleteSheetOpen = true;
+  }
+
+  async function handleDeleteAlbumConfirmed() {
+    const album = albumPendingDelete;
+    albumPendingDelete = null;
+    if (!album) return;
+    try {
+      albums = await tauriRepo.deleteAlbum(album.id);
+      if (currentRoute === 'album-detail' && currentAlbumId === album.id) {
+        navigate('collections');
+      }
+      toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: `Deleted album “${album.title}”` }];
+    } catch (e: any) {
+      toasts = [
+        ...toasts,
+        { id: Date.now().toString(), type: 'error', text: `Could not delete album: ${e?.toString() || e}` }
+      ];
+    }
   }
 
   function openConnection(hint = '') {
@@ -406,20 +519,6 @@
     ];
   }
 
-  async function handleScanLocal() {
-    toasts = [...toasts, { id: Date.now().toString(), type: 'info', text: 'Scanning local picture folders…' }];
-    try {
-      const count = await tauriRepo.scanLocalLibrary();
-      await loadLibraryData();
-      toasts = [
-        ...toasts,
-        { id: Date.now().toString(), type: 'info', text: `Scan complete: found ${count} local photos and videos` }
-      ];
-    } catch (e: any) {
-      toasts = [...toasts, { id: Date.now().toString(), type: 'error', text: `Scan error: ${e?.message || e}` }];
-    }
-  }
-
   // Global Keyboard Shortcuts (§12)
   function handleGlobalKeyDown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.altKey && e.key.toLowerCase() === 's') {
@@ -477,6 +576,8 @@
       {outboxPending}
       onnavigate={navigate}
       onsync={handleSyncNow}
+      ondeletealbum={isTauri ? handleDeleteAlbumPrompt : undefined}
+      oncreatealbum={isTauri ? () => openNewAlbum() : undefined}
     />
 
     <!-- Main Content Area -->
@@ -528,13 +629,12 @@
             <MonthsView year={selectedYear} ondrillmonth={handleDrillMonth} />
           {:else}
             <!-- All Continuous Virtualized Grid (§4.3, §4.4) -->
-            {#if activeRepo.getAssets().length === 0}
+            {#if activeRepo.totalAssets === 0}
               <EmptyLibraryView
                 {isTauri}
                 onimport={handlePickFolderAndImport}
                 onsync={handleSyncNow}
                 onseed={handleSeedDemo}
-                onscan={handleScanLocal}
               />
             {:else}
               {#key gridKey}
@@ -545,6 +645,7 @@
                   bind:isFill
                   bind:selectedIds
                   onopenphoto={openPhoto}
+                  version={libraryVersion}
                 />
               {/key}
             {/if}
@@ -554,6 +655,8 @@
           <CollectionsView
             {albums}
             onnavigatealbum={(id) => navigate('album-detail', id)}
+            oncreatealbum={isTauri ? () => openNewAlbum() : undefined}
+            ondeletealbum={isTauri ? handleDeleteAlbumPrompt : undefined}
             onnavigateroute={(r) => navigate(r)}
           />
         {:else if currentRoute === 'album-detail'}
@@ -565,6 +668,8 @@
             bind:isFill
             bind:selectedIds
             onopenphoto={openPhoto}
+            ondelete={isTauri ? handleDeleteAlbumPrompt : undefined}
+            version={libraryVersion}
           />
         {:else if currentRoute === 'people-pets'}
           <PeoplePetsView onselectperson={() => navigate('library')} />
@@ -580,7 +685,7 @@
             {isTauri}
             onimport={handlePickFolderAndImport}
             onsync={handleSyncNow}
-            onimported={() => loadLibraryData()}
+            onimported={() => refreshLibraryData()}
             onnavigatelibrary={() => navigate('library')}
           />
         {:else}
@@ -593,6 +698,7 @@
               bind:isFill
               bind:selectedIds
               onopenphoto={openPhoto}
+              version={libraryVersion}
             />
           {/key}
         {/if}
@@ -603,7 +709,7 @@
         selectedCount={selectedIds.size}
         onshare={handleShare}
         onfavorite={handleFavorite}
-        onaddtoalbum={() => handleShare()}
+        onaddtoalbum={isTauri ? openAddToAlbum : undefined}
         ondelete={handleDeletePrompt}
         onclear={() => (selectedIds = new Set())}
       />
@@ -611,7 +717,9 @@
 
     <!-- Info Panel (320px, pushes in Standard/Adaptive, floats in Glass, §4.7) -->
     {#if infoPanelOpen}
-      {@const sampleAsset = activeViewerAsset || tauriRepo.getAssets()[0]}
+      {@const sampleAsset =
+        activeViewerAsset ||
+        (selectedIds.size === 1 ? tauriRepo.getAsset(Array.from(selectedIds)[0]) : undefined)}
       {#if sampleAsset}
         <InfoPanel
           asset={sampleAsset}
@@ -627,6 +735,8 @@
     <PhotoViewer
       bind:asset={activeViewerAsset}
       bind:open={viewerOpen}
+      bind:index={viewerIndex}
+      query={viewerQuery}
       albumId={currentRoute === 'album-detail' ? currentAlbumId : null}
       onclose={closePhoto}
       onedit={(a) => openEdit(a)}
@@ -680,6 +790,26 @@
     bind:open={deleteSheetOpen}
     count={selectedIds.size}
     onconfirm={handleDeleteConfirmed}
+  />
+
+  <NewAlbumSheet bind:open={newAlbumOpen} count={newAlbumAssetIds.length} oncreate={handleCreateAlbum} />
+
+  <ContextMenu
+    items={addToAlbumItems}
+    bind:open={addToAlbumOpen}
+    x={addToAlbumAt.x}
+    y={addToAlbumAt.y}
+    onselect={handleAddToAlbum}
+  />
+
+  <!-- Album delete confirmation: removes the album everywhere, keeps its photos -->
+  <DeleteSheet
+    bind:open={albumDeleteSheetOpen}
+    title={`Delete Album “${albumPendingDelete?.title ?? ''}”?`}
+    description="The album is removed from all your synced devices. The photos and videos in it stay in your library."
+    confirmLabel="Delete Album"
+    onconfirm={handleDeleteAlbumConfirmed}
+    oncancel={() => (albumPendingDelete = null)}
   />
 
   <!-- OS Drag-and-Drop Import Overlay (§4.12) -->

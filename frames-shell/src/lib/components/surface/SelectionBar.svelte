@@ -15,7 +15,8 @@
     selectedCount: number;
     onshare?: () => void;
     onfavorite?: () => void;
-    onaddtoalbum?: () => void;
+    /** Gets the click, so the album menu can open at the button. */
+    onaddtoalbum?: (e: MouseEvent) => void;
     ondelete?: () => void;
     onclear?: () => void;
   } = $props();

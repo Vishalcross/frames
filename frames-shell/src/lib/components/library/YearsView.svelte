@@ -9,23 +9,13 @@
 
   const yearData = $derived.by(() => {
     const monthGroups = tauriRepo.getMonthGroups();
-    const assets = tauriRepo.getAssets();
     const map = new Map<number, { count: number; keyAssetId: string }>();
 
+    // Month groups arrive newest first, so a year's first month holds its cover.
     for (const mg of monthGroups) {
       const cur = map.get(mg.year) || { count: 0, keyAssetId: mg.key_asset_id };
       cur.count += mg.count;
-      if (!cur.keyAssetId && mg.key_asset_id) cur.keyAssetId = mg.key_asset_id;
       map.set(mg.year, cur);
-    }
-
-    if (map.size === 0 && assets.length > 0) {
-      for (const a of assets) {
-        const y = a.year || new Date(a.takenAt).getFullYear();
-        const cur = map.get(y) || { count: 0, keyAssetId: a.id };
-        cur.count++;
-        map.set(y, cur);
-      }
     }
 
     return Array.from(map.entries())

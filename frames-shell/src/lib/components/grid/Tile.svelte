@@ -1,5 +1,5 @@
 <script module lang="ts">
-  import { isTauriAvailable, tauriRepo } from '$lib/services/tauriRepo';
+  import { isTauriAvailable } from '$lib/services/tauriRepo';
 
   type ThumbReadyCallback = (assetId: string) => void;
   const thumbReadyListeners = new Set<ThumbReadyCallback>();
@@ -26,73 +26,14 @@
       }
     };
   }
-
-  let visibleAssetIds = new Set<string>();
-  let prioritizeTimer: any = null;
-
-  function schedulePrioritize() {
-    if (prioritizeTimer) clearTimeout(prioritizeTimer);
-    prioritizeTimer = setTimeout(() => {
-      if (visibleAssetIds.size > 0 && isTauriAvailable()) {
-        import('@tauri-apps/api/core').then(({ invoke }) => {
-          invoke('prioritize', { assetIds: Array.from(visibleAssetIds) }).catch(() => {});
-        });
-      }
-    }, 150);
-  }
-
-  let sharedObserver: IntersectionObserver | null = null;
-  function getSharedObserver() {
-    if (!sharedObserver && typeof IntersectionObserver !== 'undefined') {
-      sharedObserver = new IntersectionObserver(
-        (entries) => {
-          let changed = false;
-          for (const entry of entries) {
-            const id = (entry.target as HTMLElement).dataset.assetId;
-            if (!id) continue;
-            if (entry.isIntersecting) {
-              if (!visibleAssetIds.has(id)) {
-                visibleAssetIds.add(id);
-                changed = true;
-              }
-            } else {
-              if (visibleAssetIds.delete(id)) {
-                changed = true;
-              }
-            }
-          }
-          if (changed) schedulePrioritize();
-        },
-        { threshold: 0.05 }
-      );
-    }
-    return sharedObserver;
-  }
-
-  function observeAssetVisibility(node: HTMLElement, assetId: string) {
-    node.dataset.assetId = assetId;
-    const observer = getSharedObserver();
-    observer?.observe(node);
-    return {
-      update(newId: string) {
-        node.dataset.assetId = newId;
-      },
-      destroy() {
-        observer?.unobserve(node);
-        if (visibleAssetIds.delete(node.dataset.assetId || '')) {
-          schedulePrioritize();
-        }
-      }
-    };
-  }
 </script>
 
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import type { Asset } from '$lib/types';
   import Badge from '$lib/components/surface/Badge.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
-  import { thumbUrl } from '$lib/media';
+  import { placeholderUrl, thumbUrl } from '$lib/media';
   import { theme } from '$lib/theme/engine.svelte';
 
   let {
@@ -101,6 +42,7 @@
     isFill = true,
     size = 128,
     tabindex = -1,
+    deferLoad = false,
     onclick,
     ondblclick,
     onpointerenter,
@@ -111,6 +53,8 @@
     isFill?: boolean;
     size?: number;
     tabindex?: number;
+    /** The grid is flinging or scrubbing past: do not start loading yet. */
+    deferLoad?: boolean;
     onclick?: (e: MouseEvent) => void;
     ondblclick?: (e: MouseEvent) => void;
     onpointerenter?: (e: PointerEvent) => void;
@@ -119,36 +63,63 @@
 
   let isLoaded = $state(false);
   let reloadCounter = $state(0);
-  let fallbackDataUrl = $state<string | null>(null);
-  let fallbackAttempted = false;
+  // Loading starts once the grid has slowed down, then carries on regardless.
+  let started = $state(false);
+  // Large tiles swap the 300 px thumbnail for the 1600 px preview once it is
+  // decoded: something fast first, the sharp version when ready (PhotoKit's
+  // opportunistic delivery, at the size the tile is actually shown).
+  let upgraded = $state(false);
+
+  // Reset only when the tile shows a different photo. A refresh hands the
+  // grid new objects for the same photos; reacting to those blanked tiles
+  // whose <img> src had not changed, so no load event ever brought them back.
+  const assetId = $derived(asset.id);
 
   $effect(() => {
-    const _ = asset.id;
+    const _ = assetId;
     isLoaded = false;
     reloadCounter = 0;
-    fallbackDataUrl = null;
-    fallbackAttempted = false;
+    upgraded = false;
+    started = untrack(() => !deferLoad);
   });
 
-  const currentThumbUrl = $derived(
-    fallbackDataUrl || (reloadCounter > 0 ? `${thumbUrl(asset.id)}?v=${reloadCounter}` : thumbUrl(asset.id))
+  $effect(() => {
+    if (!deferLoad) started = true;
+  });
+
+  const wantsLarge = $derived(
+    typeof window !== 'undefined' && size * (window.devicePixelRatio || 1) > 360
   );
 
-  async function handleImgError() {
-    if (fallbackAttempted) return;
-    fallbackAttempted = true;
-    try {
-      const dataUrl = await tauriRepo.getThumbnailDataUrl(asset.id, false);
-      if (dataUrl) {
-        fallbackDataUrl = dataUrl;
-      }
-    } catch {}
-  }
+  $effect(() => {
+    if (!wantsLarge || !isLoaded || upgraded || deferLoad) return;
+    const id = assetId;
+    const large = new Image();
+    large.src = thumbUrl(id, 1024);
+    large
+      .decode()
+      .then(() => {
+        if (asset.id === id) upgraded = true;
+      })
+      .catch(() => {});
+  });
+
+  // A missing thumbnail answers 404 and the tile keeps its placeholder until
+  // the backend announces it with `thumb-ready`.
+  const currentThumbUrl = $derived(
+    upgraded
+      ? thumbUrl(asset.id, 1024)
+      : reloadCounter > 0
+        ? `${thumbUrl(asset.id)}?v=${reloadCounter}`
+        : thumbUrl(asset.id)
+  );
+
+  // The blurred ThumbHash sketch under the image, shown until it loads.
+  const placeholder = $derived(isTauriAvailable() ? placeholderUrl(asset.thumbHash) : '');
 
   onMount(() => {
     return onThumbReady((assetId) => {
       if (assetId === asset.id) {
-        fallbackDataUrl = null;
         reloadCounter++;
       }
     });
@@ -163,7 +134,7 @@
   });
 
   const accessibleLabel = $derived(
-    `${asset.kind === 'video' ? 'Video' : 'Photo'}, ${new Date(asset.takenAt).toLocaleDateString()}${asset.favorite ? ', favourite' : ''}`
+    `${asset.kind === 'video' ? 'Video' : asset.kind === 'live' ? 'Live Photo' : 'Photo'}, ${new Date(asset.takenAt).toLocaleDateString()}${asset.favorite ? ', favourite' : ''}`
   );
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -180,7 +151,6 @@
   {tabindex}
   class="photo-tile {isSelected ? 'is-selected' : ''} {isFill ? 'is-fill' : 'is-fit'} appearance-{theme.appearance}"
   style="--tile-size: {size}px;"
-  use:observeAssetVisibility={asset.id}
   {onclick}
   {ondblclick}
   onkeydown={handleKeyDown}
@@ -188,16 +158,17 @@
   {onpointerleave}
 >
   <!-- Background ThumbHash blur placeholder crossfading to real image (§4.4) -->
-  <div class="thumb-container">
-    <img
-      src={currentThumbUrl}
-      alt=""
-      loading="lazy"
-      decoding="async"
-      class="tile-image {isLoaded ? 'loaded' : ''}"
-      onload={() => (isLoaded = true)}
-      onerror={handleImgError}
-    />
+  <div class="thumb-container" style:background-image={placeholder ? `url(${placeholder})` : null}>
+    {#if started}
+      <img
+        src={currentThumbUrl}
+        alt=""
+        loading="lazy"
+        decoding="async"
+        class="tile-image {isLoaded ? 'loaded' : ''}"
+        onload={() => (isLoaded = true)}
+      />
+    {/if}
   </div>
 
   <!-- Tile States (§4.4) -->
@@ -205,6 +176,13 @@
   {#if isSelected}
     <div class="selection-check-badge">
       <Icon name="check" size={14} stroke={2.4} />
+    </div>
+  {/if}
+
+  <!-- Live Photo marker top-left (the selection check takes its place) -->
+  {#if asset.kind === 'live' && !isSelected}
+    <div class="live-badge">
+      <Badge variant="pill" text="LIVE" />
     </div>
   {/if}
 
@@ -279,7 +257,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: var(--fill-1);
+    background-color: var(--fill-1);
+    background-size: cover;
+    background-position: center;
   }
 
   .tile-image {
@@ -288,14 +268,13 @@
     object-fit: cover;
     display: block;
     opacity: 0;
-    filter: blur(8px);
-    transition: opacity 150ms var(--ease-standard),
-                filter 150ms var(--ease-standard);
+    /* A plain fade over the ThumbHash placeholder; animating filters on
+       hundreds of tiles costs the compositor every frame. */
+    transition: opacity 150ms var(--ease-standard);
   }
 
   .tile-image.loaded {
     opacity: 1;
-    filter: blur(0px);
   }
 
   /* Check badge top-left (22px, §4.4) */
@@ -331,6 +310,14 @@
     bottom: 6px;
     right: 6px;
     z-index: 2;
+  }
+
+  .live-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    pointer-events: none;
+    letter-spacing: 0.04em;
   }
 
   .cloud-badge {

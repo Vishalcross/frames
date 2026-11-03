@@ -3,6 +3,8 @@
   import Surface from '$lib/components/surface/Surface.svelte';
   import Icon from '$lib/components/icons/Icon.svelte';
   import SyncPopover from '$lib/components/dialogs/SyncPopover.svelte';
+  import ContextMenu from '$lib/components/surface/ContextMenu.svelte';
+  import type { MenuItem } from '$lib/components/surface/Menu.svelte';
   import type { AlbumItem } from '$lib/types';
   import { theme } from '$lib/theme/engine.svelte';
   import { isTauriAvailable } from '$lib/services/tauriRepo';
@@ -16,7 +18,9 @@
     isSyncing = false,
     outboxPending = 0,
     onnavigate,
-    onsync
+    onsync,
+    ondeletealbum,
+    oncreatealbum
   }: {
     currentRoute: string;
     currentAlbumId?: string;
@@ -27,7 +31,29 @@
     outboxPending?: number;
     onnavigate?: (route: string, extraId?: string) => void;
     onsync?: () => void;
+    /** Asks the page to confirm and delete an album (right-click menu). */
+    ondeletealbum?: (album: AlbumItem) => void;
+    /** Opens the New Album sheet. */
+    oncreatealbum?: () => void;
   } = $props();
+
+  // Right-click menu on album rows, as in Photos for macOS.
+  let albumMenu = $state<{ album: AlbumItem; x: number; y: number } | null>(null);
+  let albumMenuOpen = $state(false);
+  const albumMenuItems: MenuItem[] = [
+    { id: 'delete', label: 'Delete Album', icon: 'trash', danger: true }
+  ];
+
+  function openAlbumMenu(e: MouseEvent, album: AlbumItem) {
+    if (!ondeletealbum) return;
+    e.preventDefault();
+    albumMenu = { album, x: e.clientX, y: e.clientY };
+    albumMenuOpen = true;
+  }
+
+  function handleAlbumMenuSelect(item: MenuItem) {
+    if (item.id === 'delete' && albumMenu) ondeletealbum?.(albumMenu.album);
+  }
 
   let syncPopoverOpen = $state(false);
   let syncPaused = $state(false);
@@ -52,43 +78,44 @@
 
     let unlistens: Array<() => void> = [];
 
-    const refreshCounts = async () => {
+    // Events arrive many times a second during an import; the status line
+    // asks the backend at most once a second, and only for the counts.
+    let refreshQueued: ReturnType<typeof setTimeout> | null = null;
+    let lastRefresh = 0;
+    const fetchCounts = async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
-        const st = await invoke<{ uploading_count: number; thumb_generating_count: number }>(
-          'get_worker_status'
-        );
+        const st = await invoke<{
+          uploading_count: number;
+          thumb_generating_count: number;
+          import_running: boolean;
+        }>('get_worker_status');
         uploadCount = st.uploading_count;
         thumbCount = st.thumb_generating_count;
-
-        const imp = await invoke<{ running: boolean }>('get_import_status');
-        isImportRunning = imp.running;
+        isImportRunning = st.import_running;
       } catch (e) {
         // Ignore if unavailable
       }
+    };
+    const refreshCounts = () => {
+      if (refreshQueued) return;
+      const wait = Math.max(0, 1000 - (Date.now() - lastRefresh));
+      refreshQueued = setTimeout(() => {
+        refreshQueued = null;
+        lastRefresh = Date.now();
+        fetchCounts();
+      }, wait);
     };
 
     refreshCounts();
 
     import('@tauri-apps/api/event').then(({ listen }) => {
-      listen<{ job_id: string; state: string }>('upload-progress', () => {
-        refreshCounts();
-      }).then((un) => unlistens.push(un));
-
       listen<{ asset_id: string }>('thumb-ready', () => {
         if (thumbCount > 0) {
           thumbCount--;
         } else {
           refreshCounts();
         }
-      }).then((un) => unlistens.push(un));
-
-      listen('album-synced', () => {
-        refreshCounts();
-      }).then((un) => unlistens.push(un));
-
-      listen('scan-finished', () => {
-        refreshCounts();
       }).then((un) => unlistens.push(un));
 
       listen('frames://import-progress', () => {
@@ -271,7 +298,14 @@
 
       <!-- 4. My Albums Tree with Collapsible Folders (§4.1) -->
       <div class="sidebar-group">
-        <div class="section-header">My albums</div>
+        <div class="section-header section-header-row">
+          <span>My albums</span>
+          {#if oncreatealbum}
+            <button type="button" class="section-add" title="New Album" aria-label="New Album" onclick={oncreatealbum}>
+              <Icon name="plus" size={13} />
+            </button>
+          {/if}
+        </div>
         {#if albums.length === 0}
           <div class="empty-albums-notice">No albums in library</div>
         {:else}
@@ -298,6 +332,7 @@
                         type="button"
                         class="sidebar-row {currentAlbumId === child.id ? 'selected' : ''}"
                         onclick={() => navigate('album-detail', child.id)}
+                        oncontextmenu={(e) => openAlbumMenu(e, child)}
                       >
                         <span class="row-icon"><Icon name="album" size={16} /></span>
                         <span class="row-label">{child.title}</span>
@@ -314,6 +349,7 @@
                 type="button"
                 class="sidebar-row {currentAlbumId === album.id ? 'selected' : ''}"
                 onclick={() => navigate('album-detail', album.id)}
+                oncontextmenu={(e) => openAlbumMenu(e, album)}
               >
                 <span class="row-icon"><Icon name="album" size={16} /></span>
                 <span class="row-label">{album.title}</span>
@@ -420,6 +456,16 @@
       <SyncPopover bind:open={syncPopoverOpen} bind:isPaused={syncPaused} />
     </div>
 
+    {#if albumMenu}
+      <ContextMenu
+        items={albumMenuItems}
+        bind:open={albumMenuOpen}
+        x={albumMenu.x}
+        y={albumMenu.y}
+        onselect={handleAlbumMenuSelect}
+      />
+    {/if}
+
     <!-- Drag Resizer Handle -->
     <button
       type="button"
@@ -477,6 +523,31 @@
     color: var(--text-2);
     padding: 4px 10px 4px;
     letter-spacing: -0.1px;
+  }
+
+  .section-header-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .section-add {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: none;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--text-2);
+    cursor: pointer;
+  }
+
+  .section-add:hover {
+    background: var(--fill-2);
+    color: var(--text-1);
   }
 
   .sidebar-row {

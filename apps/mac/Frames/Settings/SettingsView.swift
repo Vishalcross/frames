@@ -46,6 +46,21 @@ struct AppearancePane: View {
                     }
                 }
             }
+            if settings.appearance == .glass {
+                Section("Glass") {
+                    Picker("Tint", selection: $settings.glassTint) {
+                        ForEach(GlassTint.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("Clarity", selection: $settings.glassClarity) {
+                        ForEach(GlassClarity.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("Clear shows more of the desktop. With Reduce Transparency on in Accessibility settings, the window stays solid.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
             if settings.appearance == .adaptive {
                 Section("Adaptive") {
                     Picker("Intensity", selection: $settings.intensity) {
@@ -56,7 +71,8 @@ struct AppearancePane: View {
                         ForEach(ColourSource.allCases) { Text($0.title).tag($0) }
                     }
                     Text("“Follow Photo” turns the app dark for a dark photo and light for a bright one. "
-                         + "Browsing changes the colours but never switches between light and dark.")
+                         + "Browsing changes the colours but never switches between light and dark. "
+                         + "An album can keep one palette instead: right-click it in the sidebar and choose Colours.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -71,6 +87,8 @@ struct AppearancePane: View {
         .onChange(of: settings.accent) { model.theme.settingsChanged() }
         .onChange(of: settings.intensity) { model.theme.settingsChanged() }
         .onChange(of: settings.colourSource) { model.theme.settingsChanged() }
+        .onChange(of: settings.glassTint) { model.theme.settingsChanged() }
+        .onChange(of: settings.glassClarity) { model.theme.settingsChanged() }
     }
 }
 

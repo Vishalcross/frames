@@ -553,3 +553,30 @@ The app's `-FramesTestStore YES` launch argument uses it. A test import of 3 pho
 * Glass tint and clarity options.
 * The manual offline switch.
 * Native `PHLivePhotoView` playback.
+
+## 22. The last gaps with the Tauri app, closed (2026-11-03)
+
+* **Album colours.** Right-click an album in the sidebar and choose Colours…. The choices are each photo's own colours, or one palette for the album, either generated from its photos (with Make Again) or chosen by hand with three colour wells.
+  * The album's page uses that palette in Adaptive.
+  * So does a photo opened from the album, or opened from the library when it is in such an album (as the Tauri app does).
+  * Chosen colours are shown exactly and their background decides light or dark. Generated ones are toned like a photo's.
+  * The setting is kept on this Mac, in `album_theme`, as before.
+* **Video formats AVFoundation can't open** (`frames_core::hls`, section 10). The viewer:
+  1. plays the original when the import's codec notes allow it;
+  2. otherwise plays a repackaged HLS stream (fMP4 segments and an EVENT playlist served on 127.0.0.1 with a session token);
+  3. otherwise a converted one (VideoToolbox H.264 at 10 Mb/s, AAC);
+  4. otherwise shows "Can't Play Here".
+
+  Copied HEVC is tagged `hvc1`. Streams stop when the viewer leaves the video or the app quits; leftovers are cleared at the next start. Test: a 20 s H.264/AAC MKV played through the stream after 0.7 s, and an MP4 played the original after 0.4 s. Seeking is limited to what ffmpeg has written; starting a new session at the seek point (`-ss`) is left for later.
+* **Glass:**
+  * Tint: Neutral, or from the photo (its accent hue at L 0.62, over the window's material at 18%).
+  * Clarity: Regular (regular material) or Clear (ultra-thin).
+  * Reduce Transparency keeps the window solid.
+* **Work Offline** (the sync button's menu, or File › Work Offline; remembered on this Mac):
+  * nothing reaches S4 (no sync, uploads, downloads or purges), and a running import pauses and resumes when you go back online;
+  * edits wait in the outbox;
+  * a banner with Go Online.
+
+**Not exactly as before:**
+* The Tauri app's Glass tint was set per appearance in CSS; here it is the window material plus a tint.
+* Live Photos play their movie while the LIVE badge is held, rather than in Apple's `PHLivePhotoView`. That waits for a real Live Photo to test with (section 10).

@@ -25,7 +25,9 @@ use frames_core::thumbnails::ThumbService;
 use frames_core::trash::{delete_trash_items_now, empty_trash, purge_expired_trash, trash_summary};
 
 mod manage;
+mod video;
 pub use manage::*;
+pub use video::*;
 
 uniffi::setup_scaffolding!();
 
@@ -327,12 +329,15 @@ impl Settings {
 struct Connection {
     s4: Option<Arc<dyn ObjectStore>>,
     problem: Option<String>,
+    /// Work Offline: S4 stays configured but nothing reaches it.
+    offline: bool,
 }
 
 type SharedConnection = Arc<RwLock<Connection>>;
 
+/// S4, unless it isn't configured or the user is working offline.
 fn current_s4(connection: &SharedConnection) -> Option<Arc<dyn ObjectStore>> {
-    connection.read().ok().and_then(|c| c.s4.clone())
+    connection.read().ok().filter(|c| !c.offline).and_then(|c| c.s4.clone())
 }
 
 /// An open library: the local database, thumbnails and the S4 connection,
@@ -351,6 +356,10 @@ pub struct Library {
     edit_pushes: Mutex<mpsc::Sender<()>>,
     /// Test libraries upload to memory, never to a real bucket.
     in_memory: bool,
+    /// Streams for videos the Mac's player can't open directly, started on first use.
+    hls: Mutex<Option<Arc<frames_core::hls::HlsServer>>>,
+    /// Whether going offline paused the import, so going online resumes it.
+    paused_for_offline: Mutex<bool>,
     _lock: LibraryLock,
 }
 
@@ -426,6 +435,8 @@ impl Library {
             sync_requests: Mutex::new(sync_requests),
             edit_pushes: Mutex::new(edit_pushes),
             in_memory,
+            hls: Mutex::new(None),
+            paused_for_offline: Mutex::new(false),
             _lock: lock,
         });
         library.connect(None);
@@ -451,13 +462,14 @@ impl Library {
         } else {
             self.settings.lock().map_err(|e| e.to_string()).and_then(|s| s.s4(secret))
         };
-        self.thumbs.set_s4(result.as_ref().ok().cloned());
         if let Ok(mut connection) = self.connection.write() {
+            let offline = connection.offline;
             *connection = match result {
-                Ok(s4) => Connection { s4: Some(s4), problem: None },
-                Err(problem) => Connection { s4: None, problem: Some(problem) },
+                Ok(s4) => Connection { s4: Some(s4), problem: None, offline },
+                Err(problem) => Connection { s4: None, problem: Some(problem), offline },
             };
         }
+        self.thumbs.set_s4(self.s4());
         self.sync_now();
     }
 
@@ -471,6 +483,33 @@ impl Library {
     /// Why the library isn't syncing with S4, if it isn't.
     pub fn connection_problem(&self) -> Option<String> {
         self.connection.read().ok().and_then(|c| c.problem.clone())
+    }
+
+    /// Work Offline, or go back online. Offline, nothing reaches S4: no
+    /// sync, uploads, downloads or purges, and a running import pauses.
+    /// Edits wait on this Mac and upload when you go back online.
+    pub fn set_offline(&self, offline: bool) {
+        if let Ok(mut connection) = self.connection.write() {
+            connection.offline = offline;
+        }
+        self.thumbs.set_s4(self.s4());
+        let mut paused = self.paused_for_offline.lock().unwrap_or_else(|e| e.into_inner());
+        if offline && self.imports.control.is_running() && !self.imports.control.is_paused() {
+            self.imports.control.pause();
+            *paused = true;
+        } else if !offline && *paused {
+            self.imports.control.resume();
+            *paused = false;
+        }
+        drop(paused);
+        self.observer.import_changed();
+        if !offline {
+            self.sync_now();
+        }
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.connection.read().is_ok_and(|c| c.offline)
     }
 
     /// Sync now instead of waiting for the next round.

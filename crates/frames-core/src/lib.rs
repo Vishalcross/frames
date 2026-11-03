@@ -8,6 +8,7 @@ pub mod album_palette;
 pub mod cache;
 pub mod color;
 pub mod dates;
+pub mod hls;
 pub mod importer;
 pub mod keys;
 pub mod lock;

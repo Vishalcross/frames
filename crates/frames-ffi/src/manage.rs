@@ -82,6 +82,25 @@ pub struct LibraryCheck {
     pub limit_bytes: u64,
 }
 
+/// An album's colour setting for the Adaptive appearance: each photo's own
+/// colours, or one palette for the whole album, generated from its photos or
+/// chosen by hand. Kept on this Mac only, as in the Tauri app.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AlbumColours {
+    pub one_palette: bool,
+    pub chosen: bool,
+    pub chosen_colours: Option<ColourSet>,
+    pub generated: Option<ColourSet>,
+}
+
+/// Background, sidebar and accent, as `#RRGGBB`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ColourSet {
+    pub bg: String,
+    pub sidebar: String,
+    pub accent: String,
+}
+
 /// A photo's colours for the Adaptive appearance, as hex, with its brightness.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PhotoPalette {
@@ -280,6 +299,58 @@ impl Library {
         self.s4()?.presign_get(&key, Utc::now(), 3600).ok()
     }
 
+    pub fn album_colours(&self, album_id: String) -> Result<AlbumColours, FramesError> {
+        let store = self.store.lock().map_err(FramesError::other)?;
+        let theme = frames_core::palette::get_album_theme(store.connection(), &album_id).map_err(FramesError::other)?;
+        Ok(album_colours_from(theme))
+    }
+
+    /// Save an album's colour setting. A generated palette is made now if the
+    /// album has none yet.
+    pub fn set_album_colours(&self, album_id: String, one_palette: bool, chosen: bool,
+                             colours: Option<ColourSet>) -> Result<AlbumColours, FramesError> {
+        let store = self.store.lock().map_err(FramesError::other)?;
+        let conn = store.connection();
+        let (bg, sidebar, accent) = match colours {
+            Some(c) => (Some(c.bg), Some(c.sidebar), Some(c.accent)),
+            None => (None, None, None),
+        };
+        let mode = if one_palette { "album" } else { "dynamic" };
+        let source = if chosen { "manual" } else { "auto" };
+        let mut theme = frames_core::palette::set_album_theme(conn, &album_id, mode, source, bg, sidebar, accent)
+            .map_err(FramesError::other)?;
+        if one_palette && !chosen && theme.auto_bg.is_none() {
+            let _ = frames_core::album_palette::generate_and_save_album_palette(conn, self.thumbs.cache_root(), &album_id);
+            theme = frames_core::palette::get_album_theme(conn, &album_id).map_err(FramesError::other)?;
+        }
+        Ok(album_colours_from(theme))
+    }
+
+    /// Work the album's palette out again from its photos.
+    pub fn regenerate_album_colours(&self, album_id: String) -> Result<AlbumColours, FramesError> {
+        let store = self.store.lock().map_err(FramesError::other)?;
+        let conn = store.connection();
+        frames_core::album_palette::generate_and_save_album_palette(conn, self.thumbs.cache_root(), &album_id)
+            .map_err(FramesError::other)?;
+        let theme = frames_core::palette::get_album_theme(conn, &album_id).map_err(FramesError::other)?;
+        Ok(album_colours_from(theme))
+    }
+
+    /// An album the asset is in, whose colour setting applies when the photo
+    /// is opened from the library (as in the Tauri app).
+    pub fn album_of(&self, asset_id: String) -> Option<String> {
+        let store = self.store.lock().ok()?;
+        store
+            .connection()
+            .query_row(
+                "SELECT album_id FROM album_items ai JOIN albums a ON a.id = ai.album_id
+                 WHERE ai.asset_id = ?1 AND ai.in_album = 1 AND a.deleted_at IS NULL LIMIT 1",
+                [&asset_id],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
     /// The photo's colours for the Adaptive appearance, worked out from its
     /// thumbnail the first time. None until the thumbnail exists.
     pub fn palette(&self, asset_id: String) -> Option<PhotoPalette> {
@@ -294,6 +365,19 @@ impl Library {
             other => other?,
         };
         Some(PhotoPalette { bg: palette.bg, sidebar: palette.sidebar, accent: palette.accent, lum: palette.lum })
+    }
+}
+
+fn album_colours_from(theme: frames_core::AlbumTheme) -> AlbumColours {
+    let set = |bg: Option<String>, sidebar: Option<String>, accent: Option<String>| match (bg, sidebar, accent) {
+        (Some(bg), Some(sidebar), Some(accent)) => Some(ColourSet { bg, sidebar, accent }),
+        _ => None,
+    };
+    AlbumColours {
+        one_palette: theme.mode == "album",
+        chosen: theme.source == "manual",
+        chosen_colours: set(theme.bg, theme.sidebar, theme.accent),
+        generated: set(theme.auto_bg, theme.auto_sidebar, theme.auto_accent),
     }
 }
 

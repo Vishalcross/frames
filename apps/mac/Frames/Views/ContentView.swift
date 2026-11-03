@@ -65,6 +65,7 @@ struct LibraryWindow: View {
             case .adjustDate(let detail): AdjustDateSheet(detail: detail) { date in
                     Task { await model.setDate(detail, localTime: date) }
                 }
+            case .albumColours(let album, let colours): AlbumColoursSheet(album: album, colours: colours)
             }
         }
         .confirmations()
@@ -161,6 +162,8 @@ struct AlbumRow: View {
             .listRowBackground(targeted ? RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.25)) : nil)
             .contextMenu {
                 Button("Rename…") { model.sheet = .renameAlbum(album) }
+                Button("Colours…") { Task { await model.editColours(of: album) } }
+                Divider()
                 Button("Delete Album…", role: .destructive) { model.confirmation = .deleteAlbum(album) }
             }
             .onDrop(of: [.framesAssetID, .fileURL], isTargeted: $targeted) { providers in
@@ -295,14 +298,21 @@ struct SyncButton: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        Button { model.syncNow() } label: {
+        @Bindable var model = model
+        Menu {
+            Button("Sync Now") { model.syncNow() }
+                .disabled(model.connectionProblem != nil || model.workOffline)
+            Toggle("Work Offline", isOn: $model.workOffline)
+        } label: {
             Label("Sync", systemImage: symbol)
+        } primaryAction: {
+            if model.workOffline { model.workOffline = false } else { model.syncNow() }
         }
         .help(help)
-        .disabled(model.connectionProblem != nil)
     }
 
     private var symbol: String {
+        if model.workOffline { return "wifi.slash" }
         if model.connectionProblem != nil { return "icloud.slash" }
         switch model.online {
         case true?: return "checkmark.icloud"
@@ -312,6 +322,7 @@ struct SyncButton: View {
     }
 
     private var help: String {
+        if model.workOffline { return "Working offline. Click to go back online." }
         if let problem = model.connectionProblem { return problem }
         switch model.online {
         case true?: return "Up to date with MEGA S4. Click to sync now."
@@ -326,7 +337,18 @@ struct StatusBanner: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        if let text {
+        if model.workOffline {
+            HStack {
+                Label("Working offline. Changes stay on this Mac and upload when you go back online.", systemImage: "wifi.slash")
+                Spacer()
+                Button("Go Online") { model.workOffline = false }
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(.bar)
+        } else if let text {
             Label(text, systemImage: "icloud.slash")
                 .font(.callout)
                 .foregroundStyle(.secondary)

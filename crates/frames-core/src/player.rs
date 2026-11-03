@@ -193,7 +193,21 @@ pub fn build_ffmpeg_stream_args(
 
     args.push("-i".to_string());
     args.push(source_url.to_string());
+    args.extend(codec_args(decision, encoder));
+    args.extend([
+        "-movflags".to_string(),
+        "frag_keyframe+empty_moov+default_base_moof".to_string(),
+        "-f".to_string(),
+        "mp4".to_string(),
+        "pipe:1".to_string(),
+    ]);
+    args
+}
 
+/// ffmpeg's codec arguments for a playback decision: copy what plays, and
+/// transcode the rest to H.264 and AAC.
+pub(crate) fn codec_args(decision: PlaybackDecision, encoder: H264Encoder) -> Vec<String> {
+    let mut args = Vec::new();
     match decision {
         PlaybackDecision::PlayDirect | PlaybackDecision::Repackage => {
             args.extend([
@@ -238,14 +252,6 @@ pub fn build_ffmpeg_stream_args(
             }
         }
     }
-
-    args.extend([
-        "-movflags".to_string(),
-        "frag_keyframe+empty_moov+default_base_moof".to_string(),
-        "-f".to_string(),
-        "mp4".to_string(),
-        "pipe:1".to_string(),
-    ]);
     args
 }
 

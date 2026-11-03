@@ -75,6 +75,24 @@ enum ColourSource: String, CaseIterable, Identifiable {
     }
 }
 
+/// What tints the Glass window.
+enum GlassTint: String, CaseIterable, Identifiable {
+    case neutral
+    /// The colour of the photo you're looking at, as in Adaptive.
+    case photo
+
+    var id: Self { self }
+    var title: String { self == .neutral ? "Neutral" : "From the photo" }
+}
+
+/// How much of the desktop shows through the Glass window.
+enum GlassClarity: String, CaseIterable, Identifiable {
+    case regular, clear
+
+    var id: Self { self }
+    var title: String { rawValue.capitalized }
+}
+
 enum AccentChoice: String, CaseIterable, Identifiable {
     case system, blue, purple, pink, red, orange, yellow, green, graphite
 
@@ -104,6 +122,8 @@ final class ThemeSettings {
     var accent: AccentChoice { didSet { save("accent", accent.rawValue) } }
     var intensity: AdaptiveIntensity { didSet { save("intensity", intensity.rawValue) } }
     var colourSource: ColourSource { didSet { save("colourSource", colourSource.rawValue) } }
+    var glassTint: GlassTint { didSet { save("glassTint", glassTint.rawValue) } }
+    var glassClarity: GlassClarity { didSet { save("glassClarity", glassClarity.rawValue) } }
 
     private static let prefix = "FramesTheme."
 
@@ -113,6 +133,13 @@ final class ThemeSettings {
         accent = Self.load("accent", AccentChoice.system)
         intensity = Self.load("intensity", AdaptiveIntensity.balanced)
         colourSource = Self.load("colourSource", ColourSource.viewerAndBrowsing)
+        glassTint = Self.load("glassTint", GlassTint.neutral)
+        glassClarity = Self.load("glassClarity", GlassClarity.regular)
+    }
+
+    /// Whether photos decide colours: Adaptive, or Glass tinted from the photo.
+    var takesPhotoColours: Bool {
+        appearance == .adaptive || (appearance == .glass && glassTint == .photo)
     }
 
     private static func load<T: RawRepresentable<String>>(_ key: String, _ fallback: T) -> T {

@@ -54,12 +54,14 @@ enum Sheet: Identifiable {
     case newAlbum(assetIDs: [String])
     case renameAlbum(AlbumSummary)
     case adjustDate(AssetDetail)
+    case albumColours(AlbumSummary, AlbumColours)
 
     var id: String {
         switch self {
         case .newAlbum: "new-album"
         case .renameAlbum(let album): "rename-\(album.id)"
         case .adjustDate(let detail): "date-\(detail.id)"
+        case .albumColours(let album, _): "colours-\(album.id)"
         }
     }
 }
@@ -91,7 +93,20 @@ final class AppModel {
 
     var state = State.opening
     var sidebar = SidebarItem.library {
-        didSet { if sidebar != oldValue { clearSelection(); Task { await loadTimeline() } } }
+        didSet {
+            guard sidebar != oldValue else { return }
+            clearSelection()
+            theme.albumPage(pageAlbumID, core: core)
+            Task { await loadTimeline() }
+        }
+    }
+    /// Work Offline: nothing reaches S4 until switched off. Remembered on this Mac.
+    var workOffline = UserDefaults.standard.bool(forKey: "FramesWorkOffline") {
+        didSet {
+            UserDefaults.standard.set(workOffline, forKey: "FramesWorkOffline")
+            core?.library.setOffline(offline: workOffline)
+            if !workOffline { online = nil }
+        }
     }
     var grouping = LibraryGrouping.all
     var albums: [AlbumSummary] = []
@@ -154,6 +169,11 @@ final class AppModel {
             self.core = core
             pipeline = ImagePipeline(core: core)
             viewerCache = ViewerCache()
+            if workOffline { core.library.setOffline(offline: true) }
+            // A conversion still running at quit would otherwise outlive the app.
+            NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+                core.library.stopVideoStreams()
+            }
             connectionProblem = core.library.connectionProblem()
             await reload()
             await refreshImportStatus()
@@ -364,7 +384,7 @@ final class AppModel {
         focus = index
         transitions.prepareOpening(index: index)
         viewerIndex = index
-        theme.viewerShows(timeline.id(at: index), core: core)
+        theme.viewerShows(timeline.id(at: index), albumID: pageAlbumID, core: core)
     }
 
     func closeViewer() {
@@ -372,7 +392,7 @@ final class AppModel {
         selection = [index]
         focus = index
         transitions.close(index: index) { [weak self] in self?.viewerIndex = nil }
-        theme.viewerShows(nil, core: core)
+        theme.viewerShows(nil, albumID: nil, core: core)
     }
 
     func step(_ delta: Int) {
@@ -382,7 +402,7 @@ final class AppModel {
         self.viewerIndex = next
         selection = [next]
         focus = next
-        theme.viewerShows(timeline.id(at: next), core: core)
+        theme.viewerShows(timeline.id(at: next), albumID: pageAlbumID, core: core)
     }
 
     /// Browsing rested on a photo: Adaptive may take its colours.
@@ -403,6 +423,12 @@ final class AppModel {
 
     func zoom(by step: Int) {
         columns = min(15, max(3, columns + step))
+    }
+
+    /// The album whose page is shown, if any (not while searching).
+    private var pageAlbumID: String? {
+        if case .album(let id) = sidebar, !isSearching { return id }
+        return nil
     }
 
     var currentAlbum: AlbumSummary? {
@@ -441,6 +467,29 @@ final class AppModel {
 
     func newAlbum(with ids: [String]) {
         sheet = .newAlbum(assetIDs: ids)
+    }
+
+    /// Open the Album Colours sheet.
+    func editColours(of album: AlbumSummary) async {
+        guard let core, let colours = try? await core.run({ try $0.albumColours(albumId: album.id) }) else { return }
+        sheet = .albumColours(album, colours)
+    }
+
+    func saveColours(of album: AlbumSummary, onePalette: Bool, chosen: Bool, colours: ColourSet?) async {
+        guard let core else { return }
+        do {
+            _ = try await core.run { try $0.setAlbumColours(albumId: album.id, onePalette: onePalette, chosen: chosen, colours: colours) }
+            theme.albumColoursChanged(album.id, current: pageAlbumID, core: core)
+        } catch let error as FramesError {
+            notice = error.message
+        } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    func regenerateColours(of album: AlbumSummary) async -> AlbumColours? {
+        guard let core else { return nil }
+        return try? await core.run { try $0.regenerateAlbumColours(albumId: album.id) }
     }
 
     func createAlbum(named name: String, with ids: [String]) async {

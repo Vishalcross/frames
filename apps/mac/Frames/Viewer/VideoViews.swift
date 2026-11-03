@@ -1,9 +1,10 @@
 import AVKit
 import SwiftUI
 
-/// A video in the viewer, played by AVKit from the original on this Mac or
-/// straight from S4 (frames_swift_spec.md section 10). Formats macOS can't
-/// play say so and offer the original instead.
+/// A video in the viewer, played by AVKit (frames_swift_spec.md section 10):
+/// the original from this Mac or straight from S4 when AVFoundation can,
+/// otherwise a stream that repackages or converts it. If nothing plays, it
+/// says so and offers the original instead.
 struct VideoView: View {
     @Environment(AppModel.self) private var model
     let id: String
@@ -18,7 +19,7 @@ struct VideoView: View {
                 ContentUnavailableView {
                     Label("Can't Play Here", systemImage: "play.slash")
                 } description: {
-                    Text("This video's format doesn't play on a Mac. Export the original to open it in another app.")
+                    Text("This video couldn't be played or converted. Export the original to open it in another app.")
                 } actions: {
                     Button("Export Original…") { Task { await model.exportSelection() } }
                 }
@@ -26,24 +27,53 @@ struct VideoView: View {
             }
         }
         .task(id: id) { await load() }
-        .onDisappear { player?.pause() }
+        .onDisappear {
+            player?.pause()
+            model.core?.library.stopVideoStreams()
+        }
     }
 
+    /// Direct if the import's codec notes say so (or don't say), then a
+    /// repackaged stream, then a full conversion, stopping at the first that plays.
     private func load() async {
         player?.pause()
         player = nil
         failed = false
-        guard let core = model.core, let url = await mediaURL(core: core, video: true, id: id) else {
-            failed = true
-            return
-        }
+        guard let core = model.core else { return failed = true }
+        let id = self.id
+        let plan = (try? await core.run { $0.videoPlan(assetId: id) }) ?? .direct
+        if plan == .direct, let url = await mediaURL(core: core, video: true, id: id), await play(url) { return }
+        if plan != .convert, let url = await stream(core: core, convert: false), await play(url) { return }
+        if let url = await stream(core: core, convert: true), await play(url) { return }
+        if !Task.isCancelled { failed = true }
+    }
+
+    private func stream(core: Core, convert: Bool) async -> URL? {
+        let id = self.id
+        let address = try? await core.run { try $0.startVideoStream(assetId: id, convert: convert) }
+        return address.flatMap(URL.init(string:))
+    }
+
+    /// Play `url` if AVFoundation accepts it; false if it fails or is never ready.
+    private func play(_ url: URL) async -> Bool {
         let item = AVPlayerItem(url: url)
         let next = AVPlayer(playerItem: item)
         player = next
-        while item.status == .unknown, !Task.isCancelled {
+        let started = Date()
+        while item.status == .unknown, !Task.isCancelled, Date().timeIntervalSince(started) < 30 {
             try? await Task.sleep(for: .milliseconds(100))
         }
-        if item.status == .failed { failed = true } else { next.play() }
+        guard item.status == .readyToPlay, !Task.isCancelled else {
+            player = nil
+            return false
+        }
+        next.play()
+        #if DEBUG
+        if UserDefaults.standard.bool(forKey: "FramesDebugTimings") {
+            print("video: playing \(url.isFileURL ? "the original" : url.host == "127.0.0.1" ? "a stream" : "from S4") after \(String(format: "%.1f", Date().timeIntervalSince(started))) s")
+        }
+        #endif
+        return true
     }
 }
 

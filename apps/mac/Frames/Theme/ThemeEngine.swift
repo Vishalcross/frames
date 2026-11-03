@@ -6,61 +6,111 @@ struct ThemeColours: Equatable {
     var sidebar: NSColor?
     var accent: NSColor?
     var scheme: ColorScheme?
+    /// Glass tinted from the photo.
+    var glassTint: NSColor?
 }
 
 /// Works out the window's colours from the Appearance settings and, for
-/// Adaptive, from the photo that decides them: the open photo, or while
+/// Adaptive (or Glass tinted from the photo), from what decides them: an
+/// album's own palette when it has one, otherwise the open photo, or while
 /// browsing the photo under the pointer or in the middle of the scroll.
 @MainActor
 @Observable
 final class ThemeEngine {
     let settings = ThemeSettings()
     private(set) var colours = ThemeColours()
-    private var palette: PhotoPalette?
+    /// The photo's palette, from the viewer or browsing.
+    private var photoPalette: PhotoPalette?
+    /// An album's own palette, which wins over photos. Chosen colours are
+    /// shown exactly; generated ones are toned like a photo's.
+    private var albumPalette: (palette: PhotoPalette, exact: Bool)?
+    /// The album page's palette, kept while a photo from another album is open.
+    @ObservationIgnored private var pagePalette: (palette: PhotoPalette, exact: Bool)?
     /// Kept between photos, so mid-brightness photos don't flip it.
     private var photoScheme: ColorScheme = .dark
-    @ObservationIgnored private var paletteRequest: String?
+    @ObservationIgnored private var request: String?
     @ObservationIgnored private var lastBrowseFocus = Date.distantPast
+    @ObservationIgnored private var albumColours: [String: AlbumColours] = [:]
 
     init() {
         recompute()
     }
 
-    /// The open photo changed (nil when the viewer closes).
-    func viewerShows(_ id: String?, core: Core?) {
-        guard settings.appearance == .adaptive else { return }
-        if let id { focus(id, decidesScheme: true, core: core) } else if settings.colourSource == .viewer { setPalette(nil) }
+    /// The album page shown changed (nil: not an album).
+    func albumPage(_ albumID: String?, core: Core?) {
+        Task {
+            pagePalette = await palette(ofAlbum: albumID, core: core)
+            albumPalette = pagePalette
+            setPalette(albumPalette == nil ? photoPalette : nil)
+        }
+    }
+
+    /// The open photo changed (nil when the viewer closes). `albumID` is the
+    /// album it was opened from, if any; otherwise its own album's setting applies.
+    func viewerShows(_ id: String?, albumID: String?, core: Core?) {
+        guard settings.takesPhotoColours else { return }
+        guard let id else {
+            albumPalette = pagePalette
+            if settings.colourSource == .viewer && albumPalette == nil { photoPalette = nil }
+            return animate()
+        }
+        request = id
+        Task {
+            var album = albumID
+            if album == nil, let core { album = try? await core.run { $0.albumOf(assetId: id) } }
+            let fromAlbum = await palette(ofAlbum: album, core: core)
+            guard request == id else { return }
+            albumPalette = fromAlbum
+            if fromAlbum == nil { await focus(id, decidesScheme: true, core: core) } else { animate() }
+        }
     }
 
     /// The photo under the pointer, or in the middle of the scroll.
     func browsing(_ id: String, core: Core?) {
-        guard settings.appearance == .adaptive, settings.colourSource == .viewerAndBrowsing,
+        guard settings.takesPhotoColours, settings.colourSource == .viewerAndBrowsing, albumPalette == nil,
               Date().timeIntervalSince(lastBrowseFocus) > 0.8 else { return }
         lastBrowseFocus = Date()
+        request = id
         // Browsing changes the colours, never light and dark (spec 9).
-        focus(id, decidesScheme: false, core: core)
+        Task { await focus(id, decidesScheme: false, core: core) }
     }
 
     func settingsChanged() {
-        if settings.appearance != .adaptive { palette = nil }
+        if !settings.takesPhotoColours { photoPalette = nil }
         recompute()
     }
 
-    private func focus(_ id: String, decidesScheme: Bool, core: Core?) {
-        guard let core, paletteRequest != id else { return }
-        paletteRequest = id
-        Task {
-            let found = try? await core.run { $0.palette(assetId: id) }
-            guard paletteRequest == id, let found else { return }
-            if decidesScheme, let lum = found.lum {
-                if lum < 0.45 { photoScheme = .dark } else if lum > 0.55 { photoScheme = .light }
-            }
-            setPalette(found)
+    /// An album's colour setting changed: forget what was loaded for it.
+    func albumColoursChanged(_ albumID: String, current: String?, core: Core?) {
+        albumColours[albumID] = nil
+        if current == albumID { albumPage(albumID, core: core) }
+    }
+
+    private func palette(ofAlbum albumID: String?, core: Core?) async -> (palette: PhotoPalette, exact: Bool)? {
+        guard let albumID, let core else { return nil }
+        if albumColours[albumID] == nil {
+            albumColours[albumID] = try? await core.run { try $0.albumColours(albumId: albumID) }
         }
+        guard let colours = albumColours[albumID], colours.onePalette else { return nil }
+        let set = colours.chosen ? colours.chosenColours : colours.generated
+        guard let set else { return nil }
+        return (PhotoPalette(bg: set.bg, sidebar: set.sidebar, accent: set.accent, lum: nil), colours.chosen)
+    }
+
+    private func focus(_ id: String, decidesScheme: Bool, core: Core?) async {
+        guard let core, let found = try? await core.run({ $0.palette(assetId: id) }), request == id else { return }
+        if decidesScheme, let lum = found.lum {
+            if lum < 0.45 { photoScheme = .dark } else if lum > 0.55 { photoScheme = .light }
+        }
+        setPalette(found)
     }
 
     private func setPalette(_ new: PhotoPalette?) {
-        palette = new
+        photoPalette = new
+        animate()
+    }
+
+    private func animate() {
         withAnimation(.easeInOut(duration: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.4)) {
             recompute()
         }
@@ -74,20 +124,35 @@ final class ThemeEngine {
         case .dark: next.scheme = .dark
         case .followPhoto: next.scheme = settings.appearance == .adaptive ? photoScheme : nil
         }
+        let source = albumPalette ?? photoPalette.map { ($0, false) }
         switch settings.appearance {
-        case .standard, .glass:
+        case .standard:
             next.accent = settings.accent.color.map(NSColor.init)
+        case .glass:
+            next.accent = settings.accent.color.map(NSColor.init)
+            if settings.glassTint == .photo, let source, let accent = NSColor(hex: source.0.accent) {
+                let hue = accent.oklch
+                next.glassTint = Oklch(l: 0.62, c: min(0.14, max(0.06, hue.c)), h: hue.h).nsColor
+            }
         case .adaptive:
-            let dark = (next.scheme ?? Self.systemScheme) == .dark
-            if let palette, let roles = Self.immersive(palette, dark: dark, intensity: settings.intensity.factor) {
-                next.canvas = roles.canvas
-                next.sidebar = roles.sidebar
-                next.accent = roles.accent
+            if let (palette, exact) = source, exact, let bg = NSColor(hex: palette.bg) {
+                // Colours chosen for an album are shown as chosen, and their
+                // background decides light or dark (as in the Tauri app).
+                next.canvas = bg
+                next.sidebar = NSColor(hex: palette.sidebar)
+                next.accent = NSColor(hex: palette.accent)
+                next.scheme = bg.oklch.luminance < 0.18 ? .dark : .light
             } else {
-                // Before any photo: a quiet slate in the same tones.
-                let slate = Oklch(l: dark ? 0.22 : 0.965, c: 0.02, h: 255)
-                next.canvas = slate.nsColor
-                next.sidebar = Oklch(l: dark ? 0.185 : 0.925, c: 0.025, h: 255).nsColor
+                let dark = (next.scheme ?? Self.systemScheme) == .dark
+                if let (palette, _) = source, let roles = Self.immersive(palette, dark: dark, intensity: settings.intensity.factor) {
+                    next.canvas = roles.canvas
+                    next.sidebar = roles.sidebar
+                    next.accent = roles.accent
+                } else {
+                    // Before any photo: a quiet slate in the same tones.
+                    next.canvas = Oklch(l: dark ? 0.22 : 0.965, c: 0.02, h: 255).nsColor
+                    next.sidebar = Oklch(l: dark ? 0.185 : 0.925, c: 0.025, h: 255).nsColor
+                }
             }
         }
         if next != colours { colours = next }

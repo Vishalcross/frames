@@ -18,6 +18,15 @@ private struct Themed: ViewModifier {
         content
             .preferredColorScheme(colours.scheme)
             .tint(colours.accent.map { Color(nsColor: $0) })
-            .containerBackground(glass ? AnyShapeStyle(.ultraThinMaterial) : AnyShapeStyle(.windowBackground), for: .window)
+            .containerBackground(for: .window) {
+                if glass {
+                    ZStack {
+                        Rectangle().fill(theme.settings.glassClarity == .clear ? AnyShapeStyle(.ultraThinMaterial) : AnyShapeStyle(.regularMaterial))
+                        if let tint = colours.glassTint { Color(nsColor: tint).opacity(0.18) }
+                    }
+                } else {
+                    Rectangle().fill(.windowBackground)
+                }
+            }
     }
 }

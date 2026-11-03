@@ -48,7 +48,8 @@ struct LibraryCommands: Commands {
             Divider()
             Button("Sync Now") { model.syncNow() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(model.connectionProblem != nil)
+                .disabled(model.connectionProblem != nil || model.workOffline)
+            Toggle("Work Offline", isOn: Binding(get: { model.workOffline }, set: { model.workOffline = $0 }))
         }
         CommandGroup(after: .pasteboard) {
             Divider()

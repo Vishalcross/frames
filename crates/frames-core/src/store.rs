@@ -493,10 +493,17 @@ impl Store {
                 accent      TEXT NOT NULL,
                 on_bg       TEXT NOT NULL,
                 on_sidebar  TEXT NOT NULL,
-                computed_at INTEGER NOT NULL
+                computed_at INTEGER NOT NULL,
+                lum         REAL
             )",
             [],
         )?;
+        let palette_has_lum = conn
+            .prepare("SELECT 1 FROM pragma_table_info('photo_palettes') WHERE name = 'lum'")?
+            .exists([])?;
+        if !palette_has_lum {
+            conn.execute("ALTER TABLE photo_palettes ADD COLUMN lum REAL", [])?;
+        }
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS album_theme (

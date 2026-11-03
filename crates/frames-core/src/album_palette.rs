@@ -219,6 +219,7 @@ mod tests {
                 accent: format!("#{:02X}{:02X}FF", 10 + i * 5, 80 + i * 5), // Vivid blue
                 on_bg: "#FFFFFF".to_string(),
                 on_sidebar: "#FFFFFF".to_string(),
+                lum: None,
             });
         }
         // 2 orange palettes
@@ -229,6 +230,7 @@ mod tests {
                 accent: "#FF8800".to_string(),
                 on_bg: "#FFFFFF".to_string(),
                 on_sidebar: "#FFFFFF".to_string(),
+                lum: None,
             });
         }
 

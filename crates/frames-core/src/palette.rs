@@ -17,13 +17,17 @@ impl Default for Tone {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Palette {
     pub bg: String,
     pub sidebar: String,
     pub accent: String,
     pub on_bg: String,
     pub on_sidebar: String,
+    /// The photo's mean brightness, 0 to 1, for a light or dark interface
+    /// that follows the photo. Only photos have one, not albums.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lum: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +81,7 @@ pub fn fallback_palette(tone: Tone) -> Palette {
             accent: "#0A84FF".to_string(),
             on_bg: "#FFFFFF".to_string(),
             on_sidebar: "#FFFFFF".to_string(),
+            lum: None,
         },
         Tone::Light => Palette {
             bg: "#F2F2F7".to_string(),
@@ -84,6 +89,7 @@ pub fn fallback_palette(tone: Tone) -> Palette {
             accent: "#0A84FF".to_string(),
             on_bg: "#111111".to_string(),
             on_sidebar: "#111111".to_string(),
+            lum: None,
         },
     }
 }
@@ -192,6 +198,7 @@ pub fn normalise_roles(bg: &str, sidebar: &str, accent: &str, tone: Tone) -> Pal
         accent: to_hex(acc_rgb),
         on_bg,
         on_sidebar,
+        lum: None,
     }
 }
 
@@ -210,12 +217,15 @@ pub fn extract_palette(thumb: &Path, tone: Tone) -> Palette {
     // Count pixels per bucket and keep the average real colour of each bucket. Skip alpha < 128.
     let mut buckets = vec![Bucket::default(); 4096];
     let mut total_pixels = 0;
+    let mut luma_sum = 0.0f64;
 
     for pixel in resized.pixels() {
         let [r, g, b, a] = pixel.0;
         if a < 128 {
             continue;
         }
+        // Rec. 709 luma of the encoded values: close to how bright it looks.
+        luma_sum += (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
         let idx = (((r >> 4) as usize) << 8) | (((g >> 4) as usize) << 4) | ((b >> 4) as usize);
         buckets[idx].count += 1;
         buckets[idx].sum_r += r as u64;
@@ -321,7 +331,9 @@ pub fn extract_palette(thumb: &Path, tone: Tone) -> Palette {
     });
 
     // 7. Normalise roles
-    normalise_roles(&bg_hex, &sidebar_hex, &accent_hex, tone)
+    let mut palette = normalise_roles(&bg_hex, &sidebar_hex, &accent_hex, tone);
+    palette.lum = Some((luma_sum / total_pixels as f64) as f32);
+    palette
 }
 
 /// Compute palette from the asset's `s.webp` under `cache_root` and store in photo_palettes.
@@ -337,15 +349,16 @@ pub fn compute_and_store_palette(
     let palette = extract_palette(&thumb_file, Tone::Dark);
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
-        "INSERT INTO photo_palettes (asset_id, bg, sidebar, accent, on_bg, on_sidebar, computed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO photo_palettes (asset_id, bg, sidebar, accent, on_bg, on_sidebar, computed_at, lum)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(asset_id) DO UPDATE SET
              bg = excluded.bg,
              sidebar = excluded.sidebar,
              accent = excluded.accent,
              on_bg = excluded.on_bg,
              on_sidebar = excluded.on_sidebar,
-             computed_at = excluded.computed_at",
+             computed_at = excluded.computed_at,
+             lum = excluded.lum",
         rusqlite::params![
             asset_id,
             palette.bg,
@@ -354,6 +367,7 @@ pub fn compute_and_store_palette(
             palette.on_bg,
             palette.on_sidebar,
             now,
+            palette.lum,
         ],
     ).map_err(|e| format!("failed to store palette: {e}"))?;
 
@@ -363,7 +377,7 @@ pub fn compute_and_store_palette(
 /// Retrieve the cached palette for an asset from photo_palettes.
 pub fn get_palette_from_db(conn: &rusqlite::Connection, asset_id: &str) -> rusqlite::Result<Option<Palette>> {
     let mut stmt = conn.prepare(
-        "SELECT bg, sidebar, accent, on_bg, on_sidebar FROM photo_palettes WHERE asset_id = ?1",
+        "SELECT bg, sidebar, accent, on_bg, on_sidebar, lum FROM photo_palettes WHERE asset_id = ?1",
     )?;
     let mut rows = stmt.query([asset_id])?;
     if let Some(r) = rows.next()? {
@@ -373,6 +387,7 @@ pub fn get_palette_from_db(conn: &rusqlite::Connection, asset_id: &str) -> rusql
             accent: r.get(2)?,
             on_bg: r.get(3)?,
             on_sidebar: r.get(4)?,
+            lum: r.get(5)?,
         }))
     } else {
         Ok(None)
@@ -539,6 +554,19 @@ mod tests {
         assert_ne!(p.bg, p.sidebar, "bg and sidebar must differ");
         assert_ne!(p.sidebar, p.accent, "sidebar and accent must differ");
         assert_ne!(p.bg, p.accent, "bg and accent must differ");
+    }
+
+    #[test]
+    fn brightness_separates_bright_and_dark_photos() {
+        let snow = make_test_image(64, 64, |_, _| Rgba([235, 240, 245, 255]));
+        let night = make_test_image(64, 64, |x, _| if x < 8 { Rgba([255, 200, 80, 255]) } else { Rgba([10, 12, 30, 255]) });
+        let snow_lum = extract_palette(&snow, Tone::Dark).lum.unwrap();
+        let night_lum = extract_palette(&night, Tone::Dark).lum.unwrap();
+        let _ = std::fs::remove_file(&snow);
+        let _ = std::fs::remove_file(&night);
+
+        assert!(snow_lum > 0.9, "snow scene brightness {snow_lum}");
+        assert!(night_lum < 0.15, "night scene brightness {night_lum}");
     }
 
     #[test]

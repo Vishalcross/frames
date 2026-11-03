@@ -10,9 +10,10 @@ import type {
   Scheme
 } from '$lib/types';
 import {
-  computeTonalRoles,
+  immersiveRoles,
+  paletteFromSeeds,
   rolesFromPhotoPalette,
-  rolesFromPhotoSeeds,
+  schemeForBrightness,
   selectSeedAndSecondary,
   oklchToCss,
   type ComputedPaletteRoles,
@@ -76,12 +77,18 @@ export const theme = $state({
   reduceTransparency: initial.reduceTransparency
 });
 
+function systemScheme(): ResolvedScheme {
+  if (typeof window === 'undefined') return 'light';
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
 export const resolved = $state<{
   scheme: ResolvedScheme;
   tier: 1 | 2;
   palette: Palette | null;
 }>({
-  scheme: 'light',
+  // "Follow photo" starts from the system's scheme until a photo decides.
+  scheme: systemScheme(),
   tier: 1,
   palette: null
 });
@@ -213,11 +220,7 @@ function applyFocusedAsset(id: string | null) {
 
   // Scheme "Follow photo" (§7.6): dark when lum < .45, light when > .55
   if (theme.scheme === 'photo' && theme.appearance === 'adaptive') {
-    if (lum < 0.45) {
-      resolved.scheme = 'dark';
-    } else if (lum > 0.55) {
-      resolved.scheme = 'light';
-    }
+    resolved.scheme = schemeForBrightness(lum, resolved.scheme);
   }
 
   syncDOMTokens();
@@ -243,18 +246,21 @@ export function cycleAppearance(): void {
 export function syncDOM(): void {
   if (typeof document === 'undefined') return;
 
-  // Resolve system scheme
-  if (theme.scheme === 'system') {
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    resolved.scheme = prefersDark ? 'dark' : 'light';
+  // Resolve the scheme. "Follow photo" exists only in Adaptive; elsewhere it
+  // means the system's.
+  const followPhoto = theme.scheme === 'photo' && theme.appearance === 'adaptive';
+  if (theme.scheme === 'system' || (theme.scheme === 'photo' && !followPhoto)) {
+    resolved.scheme = systemScheme();
   } else if (theme.scheme === 'light' || theme.scheme === 'dark') {
     resolved.scheme = theme.scheme;
   }
   // Colours chosen for an album bring their own background, so their scheme
-  // decides; photo palettes are re-toned to the scheme instead.
+  // decides. Photo palettes are built for the scheme instead, which follows
+  // the photo's brightness when asked to.
   const fromPhoto =
     theme.appearance === 'adaptive' && photoPalette?.exact ? rolesFromPhotoPalette(photoPalette) : null;
   if (fromPhoto) resolved.scheme = fromPhoto.scheme;
+  else if (followPhoto) resolved.scheme = schemeForBrightness(photoPalette?.lum, resolved.scheme);
 
   // Detect Tier
   resolved.tier = detectGlassTier();
@@ -312,19 +318,18 @@ function syncDOMTokens(): void {
 
   if (theme.appearance === 'adaptive') {
     // One source for every token: the photo palette when there is one,
-    // otherwise the seed's tonal roles for the resolved scheme.
+    // otherwise the seed's, both as an immersive theme for the scheme.
     const highContrast = root.getAttribute('data-contrast') === 'more';
     let roles: ComputedPaletteRoles | null = null;
     if (photoPalette?.exact) {
       roles = rolesFromPhotoPalette(photoPalette)?.roles ?? null;
     } else if (photoPalette) {
-      roles = rolesFromPhotoSeeds(photoPalette, resolved.scheme, theme.intensity, highContrast);
+      roles = immersiveRoles(photoPalette, resolved.scheme, theme.intensity, highContrast);
     }
     if (!roles && resolved.palette) {
       const isBrowsingOnly = theme.colourSource === 'viewer' && !activeViewerAssetId;
-      roles = computeTonalRoles(
-        resolved.palette.seed,
-        resolved.palette.secondary,
+      roles = immersiveRoles(
+        paletteFromSeeds(resolved.palette.seed, resolved.palette.secondary),
         resolved.scheme,
         isBrowsingOnly ? 'subtle' : theme.intensity,
         highContrast

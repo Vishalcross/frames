@@ -17,7 +17,8 @@ function clamp(v: number, min: number, max: number): number {
  * Convert OKLCH to sRGB hex string.
  * Accurate OKLCH -> OKLab -> Linear RGB -> sRGB transformation.
  */
-export function oklchToRgb(l: number, c: number, hDeg: number): [number, number, number] {
+/** OKLCH to linear sRGB, unclamped, so callers can tell when it is out of gamut. */
+function oklchToLinearRgb(l: number, c: number, hDeg: number): [number, number, number] {
   const hRad = (hDeg * Math.PI) / 180;
   const a = c * Math.cos(hRad);
   const b = c * Math.sin(hRad);
@@ -32,9 +33,15 @@ export function oklchToRgb(l: number, c: number, hDeg: number): [number, number,
   const S = s_ * s_ * s_;
 
   // LMS to Linear sRGB
-  let rLin = +4.0767416621 * L - 3.3077115913 * M + 0.2309699292 * S;
-  let gLin = -1.2684380046 * L + 2.6097574011 * M - 0.3413193965 * S;
-  let bLin = -0.0041960863 * L - 0.7034186147 * M + 1.707614701 * S;
+  return [
+    +4.0767416621 * L - 3.3077115913 * M + 0.2309699292 * S,
+    -1.2684380046 * L + 2.6097574011 * M - 0.3413193965 * S,
+    -0.0041960863 * L - 0.7034186147 * M + 1.707614701 * S
+  ];
+}
+
+export function oklchToRgb(l: number, c: number, hDeg: number): [number, number, number] {
+  const [rLin, gLin, bLin] = oklchToLinearRgb(l, c, hDeg);
 
   // Gamma compression (Linear to sRGB)
   const transfer = (c: number) => {
@@ -268,6 +275,8 @@ export interface PhotoPalette {
   on_sidebar: string;
   /** Colours someone chose for an album: shown exactly, not re-toned. */
   exact?: boolean;
+  /** The photo's mean brightness, 0-1, for "Follow photo". */
+  lum?: number;
 }
 
 /** sRGB (0-255) to OKLCH, the inverse of `oklchToRgb`. */
@@ -289,12 +298,14 @@ export function rgbToOklch(r: number, g: number, b: number): OklchColor {
 }
 
 /**
- * A photo's palette in the user's light or dark scheme: surfaces and text
- * take the photo's dominant hue, the accent its most vivid colour, at the
- * scheme's own tones. So opening a photo recolours the app without flipping a
- * light app to dark. `null` if a colour is malformed.
+ * A photo's colours as an immersive theme, after editor themes such as Tokyo
+ * Night or Solarized Light: every surface carries colour at the scheme's
+ * tones, not just the accent. The canvas takes the photo's dominant hue, the
+ * sidebar its second hue a shade deeper, and the accent, hover fills and glow
+ * its most vivid colour. Light or dark is the caller's choice (see
+ * `schemeForBrightness`). `null` if a colour is malformed.
  */
-export function rolesFromPhotoSeeds(
+export function immersiveRoles(
   p: PhotoPalette,
   scheme: ResolvedScheme,
   intensity: AdaptiveIntensity = 'balanced',
@@ -304,11 +315,102 @@ export function rolesFromPhotoSeeds(
   const sidebar = hexToRgb(p.sidebar);
   const accent = hexToRgb(p.accent);
   if (!bg || !sidebar || !accent) return null;
-  const dominant = rgbToOklch(...bg);
+
+  const dark = scheme === 'dark';
+  const k = intensity === 'subtle' ? 0.6 : intensity === 'vivid' ? 1.4 : 1;
   const vivid = rgbToOklch(...accent);
-  const base = computeTonalRoles(dominant, rgbToOklch(...sidebar), scheme, intensity, highContrast);
-  const accented = computeTonalRoles(vivid, dominant, scheme, intensity, highContrast);
-  return { ...base, accent: accented.accent, accentFg: accented.accentFg, ambient1: accented.ambient1 };
+  // How colourful the dominant and second colours are (the extractor caps
+  // saturation at 0.35). A grey photo gets a faint tint of its accent.
+  const colourOf = (rgb: Rgb) => Math.min(1, hslSaturation(rgb) / 0.35);
+  const greyCanvas = colourOf(bg) < 0.15;
+  const canvasHue = greyCanvas ? vivid.h : rgbToOklch(...bg).h;
+  const canvasAmt = greyCanvas ? 0.3 : colourOf(bg);
+  const greySidebar = colourOf(sidebar) < 0.15;
+  const sidebarHue = greySidebar ? canvasHue : rgbToOklch(...sidebar).h;
+  const sidebarAmt = greySidebar ? canvasAmt : colourOf(sidebar);
+
+  // Chroma rises with the photo's colourfulness, to about what the most
+  // colourful editor themes use (Night Owl's canvas is near 0.05).
+  const surfaceC = (amt: number) => k * (dark ? 0.03 + 0.035 * amt : 0.012 + 0.022 * amt);
+  const canvas = fitOklch(dark ? 0.22 : 0.965, surfaceC(canvasAmt), canvasHue);
+  const side = fitOklch(dark ? 0.185 : 0.925, surfaceC(sidebarAmt) * (dark ? 1 : 1.15), sidebarHue);
+  const raised = fitOklch(dark ? 0.27 : 0.99, dark ? canvas.c : k * 0.008, canvasHue);
+  const canvasRgb = oklchToRgb(canvas.l, canvas.c, canvas.h);
+  // Text must read on the palest dark surface or the deepest light one.
+  const textBg = dark ? oklchToRgb(raised.l, raised.c, raised.h) : oklchToRgb(side.l, side.c, side.h);
+  const minText = highContrast ? 7 : 4.5;
+  const text1 = ensureContrast({ l: dark ? 0.94 : 0.25, c: 0.02, h: canvasHue, pop: 1 }, textBg, minText);
+  const text2 = ensureContrast({ l: dark ? 0.78 : 0.43, c: 0.035, h: canvasHue, pop: 1 }, textBg, 4.5);
+  const text3 = ensureContrast({ l: dark ? 0.62 : 0.58, c: 0.035, h: canvasHue, pop: 1 }, textBg, highContrast ? 4.5 : 3);
+
+  const accentC = Math.min(0.2, k * Math.max(0.12, vivid.c));
+  const acc = ensureContrast(fitOklch(dark ? 0.76 : 0.52, accentC, vivid.h), canvasRgb, 3);
+  const accRgb = oklchToRgb(acc.l, acc.c, acc.h);
+  const white: Rgb = [255, 255, 255];
+  const ink: Rgb = [17, 17, 19];
+  const accentFg = contrastRatio(white, accRgb) >= contrastRatio(ink, accRgb) ? '#ffffff' : '#111113';
+
+  const css = (o: OklchColor, alpha = 1) => oklchToCss(o.l, o.c, o.h, alpha);
+  const fill = fitOklch(dark ? 0.8 : 0.55, k * 0.08, vivid.h);
+  return {
+    bgCanvas: css(canvas),
+    bgSidebar: css(side),
+    bgViewer: css(fitOklch(dark ? 0.13 : 0.985, k * (dark ? 0.025 : 0.008), canvasHue)),
+    surfaceRaised: css(raised),
+    surfaceOverlay: css(fitOklch(dark ? 0.25 : 0.975, canvas.c, canvasHue), 0.96),
+    fill1: css(fill, 0.07),
+    fill2: css(fill, dark ? 0.12 : 0.11),
+    fill3: css(fill, dark ? 0.18 : 0.17),
+    text1: css(text1),
+    text2: css(text2),
+    text3: css(text3),
+    separator: css(fitOklch(dark ? 0.85 : 0.4, dark ? 0.03 : 0.04, canvasHue), dark ? 0.12 : 0.14),
+    accent: css(acc),
+    accentFg,
+    ambient1: css(fitOklch(dark ? 0.55 : 0.84, k * (dark ? 0.16 : 0.1), vivid.h), dark ? 0.3 : 0.4),
+    ambient2: css(fitOklch(dark ? 0.5 : 0.88, k * (dark ? 0.1 : 0.07), sidebarHue), dark ? 0.24 : 0.32)
+  };
+}
+
+/**
+ * Light or dark for a photo of mean brightness `lum` (0-1): dark below 0.45,
+ * light above 0.55, otherwise unchanged so mid-tone photos do not flip it.
+ */
+export function schemeForBrightness(lum: number | null | undefined, current: ResolvedScheme): ResolvedScheme {
+  if (lum == null) return current;
+  if (lum < 0.45) return 'dark';
+  if (lum > 0.55) return 'light';
+  return current;
+}
+
+/** Swatch seeds (no photo palette yet, or the mock library) as a photo palette. */
+export function paletteFromSeeds(seed: OklchColor, secondary: OklchColor): PhotoPalette {
+  const hex = (l: number, c: number, h: number) => oklchToCss(l, c, h);
+  return {
+    bg: hex(0.25, Math.min(seed.c, 0.05), seed.h),
+    sidebar: hex(0.25, Math.min(secondary.c, 0.05), secondary.h),
+    accent: hex(0.65, seed.c, seed.h),
+    on_bg: '#ffffff',
+    on_sidebar: '#ffffff'
+  };
+}
+
+/** `l`, `c`, `h` with the chroma reduced until the colour fits in sRGB. */
+function fitOklch(l: number, c: number, h: number): OklchColor {
+  let chroma = Math.max(0, c);
+  while (chroma > 0 && !inSrgb(oklchToLinearRgb(l, chroma, h))) chroma -= 0.004;
+  return { l, c: Math.max(0, chroma), h, pop: 1 };
+}
+
+function inSrgb(rgb: [number, number, number]): boolean {
+  return rgb.every((v) => v >= -0.001 && v <= 1.001);
+}
+
+function hslSaturation([r, g, b]: Rgb): number {
+  const max = Math.max(r, g, b) / 255;
+  const min = Math.min(r, g, b) / 255;
+  const l = (max + min) / 2;
+  return max === min ? 0 : (max - min) / (1 - Math.abs(2 * l - 1));
 }
 
 type Rgb = [number, number, number];

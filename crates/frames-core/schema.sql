@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS photo_palettes (
   accent      TEXT NOT NULL,
   on_bg       TEXT NOT NULL,
   on_sidebar  TEXT NOT NULL,
-  computed_at INTEGER NOT NULL
+  computed_at INTEGER NOT NULL,
+  lum         REAL
 );
 
 -- Album colour theme settings (Task 4-e)

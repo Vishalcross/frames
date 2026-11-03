@@ -14,11 +14,14 @@ pub fn get_palette(
     let conn = store.connection();
 
     // 1. If row exists in photo_palettes, return it
-    if let Ok(Some(pal)) = frames_core::palette::get_palette_from_db(conn, &asset_id) {
-        return Ok(Some(pal));
+    let stored = frames_core::palette::get_palette_from_db(conn, &asset_id).ok().flatten();
+    if let Some(pal) = &stored {
+        if pal.lum.is_some() {
+            return Ok(stored);
+        }
     }
 
-    // 2. If row is missing and thumbnail exists, compute now and store
+    // 2. If row is missing (or predates brightness) and thumbnail exists, compute now and store
     let cache_root = state.thumbs.cache_root();
     if state.thumbs.small_thumb_path(&asset_id).exists() {
         if let Ok(pal) = frames_core::palette::compute_and_store_palette(conn, cache_root, &asset_id) {
@@ -26,8 +29,8 @@ pub fn get_palette(
         }
     }
 
-    // 3. If thumbnail does not exist yet, return null
-    Ok(None)
+    // 3. If thumbnail does not exist yet, return the stored row or null
+    Ok(stored)
 }
 
 #[tauri::command(async)]

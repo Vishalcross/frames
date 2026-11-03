@@ -14,6 +14,8 @@ export interface AdaptivePalette {
   on_sidebar: string;
   /** Chosen by hand for an album, so shown exactly rather than re-toned. */
   exact?: boolean;
+  /** The photo's mean brightness, 0-1 (photos only), for "Follow photo". */
+  lum?: number;
 }
 
 export interface BackendAlbumTheme {
@@ -56,8 +58,9 @@ let isListeningToPaletteReady = false;
 let pageAlbumId: string | null = null;
 
 // "Viewer and browsing": the photo under the pointer or centred in the scroll
-// colours the app like an open one, under the same album rules.
-onBrowsingFocus((assetId) => handleViewedPhotoChange(assetId, pageAlbumId));
+// colours the app like an open one, under the same album rules. Only an open
+// photo decides light or dark, so hovering never flips the whole app.
+onBrowsingFocus((assetId) => handleViewedPhotoChange(assetId, pageAlbumId, { browsing: true }));
 
 /**
  * Setup Tauri event listener for album-palette-ready
@@ -199,7 +202,8 @@ export function getCurrentPalette(): AdaptivePalette | null {
  */
 export function handleViewedPhotoChange(
   assetId: string | null,
-  albumId?: string | null
+  albumId?: string | null,
+  opts: { browsing?: boolean } = {}
 ): void {
   if (debounceTimer) {
     clearTimeout(debounceTimer);
@@ -216,7 +220,7 @@ export function handleViewedPhotoChange(
       // If the result is null and viewing a photo, do nothing (the previous colours stay).
       // If closing the viewer with no active album palette, restore expected grid colours.
       if (palette) {
-        applyPalette(palette);
+        applyPalette(opts.browsing ? { ...palette, lum: undefined } : palette);
       } else if (!assetId) {
         clearAdaptivePalette();
       }

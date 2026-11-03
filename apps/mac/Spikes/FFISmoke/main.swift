@@ -28,7 +28,7 @@ do {
         try Library.open(dataDir: arguments[1], cacheDir: arguments.count > 2 ? arguments[2] : nil, observer: Quiet())
     }
     print("connection: \(library.connectionProblem() ?? "ok")")
-    let timeline = try timed("timeline") { try library.timeline(filter: TimelineFilter(albumId: nil, videosOnly: false)) }
+    let timeline = try timed("timeline") { try library.timeline(filter: TimelineFilter(albumId: nil, kind: nil, trash: false, text: nil, year: nil, month: nil, camera: nil, fileExt: nil)) }
     print("\(timeline.count) items, \(timeline.ids.count) id bytes, \(timeline.thumbhashes.count) thumbhash bytes")
     for album in try library.albums() {
         print("album \"\(album.name)\": \(album.assetCount) items")

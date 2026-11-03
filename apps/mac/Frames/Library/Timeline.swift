@@ -6,8 +6,10 @@ struct TimelineSection: Sendable, Equatable {
     let count: Int
     let year: Int
     let month: Int
+    /// A header that isn't a month, for a timeline that isn't ordered by date.
+    var heading: String?
 
-    var title: String { "\(Calendar.current.standaloneMonthSymbols[month - 1]) \(year)" }
+    var title: String { heading ?? "\(Calendar.current.standaloneMonthSymbols[month - 1]) \(year)" }
 }
 
 /// A whole timeline held in memory (frames_swift_spec.md 5.3): the core's
@@ -26,6 +28,7 @@ struct Timeline: Sendable {
     private let durations: [UInt32]
     private let thumbhashes: Data
     private let thumbhashEnds: [UInt32]
+    private let daysLeft: [UInt16]
 
     private init() {
         version = UUID()
@@ -38,6 +41,7 @@ struct Timeline: Sendable {
         durations = []
         thumbhashes = Data()
         thumbhashEnds = []
+        daysLeft = []
     }
 
     init(_ snapshot: TimelineSnapshot) {
@@ -50,7 +54,14 @@ struct Timeline: Sendable {
         durations = Self.integers(snapshot.durationS)
         thumbhashes = snapshot.thumbhashes
         thumbhashEnds = Self.integers(snapshot.thumbhashEnds)
-        sections = Self.sections(localMs)
+        daysLeft = Self.integers(snapshot.daysLeft)
+        if daysLeft.isEmpty {
+            sections = Self.sections(localMs)
+        } else {
+            // Recently Deleted is ordered by deletion, so it is one section.
+            sections = count == 0 ? [] : [TimelineSection(start: 0, count: count, year: 0, month: 1,
+                                                          heading: "Deleted items are removed for good after 30 days")]
+        }
     }
 
     /// The core's little-endian numbers as an array, in one copy. The app is
@@ -77,10 +88,30 @@ struct Timeline: Sendable {
     func dateGuessed(_ index: Int) -> Bool { flags[index] & 4 != 0 }
     func durationSeconds(_ index: Int) -> Int { Int(durations[index]) }
     func thumbhash(_ index: Int) -> Data { thumbhashes[range(index, ends: thumbhashEnds)] }
+    /// Days until a Recently Deleted item is purged; nil outside Recently Deleted.
+    func daysLeft(_ index: Int) -> Int? { index < daysLeft.count ? Int(daysLeft[index]) : nil }
 
     func index(of id: String) -> Int? {
         let wanted = Array(id.utf8)
         return (0..<count).first { ids[range($0, ends: idEnds)].elementsEqual(wanted) }
+    }
+
+    /// Where each of `wanted` is, in one pass over the timeline.
+    func indexes(of wanted: [String]) -> [String: Int] {
+        guard !wanted.isEmpty else { return [:] }
+        if wanted.count <= 8 {
+            return Dictionary(wanted.compactMap { id in index(of: id).map { (id, $0) } }, uniquingKeysWith: { a, _ in a })
+        }
+        let set = Set(wanted)
+        var found: [String: Int] = [:]
+        for index in 0..<count {
+            let id = id(at: index)
+            if set.contains(id) {
+                found[id] = index
+                if found.count == set.count { break }
+            }
+        }
+        return found
     }
 
     func section(containing index: Int) -> Int? {

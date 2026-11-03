@@ -25,6 +25,41 @@ struct LibraryCommands: Commands {
     let model: AppModel
 
     var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("New Album") { model.newAlbum(with: []) }
+                .keyboardShortcut("n")
+            Button("New Album with Selection") { model.newAlbum(with: model.selectedIDs) }
+                .keyboardShortcut("n", modifiers: [.command, .option])
+                .disabled(model.selection.isEmpty)
+            Divider()
+            Button("Export Originals…") { Task { await model.exportSelection() } }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+                .disabled(model.selection.isEmpty)
+            Divider()
+            Button("Sync Now") { model.syncNow() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(model.connectionProblem != nil)
+        }
+        CommandGroup(after: .pasteboard) {
+            Divider()
+            if model.sidebar == .trash {
+                Button("Recover") { Task { await model.restoreSelection() } }
+                    .disabled(model.selection.isEmpty)
+                Button("Delete Now…") { model.confirmDeleteNow() }
+                    .keyboardShortcut(.delete)
+                    .disabled(model.selection.isEmpty)
+            } else {
+                Button("Move to Recently Deleted") { Task { await model.trashSelection() } }
+                    .keyboardShortcut(.delete)
+                    .disabled(model.selection.isEmpty)
+            }
+        }
+        CommandMenu("Image") {
+            Button("Adjust Date and Time…") { Task { await model.adjustDate() } }
+                .disabled(model.selection.count != 1 && model.viewerIndex == nil)
+            Button(model.showInfo ? "Hide Info" : "Show Info") { model.showInfo.toggle() }
+                .keyboardShortcut("i")
+        }
         CommandGroup(after: .sidebar) {
             Button("Years") { model.grouping = .years }
                 .keyboardShortcut("1")
@@ -37,14 +72,6 @@ struct LibraryCommands: Commands {
                 .keyboardShortcut("+")
             Button("Zoom Out") { model.zoom(by: 1) }
                 .keyboardShortcut("-")
-            Divider()
-            Button(model.showInfo ? "Hide Info" : "Show Info") { model.showInfo.toggle() }
-                .keyboardShortcut("i")
-        }
-        CommandGroup(after: .newItem) {
-            Button("Sync Now") { model.syncNow() }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(model.connectionProblem != nil)
         }
     }
 }

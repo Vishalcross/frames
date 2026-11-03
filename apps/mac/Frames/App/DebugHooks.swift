@@ -3,7 +3,8 @@ import AppKit
 import ImageIO
 
 /// Test hooks for Debug builds, all off unless passed as launch arguments:
-/// `-FramesDebugSidebar videos|<album name>`, `-FramesDebugGrouping years|months|all`,
+/// `-FramesDebugSidebar videos|trash|<album name>`, `-FramesDebugGrouping years|months|all`,
+/// `-FramesDebugSelect <first>-<last>`, `-FramesDebugSearch <text>`,
 /// `-FramesDebugColumns N`, `-FramesDebugOpen <index>` (opens the viewer),
 /// `-FramesDebugInfo YES`, `-FramesDebugScrollTo <index>`, `-FramesDebugTimings YES`
 /// (prints how long loading took), and `-FramesDebugSnapshot <png path>`, which writes
@@ -15,9 +16,12 @@ enum DebugHooks {
         guard case .ready = model.state else { return snapshotIfAsked(defaults) }
         switch defaults.string(forKey: "FramesDebugSidebar") {
         case "videos"?: model.sidebar = .videos
+        case "trash"?: model.sidebar = .trash
         case let name?: if let album = model.albums.first(where: { $0.name == name }) { model.sidebar = .album(album.id) }
         case nil: break
         }
+        // Selections below refer to the timeline for this sidebar item.
+        await model.loadTimeline()
         switch defaults.string(forKey: "FramesDebugGrouping") {
         case "years"?: model.grouping = .years
         case "months"?: model.grouping = .months
@@ -25,6 +29,14 @@ enum DebugHooks {
         }
         if defaults.integer(forKey: "FramesDebugColumns") > 0 { model.columns = defaults.integer(forKey: "FramesDebugColumns") }
         try? await Task.sleep(for: .milliseconds(300))
+        if let search = defaults.string(forKey: "FramesDebugSearch") {
+            model.searchText = search
+            try? await Task.sleep(for: .milliseconds(600))
+        }
+        if let range = defaults.string(forKey: "FramesDebugSelect")?.split(separator: "-").compactMap({ Int($0) }), range.count == 2 {
+            model.selection = IndexSet(integersIn: range[0]...range[1])
+            model.focus = range[1]
+        }
         if defaults.object(forKey: "FramesDebugScrollTo") != nil {
             model.scrollTarget = ScrollTarget(index: defaults.integer(forKey: "FramesDebugScrollTo"))
         }

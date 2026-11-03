@@ -467,3 +467,47 @@ Each phase ends with an app the owner can use on the real library and a performa
 * The S4 secret is still read through `/usr/bin/security`, as the Tauri app does, so nothing prompts until a stable signing identity exists (5.5).
 * The Settings window (Phase 6). Until then the app reads `settings.json` written by the Tauri app.
 * Sync is untested from this app against the real bucket. It is the same `sync_once` the Tauri app runs every 5 minutes.
+
+## 20. Phase 2 status (2026-11-03)
+
+**Built:**
+* **Selection.** Click, Shift-click (range), ⌘-click (toggle), a marquee dragged from a gap or header, clicking a month header (selects the month), ⌘A, Esc, and Shift-arrow. Selected tiles get a ring and a check mark. The selection is kept by asset id across reloads.
+* **Albums:**
+  * create from the sidebar's +, from File › New Album (⌘N), or from a selection (⌥⌘N) or its menus;
+  * rename and delete from the sidebar's context menu, with a confirmation before deleting;
+  * add, move and remove from the grid's context menu or the toolbar;
+  * drop photos on a sidebar album to add them.
+* **Recently Deleted:**
+  * sidebar entry; one grid ordered by deletion, each tile showing its days left;
+  * Recover, Delete Now (confirmed), and Delete All (confirmed with the count and size; needs S4);
+  * ⌘⌫ moves photos there.
+* **Adjust Date and Time.** A sheet from the Image menu or the context menu. It edits the wall-clock time where the photo was taken; only the index changes.
+* **Export:**
+  * Export Originals… (⇧⌘E) copies from this Mac when the original is still at its import path, otherwise from S4. It reports anything missing.
+  * Dragging tiles to Finder or another app writes each original on drop (file promises; the first 500 of a larger drag).
+* **Search.** The toolbar field with suggested tokens: albums, months, cameras, types and file names. The results replace the grid.
+* **Edits upload about 2 s after the last one,** in one log batch. Items past 30 days are purged daily. Both need S4.
+* **The items from Phase 1's "not yet" list:**
+  * the year scrubber (it appears while scrolling or on hover; click or drag to jump, with a month bubble);
+  * the zoom from a tile into the viewer and back;
+  * the grid follows a pinch live and settles on the nearest column count with animation (⌘+/− animate too);
+  * the full-resolution original replaces the screen-size image once the viewer is zoomed past 100%.
+
+**Bridge additions:**
+* album edits; trash, restore, delete-now and empty-trash calls;
+* `set_date`, `export_originals`, `export_original` and `filenames`;
+* `search_suggestions`; a trash summary;
+* the Recently Deleted timeline with days left;
+* timeline filters for text, month, camera, type and file extension;
+* the edit-upload and daily-purge threads.
+
+`apps/mac/Spikes/EditCheck` runs every edit on a copy of a library and checks the result. All 18 checks pass, and every edit queues its change-log op.
+
+**Not verified by me.** These need a person at the trackpad:
+* the live pinch;
+* drag to Finder and drops on sidebar albums;
+* context menus and sheets;
+* keyboard shortcuts;
+* the viewer transition at full speed.
+
+Delete Now, Delete All and the edit upload are untested against the real bucket, because the test copies have no S4 settings.

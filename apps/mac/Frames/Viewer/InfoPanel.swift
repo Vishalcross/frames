@@ -6,7 +6,7 @@ struct InfoPanel: View {
     @State private var detail: AssetDetail?
 
     var body: some View {
-        let index = model.viewerIndex ?? model.selection
+        let index = model.viewerIndex ?? model.focus ?? model.selection.first
         let id = index.flatMap { $0 < model.timeline.count ? model.timeline.id(at: $0) : nil }
         Group {
             if let detail, detail.id == id {

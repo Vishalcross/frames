@@ -65,6 +65,8 @@ extension FramesError {
             "Frames is already open in another app. Quit it, then try again."
         case .DamagedDatabase(let message):
             "The library database could not be opened: \(message)"
+        case .NotConnected:
+            "Frames isn't connected to MEGA S4, so this can't be done now."
         case .Other(let message):
             message
         }

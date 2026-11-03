@@ -3,31 +3,38 @@ import SwiftUI
 
 /// One photo filling the detail area (frames_swift_spec.md 7.5): the grid's
 /// thumbnail at once, then the preview, then the original on this Mac, each
-/// decoded at screen size. Neighbours are prepared while you look.
+/// decoded at screen size. Zooming past 100% brings in the full-resolution
+/// original. Neighbours are prepared while you look.
 struct ViewerView: View {
     @Environment(AppModel.self) private var model
     let index: Int
     @State private var image: CGImage?
+    @State private var fullResolution: CGImage?
 
     var body: some View {
         let id = model.timeline.id(at: index)
-        ZoomableImage(image: image) { key in
+        let opening = model.transitions.phase == .opening
+        ZoomableImage(assetID: id, image: fullResolution ?? image, hidden: opening, transitions: model.transitions) { key in
             switch key {
             case .previous: model.step(-1)
             case .next: model.step(1)
             case .close: model.closeViewer()
             case .info: model.showInfo.toggle()
+            case .fullResolution: Task { await loadFullResolution(id) }
             }
         }
-        .background(Color.black)
-        .task(id: id) { await load(id) }
+        .background(opening ? Color.clear : Color.black)
+        .task(id: id) {
+            fullResolution = nil
+            await load(id)
+        }
     }
 
     private func load(_ id: String) async {
         guard let core = model.core, let pipeline = model.pipeline, let cache = model.viewerCache else { return }
         let pixels = ViewerCache.screenPixels
         image = cache.image(for: id)
-            ?? [384, 256, 128].lazy.compactMap { pipeline.cached(id, pixels: $0) }.first
+            ?? [512, 384, 256, 128].lazy.compactMap { pipeline.cached(id, pixels: $0) }.first
             ?? pipeline.placeholder(id, hash: model.timeline.thumbhash(index))
         if cache.isFull(id) { return prepareNeighbours() }
 
@@ -40,6 +47,14 @@ struct ViewerView: View {
             image = original
             cache.store(original, for: id, full: true)
         }
+    }
+
+    /// The original at its own size, for detail past 100%. Not cached: one
+    /// at a time, dropped when you move on.
+    private func loadFullResolution(_ id: String) async {
+        guard let core = model.core, fullResolution == nil else { return }
+        let full = await ViewerCache.decode(core: core, id: id, pixels: 16_384, original: true)
+        if model.viewerIndex.map({ model.timeline.id(at: $0) }) == id { fullResolution = full }
     }
 
     private func prepareNeighbours() {
@@ -97,13 +112,16 @@ final class ViewerCache {
 }
 
 enum ViewerKey {
-    case previous, next, close, info
+    case previous, next, close, info, fullResolution
 }
 
 /// The photo in a magnifying scroll view: pinch or double-click to zoom,
 /// arrows to move, Esc or Space to go back to the grid.
 struct ZoomableImage: NSViewRepresentable {
+    let assetID: String
     let image: CGImage?
+    let hidden: Bool
+    let transitions: ViewerTransitions
     let onKey: (ViewerKey) -> Void
 
     func makeNSView(context: Context) -> ZoomView {
@@ -112,13 +130,19 @@ struct ZoomableImage: NSViewRepresentable {
 
     func updateNSView(_ view: ZoomView, context: Context) {
         view.onKey = onKey
-        view.show(image)
+        view.transitions = transitions
+        view.show(image, assetID: assetID, hidden: hidden)
     }
 }
 
 final class ZoomView: NSScrollView {
     var onKey: (ViewerKey) -> Void = { _ in }
+    weak var transitions: ViewerTransitions?
+    private(set) var image: CGImage?
     private let canvas = NSView()
+    private var assetID: String?
+    private var askedForFullResolution = false
+    private var appeared = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -132,18 +156,39 @@ final class ZoomView: NSScrollView {
         canvas.layerContentsRedrawPolicy = .never
         canvas.layer?.contentsGravity = .resizeAspect
         documentView = canvas
+        NotificationCenter.default.addObserver(self, selector: #selector(checkMagnification),
+                                               name: NSScrollView.didEndLiveMagnifyNotification, object: self)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
     override var acceptsFirstResponder: Bool { true }
 
-    func show(_ image: CGImage?) {
-        guard canvas.layer?.contents as AnyObject? !== image else { return }
+    func show(_ image: CGImage?, assetID: String, hidden: Bool) {
+        if assetID != self.assetID {
+            self.assetID = assetID
+            askedForFullResolution = false
+            if magnification != 1 { magnification = 1 }
+        }
+        canvas.isHidden = hidden
+        guard self.image !== image else { return }
+        self.image = image
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         canvas.layer?.contents = image
         CATransaction.commit()
+    }
+
+    override var magnification: CGFloat {
+        didSet { checkMagnification() }
+    }
+
+    /// Past 100% the screen-size image runs out of detail.
+    @objc private func checkMagnification() {
+        if magnification > 1.05, !askedForFullResolution {
+            askedForFullResolution = true
+            onKey(.fullResolution)
+        }
     }
 
     override func viewDidMoveToWindow() {
@@ -154,6 +199,10 @@ final class ZoomView: NSScrollView {
     override func layout() {
         super.layout()
         if magnification <= 1 { canvas.frame = CGRect(origin: .zero, size: contentView.bounds.size) }
+        if !appeared, window != nil, bounds.width > 0 {
+            appeared = true
+            transitions?.viewerAppeared(self)
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -161,6 +210,7 @@ final class ZoomView: NSScrollView {
         guard event.clickCount == 2 else { return super.mouseDown(with: event) }
         let point = canvas.convert(event.locationInWindow, from: nil)
         animator().setMagnification(magnification > 1 ? 1 : 2.5, centeredAt: point)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.checkMagnification() }
     }
 
     override func keyDown(with event: NSEvent) {

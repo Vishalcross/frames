@@ -15,6 +15,7 @@ let package = Package(
             path: "Generated/FramesCore"
         ),
         .executableTarget(name: "ffi-smoke", dependencies: ["FramesCore"], path: "Spikes/FFISmoke"),
+        .executableTarget(name: "edit-check", dependencies: ["FramesCore"], path: "Spikes/EditCheck"),
         .executableTarget(
             name: "grid-spike",
             path: "Spikes/GridSpike",

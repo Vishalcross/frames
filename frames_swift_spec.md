@@ -179,7 +179,8 @@ Swift stores and reads the S4 secret with the Security framework (Keychain) and 
 
 ### 6.2 Local data (shared with the Tauri app)
 
-* Folder: `~/Library/Application Support/app.frames.desktop/`. It holds `frames.sqlite3`, `settings.json` and the thumbnail and preview cache.
+* Library folder: `~/Library/Application Support/app.frames.desktop/` holds `frames.sqlite3` and `settings.json`.
+* Cache: `~/Library/Caches/app.frames.desktop/cache/` (unless Settings moves it). Small thumbnails are in `thumbs_s/<first 2 hex>/<id>.webp`, previews in `lru/previews/<id>.webp`.
 * Schema and migrations stay owned by `frames-core`, so both apps always agree on them.
 * The device id and next sequence number come from the database. The Mac keeps its existing identity (`mac-7df742fc`) and its log continues without a gap.
 
@@ -229,7 +230,7 @@ The plan is a custom `GridView`: a layer-backed `NSView` inside `NSScrollView`.
 * Selection behaves as today: click, Shift, Command, marquee and whole month. Selection is drawn as a layer border plus a check mark, not by re-rendering the tile.
 * **Zoom works like Photos.** Pinch or slider changes animate the visible layers around the pointer to the new size, then snap to the new column count.
 * **Accessibility.** Every visible tile is an accessibility element ("Photo, 12 May 2024, 14:30"). The arrow keys move a focus ring.
-* **Decision gate (Phase 0).** Build the same 100k grid both ways, once as `GridView` and once as `NSCollectionView` with a custom layout and prefetching. Measure both against 7.1. Keep `NSCollectionView` if it meets the budgets, because it is less code. Otherwise use `GridView`.
+* **Decided in Phase 0: `GridView`.** Both versions held 60 fps through 100k items, but `NSCollectionView` needed 5 to 6 ms of main-thread work per frame (9 ms worst), against about 1.1 ms (2.5 ms worst) for `GridView`. That breaks the 8 ms limit and leaves no room for 120 Hz, badges or selection. Numbers in section 18.
 
 ### 7.4 The image pipeline
 
@@ -295,12 +296,16 @@ Three appearances, as today.
 ## 10. Video and Live Photos
 
 * **Native formats** (MOV, MP4, M4V, 3GP with H.264, HEVC, ProRes or AAC) play in `AVPlayerView`. The source is the local cached original if present, otherwise a presigned S4 URL. AVFoundation handles range requests and hardware decoding.
-* **Other formats** go through the core's existing player: an ffmpeg repackage (`-c copy`) or a conversion to H.264 (`h264_videotoolbox`) served on 127.0.0.1 with a per-session token.
-  * **Spike (Phase 0):** confirm `AVPlayer` plays and seeks in today's fragmented-MP4 progressive stream.
-  * If it doesn't, change the loopback output to HLS (fMP4 segments with a growing playlist), which AVPlayer supports natively, and seek by playlist position.
+* **Other formats** go through the core's player: an ffmpeg repackage (`-c copy`) or a conversion to H.264 (`h264_videotoolbox`), served on 127.0.0.1 with a per-session token. **Decided in Phase 0: as HLS.**
+  * `AVPlayer` rejects today's progressive fragmented-MP4 stream (`AVFoundationErrorDomain` −11850, "server incorrectly configured"), because it requires byte-range support, which a live conversion can't offer.
+  * HLS works for both repackage and convert: fMP4 segments of about 2 s and an `EVENT` playlist that grows while ffmpeg writes (`-f hls -hls_segment_type fmp4 -hls_playlist_type event`). The player was ready in 0.2 to 0.3 s, including while the playlist was still growing.
+  * Run ffmpeg as fast as it can, not in real time (no `-re`). With stream copy, segments can only end on the source's keyframes, so in real time the first segment can take a whole keyframe interval (8 s for the test file).
+  * Segments go to a temporary folder in the cache and are deleted when playback ends or the app quits. This replaces the Tauri design's "nothing written to disk" for this path only.
+  * Seeking within written segments uses the playlist. Seeking past them starts a new session at that time (`-ss`), as today.
+  * The Windows app keeps its progressive stream, since its web view plays it.
 * **Live Photos.** When a Live Photo opens, the photo and its MOV are fetched to the cache and handed to `PHLivePhoto.request(withResourceFileURLs:…)` for `PHLivePhotoView`, which gives Apple's own playback.
   * Fallback if pairing is rejected (for example a missing content identifier): an `AVPlayerLayer` playing the MOV once over the photo.
-  * Confirm both paths in the Phase 0 spike.
+  * **Deferred to Phase 4** (owner's call, 2026-11-03): there are no Live Photos in the library yet, and a fake pair wouldn't prove Apple's pairing. Confirm both paths when a real one exists.
 * The scrubber shows the stored duration while a converted stream is still filling.
 
 ## 11. Import
@@ -315,8 +320,9 @@ The pipeline in `frames_design_spec.md` section 7 is unchanged and runs in the c
 
 * **Prerequisite:** install Xcode. This Mac has only the Command Line Tools (Swift 6.2.3), which can't run Instruments, sign with a team identity or compile asset catalogs.
 * **Layout:**
-  * `apps/mac/Frames.xcodeproj`, with sources in `apps/mac/Frames/`;
-  * `crates/frames-ffi` and `scripts/build-core-xcframework.sh` (5.1).
+  * `apps/mac/Frames.xcodeproj`, with sources in `apps/mac/Frames/` (from Phase 1);
+  * `apps/mac/Package.swift`: the Phase 0 trial programs (`ffi-smoke`, `grid-spike`, `video-spike`);
+  * `crates/frames-ffi` and `scripts/build-core-xcframework.sh` (5.1). The script sets `MACOSX_DEPLOYMENT_TARGET=26.0`; without it the C code inside the core (SQLite, libwebp, ring) targets the build Mac's own macOS version.
 * **Bundle:** id `app.frames.mac`. Hardened runtime on; network-client entitlement; no sandbox.
 * **ffmpeg and ffprobe** go in `Contents/Helpers/`, signed. The existing `scripts/prepare-binaries.js` provides them, with checksums verified.
 * **Signing (still open):**
@@ -389,3 +395,30 @@ Each phase ends with an app the owner can use on the real library and a performa
 | AVPlayer and the converted stream | Phase 0 spike, with HLS as the fallback |
 | Two copies of the theme maths drift | Golden fixtures generated from the TypeScript, checked in tests |
 | Keychain prompts after every build | A stable signing identity (section 12) |
+
+## 18. Phase 0 results (2026-11-03)
+
+| Item | Result |
+|---|---|
+| Data-folder lock | Done. `frames_core::lock`, with a test. The Tauri app takes it at launch and shows "Frames is already open in another app" if it can't. Shipped in the Tauri build of 20:04. |
+| `frames-ffi` and XCFramework | Done. `scripts/build-core-xcframework.sh` builds in about 3 minutes; the static library is 106 MB before linking. `ffi-smoke` opened a copy of the real library from Swift: 216 items, the "Portfolio" album, and a second open refused by the lock. |
+| Grid | `GridView` chosen (7.3). Measured below. |
+| Video | HLS chosen for non-native formats (section 10). |
+| Live Photos | Deferred to Phase 4: no Live Photos in the library yet (section 10). |
+
+**Grid trial.** 100,000 items in 494 months, cycling the 217 real cached thumbnails; window 1280 × 800 points, 7 columns; MacBook Air M3, 60 Hz. Each speed ran for 5 s, scrolled by the display link. "Main" is the main-thread time of one scroll step.
+
+| Speed (screens/s) | `GridView` main p95 / worst | `NSCollectionView` main p95 / worst | Frames over budget |
+|---|---|---|---|
+| 1 | 1.06 / 2.50 ms | 5.27 / 7.66 ms | none in either |
+| 2 | 1.12 / 1.37 ms | 5.96 / 8.05 ms | none in either |
+| 6 | 0.75 / 1.11 ms | 6.09 / 9.08 ms | none in either |
+| 20 | 1.41 / 2.33 ms | 6.01 / 7.04 ms | none in either |
+
+* Decode latency: 9 to 13 ms median and 13 to 81 ms p95 while scrolling slowly. Above 3 screens a second no decodes start, by design.
+* First layout: 211 ms for `GridView` warm (809 ms on a cold first launch); 285 ms for `NSCollectionView`.
+* The first, cold `GridView` run had two stalls (163 ms and 50 ms) outside the scroll step; the repeat run had none.
+
+**Follow-ups for Phase 1:**
+* Memory ended at about 640 MB in both versions, over the 600 MB budget. It comes from the shared image pipeline, not the grid. Account for the decoded image cost properly and measure with the cache capped at 150 MB.
+* Bring the cold first layout under the 1 s budget, and investigate the cold-start stalls with Instruments.

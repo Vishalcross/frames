@@ -10,6 +10,7 @@ pub mod color;
 pub mod dates;
 pub mod importer;
 pub mod keys;
+pub mod lock;
 pub mod media;
 pub mod ops;
 pub mod palette;

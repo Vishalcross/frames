@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "FramesCore"
+ffi_module_name = "FramesCoreFFI"
+ffi_module_filename = "FramesCoreFFI"

@@ -17,3 +17,7 @@ Thumbs.db
 # Bundled native sidecar binaries (downloaded dynamically via scripts/prepare-binaries.js)
 frames-shell/src-tauri/binaries/
 binaries/
+
+# Native Mac app: generated Rust bindings and Swift build output
+apps/mac/Generated/
+apps/mac/.build/

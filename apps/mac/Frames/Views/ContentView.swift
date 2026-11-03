@@ -32,6 +32,11 @@ struct LibraryWindow: View {
                     StatusBanner()
                     DetailView()
                 }
+                .background(model.theme.colours.canvas.map { Color(nsColor: $0) } ?? .clear)
+                .dropDestination(for: URL.self) { urls, _ in
+                    Task { await model.importFiles(urls, into: model.currentAlbum) }
+                    return !urls.isEmpty
+                }
                 if let index = model.viewerIndex {
                     ViewerView(index: index)
                 }
@@ -44,6 +49,7 @@ struct LibraryWindow: View {
         .navigationTitle(model.viewerIndex == nil ? model.title : "")
         .navigationSubtitle(subtitle)
         .toolbar { LibraryToolbar() }
+        .themed(model.theme)
         .searchable(text: $model.searchText, tokens: $model.searchTokens, suggestedTokens: $model.suggestedTokens,
                     placement: .toolbar, prompt: "Search") { token in
             Label(token.label, systemImage: token.symbol)
@@ -68,7 +74,7 @@ struct LibraryWindow: View {
     }
 
     private var subtitle: String {
-        guard model.viewerIndex == nil else { return "" }
+        guard model.viewerIndex == nil, model.sidebar != .imports || model.isSearching else { return "" }
         if !model.selection.isEmpty { return "\(model.selection.count) selected" }
         let count = model.timeline.count
         return count == 0 ? "" : "\(count.formatted()) \(count == 1 ? "item" : "items")"
@@ -77,6 +83,7 @@ struct LibraryWindow: View {
 
 struct SidebarView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         @Bindable var model = model
@@ -84,6 +91,7 @@ struct SidebarView: View {
             Section("Photos") {
                 Label("Library", systemImage: "photo.on.rectangle").tag(SidebarItem.library)
                 Label("Videos", systemImage: "video").tag(SidebarItem.videos)
+                ImportsRow().tag(SidebarItem.imports)
                 Label("Recently Deleted", systemImage: "trash").tag(SidebarItem.trash)
             }
             Section {
@@ -102,6 +110,41 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(model.theme.colours.sidebar == nil ? .automatic : .hidden)
+        .background(model.theme.colours.sidebar.map { Color(nsColor: $0) } ?? .clear)
+        .safeAreaInset(edge: .bottom) {
+            Button { openSettings() } label: {
+                Label("Settings", systemImage: "gearshape")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.borderless)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .help("Connection, storage, library and appearance (⌘,)")
+        }
+        .onChange(of: model.settingsRequest) { openSettings() }
+    }
+}
+
+/// Imports, with how far the current one has got.
+struct ImportsRow: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let status = model.importStatus
+        Label {
+            HStack {
+                Text("Imports")
+                Spacer()
+                if let status, status.running, status.totalBytes > 0 {
+                    ProgressView(value: Double(status.completedBytes), total: Double(status.totalBytes))
+                        .progressViewStyle(.circular)
+                        .controlSize(.mini)
+                }
+            }
+        } icon: {
+            Image(systemName: "square.and.arrow.down")
+        }
     }
 }
 
@@ -120,15 +163,32 @@ struct AlbumRow: View {
                 Button("Rename…") { model.sheet = .renameAlbum(album) }
                 Button("Delete Album…", role: .destructive) { model.confirmation = .deleteAlbum(album) }
             }
-            .onDrop(of: [.framesAssetID], isTargeted: $targeted) { providers in
-                Task { await model.add(await Self.assetIDs(from: providers), to: album) }
+            .onDrop(of: [.framesAssetID, .fileURL], isTargeted: $targeted) { providers in
+                Task {
+                    // Photos from the grid join the album; files from Finder are imported into it.
+                    let ids = await Self.assetIDs(from: providers)
+                    if !ids.isEmpty { await model.add(ids, to: album) }
+                    let files = await Self.fileURLs(from: providers)
+                    if !files.isEmpty { await model.importFiles(files, into: album) }
+                }
                 return true
             }
     }
 
+    private static func fileURLs(from providers: [NSItemProvider]) async -> [URL] {
+        var urls: [URL] = []
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            let url: URL? = await withCheckedContinuation { continuation in
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in continuation.resume(returning: url) }
+            }
+            if let url { urls.append(url) }
+        }
+        return urls
+    }
+
     private static func assetIDs(from providers: [NSItemProvider]) async -> [String] {
         var ids: [String] = []
-        for provider in providers {
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.framesAssetID.identifier) {
             let data: Data? = await withCheckedContinuation { continuation in
                 provider.loadDataRepresentation(forTypeIdentifier: UTType.framesAssetID.identifier) { data, _ in
                     continuation.resume(returning: data)
@@ -147,6 +207,8 @@ struct DetailView: View {
     var body: some View {
         if model.isSearching {
             grid(empty: ContentUnavailableView.search)
+        } else if model.sidebar == .imports {
+            ImportsView()
         } else if model.sidebar == .library && model.grouping == .years {
             YearsView()
         } else if model.sidebar == .library && model.grouping == .months {

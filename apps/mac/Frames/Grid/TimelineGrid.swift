@@ -17,6 +17,7 @@ struct TimelineGrid: NSViewRepresentable {
         }
         grid.onColumnsChange = { count in model.columns = count }
         grid.onOpen = { index in model.openViewer(at: index) }
+        grid.onBrowse = { index in model.browsing(index) }
         if let core = model.core {
             grid.promiseWriter = AssetPromiseWriter(core: core)
             grid.filenames = { ids in (try? core.library.filenames(assetIds: ids)) ?? [] }
@@ -28,6 +29,8 @@ struct TimelineGrid: NSViewRepresentable {
     func updateNSView(_ container: GridContainer, context: Context) {
         let grid = container.grid
         grid.menuProvider = menu
+        grid.accent = model.theme.colours.accent
+        grid.canvas = model.theme.colours.canvas
         grid.show(timeline, columns: model.columns)
         grid.setSelection(model.selection, focus: model.focus)
         container.refreshScrubber()

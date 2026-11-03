@@ -14,6 +14,19 @@ final class GridView: NSView, NSDraggingSource {
     var filenames: ([String]) -> [String] = { _ in [] }
     var promiseWriter: AssetPromiseWriter?
     var onScroll: () -> Void = {}
+    /// The photo browsing rests on: under the pointer for 0.4 s, or in the
+    /// middle of the view when a scroll settles. Adaptive takes its colours.
+    var onBrowse: (Int) -> Void = { _ in }
+    /// Selection rings and check marks; the system accent unless the theme sets one.
+    var accent: NSColor? {
+        didSet { if accent != oldValue { recolour() } }
+    }
+    /// The pinned month header's background; the window's unless the theme tints it.
+    var canvas: NSColor? {
+        didSet { if canvas != oldValue { recolour() } }
+    }
+    private var hoverTimer: Timer?
+    private var hoverIndex: Int?
 
     private let pipeline: ImagePipeline
     private(set) var timeline = Timeline.empty
@@ -47,9 +60,50 @@ final class GridView: NSView, NSDraggingSource {
         marquee.lineWidth = 1
         marquee.isHidden = true
         layer?.addSublayer(marquee)
-        speed.onSettle = { [weak self] in self?.updateVisible() }
+        speed.onSettle = { [weak self] in
+            self?.updateVisible()
+            self?.browseMiddle()
+        }
         NotificationCenter.default.addObserver(
             self, selector: #selector(thumbnailArrived(_:)), name: .thumbnailArrived, object: nil)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let index = layout.index(at: convert(event.locationInWindow, from: nil))
+        guard index != hoverIndex else { return }
+        hoverIndex = index
+        hoverTimer?.invalidate()
+        guard let index else { return }
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.hoverIndex == index else { return }
+                self.onBrowse(index)
+            }
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoverIndex = nil
+        hoverTimer?.invalidate()
+    }
+
+    private func browseMiddle() {
+        guard let visible = enclosingScrollView?.documentVisibleRect,
+              let index = layout.index(at: CGPoint(x: visible.midX, y: visible.midY)) else { return }
+        onBrowse(index)
+    }
+
+    private func recolour() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            stickyHeader.applyColours(background: canvas)
+            for tile in tiles.values { tile.applyColours(accent: accent) }
+            for tile in tilePool { tile.applyColours(accent: accent) }
+            let ring = accent ?? NSColor.controlAccentColor
+            marquee.strokeColor = ring.cgColor
+            marquee.fillColor = ring.withAlphaComponent(0.15).cgColor
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -209,12 +263,9 @@ final class GridView: NSView, NSDraggingSource {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            stickyHeader.applyColours()
             for header in headers.values { header.foregroundColor = NSColor.labelColor.cgColor }
-            for tile in tiles.values { tile.applyColours() }
-            marquee.strokeColor = NSColor.controlAccentColor.cgColor
-            marquee.fillColor = NSColor.controlAccentColor.withAlphaComponent(0.15).cgColor
         }
+        recolour()
     }
 
     @objc private func clipScrolled() {
@@ -359,7 +410,7 @@ final class GridView: NSView, NSDraggingSource {
     private func newTile(in root: CALayer) -> TileLayer {
         let tile = TileLayer()
         tile.contentsScale = window?.backingScaleFactor ?? 2
-        effectiveAppearance.performAsCurrentDrawingAppearance { tile.applyColours() }
+        effectiveAppearance.performAsCurrentDrawingAppearance { tile.applyColours(accent: accent) }
         root.insertSublayer(tile, below: stickyHeader)
         return tile
     }
@@ -659,10 +710,11 @@ final class TileLayer: CALayer {
         add(fade, forKey: "fade")
     }
 
-    func applyColours() {
+    func applyColours(accent: NSColor?) {
+        let ring = accent ?? NSColor.controlAccentColor
         backgroundColor = NSColor.quaternaryLabelColor.cgColor
-        borderColor = NSColor.controlAccentColor.cgColor
-        check?.backgroundColor = NSColor.controlAccentColor.cgColor
+        borderColor = ring.cgColor
+        check?.backgroundColor = ring.cgColor
     }
 
     func layoutBadges() {
@@ -718,7 +770,7 @@ final class TileLayer: CALayer {
         mark.fontSize = 13
         mark.alignmentMode = .center
         mark.foregroundColor = NSColor.white.cgColor
-        mark.backgroundColor = NSColor.controlAccentColor.cgColor
+        mark.backgroundColor = borderColor ?? NSColor.controlAccentColor.cgColor
         mark.cornerRadius = 10
         mark.borderColor = NSColor.white.cgColor
         mark.borderWidth = 1.5
@@ -756,8 +808,8 @@ final class HeaderBar: CALayer {
         label.frame = bounds.insetBy(dx: 14, dy: 12)
     }
 
-    func applyColours() {
-        backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
+    func applyColours(background: NSColor?) {
+        backgroundColor = (background ?? NSColor.windowBackgroundColor).withAlphaComponent(0.92).cgColor
         label.foregroundColor = NSColor.labelColor.cgColor
     }
 }

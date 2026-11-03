@@ -6,7 +6,9 @@ import ImageIO
 /// `-FramesDebugSidebar videos|trash|<album name>`, `-FramesDebugGrouping years|months|all`,
 /// `-FramesDebugSelect <first>-<last>`, `-FramesDebugSearch <text>`,
 /// `-FramesDebugColumns N`, `-FramesDebugOpen <index>` (opens the viewer),
-/// `-FramesDebugInfo YES`, `-FramesDebugScrollTo <index>`, `-FramesDebugTimings YES`
+/// `-FramesDebugInfo YES`, `-FramesDebugScrollTo <index>`, `-FramesDebugTimings YES`,
+/// `-FramesDebugImport <folder>`, `-FramesDebugSettings YES` (opens Settings; pick
+/// the pane with `-FramesSettingsTab appearance|connection|storage|library`),
 /// (prints how long loading took), and `-FramesDebugSnapshot <png path>`, which writes
 /// the window to a PNG after `-FramesDebugDelay` seconds (default 3) and quits.
 @MainActor
@@ -42,6 +44,12 @@ enum DebugHooks {
         }
         if defaults.object(forKey: "FramesDebugOpen") != nil { model.openViewer(at: defaults.integer(forKey: "FramesDebugOpen")) }
         if defaults.bool(forKey: "FramesDebugInfo") { model.showInfo = true }
+        if let folder = defaults.string(forKey: "FramesDebugImport") {
+            await model.importFiles([URL(fileURLWithPath: folder)], into: nil)
+        }
+        if defaults.bool(forKey: "FramesDebugSettings") {
+            model.settingsRequest += 1
+        }
         snapshotIfAsked(defaults)
     }
 
@@ -65,7 +73,13 @@ enum DebugHooks {
         let delay = defaults.double(forKey: "FramesDebugDelay")
         Task {
             try? await Task.sleep(for: .seconds(delay > 0 ? delay : 3))
-            if let window = NSApp.windows.first(where: \.isVisible), let frame = window.contentView?.superview {
+            let visible = NSApp.windows.filter(\.isVisible)
+            print("windows: \(visible.map { "\($0.title) \(Int($0.frame.width))x\(Int($0.frame.height))" })")
+            // Settings, when asked for, is any window other than the library's.
+            let window = defaults.bool(forKey: "FramesDebugSettings")
+                ? visible.first { $0.identifier?.rawValue.hasPrefix("library") != true && $0.title != "Frames" }
+                : visible.first
+            if let window, let frame = window.contentView?.superview {
                 write(frame, scale: window.backingScaleFactor, to: URL(fileURLWithPath: path))
             }
             NSApp.terminate(nil)

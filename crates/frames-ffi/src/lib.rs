@@ -4,8 +4,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -15,11 +15,17 @@ use frames_core::keys::clash_filename;
 use frames_core::lock::LibraryLock;
 use frames_core::ops::AssetKind;
 use frames_core::qos::{self, WorkClass};
-use frames_core::s4::{load_secret_from_os_keychain, ObjectStore, S4Client, S4Config};
+use frames_core::s4::{load_secret_from_os_keychain, InMemoryObjectStore, ObjectStore, S4Client, S4Config};
 use frames_core::store::{SearchFilter, Store};
-use frames_core::sync::{export_originals, flush_outbox, sync_once};
+use frames_core::sync::{
+    export_originals, flush_outbox, resume_unfinished_imports, sync_once, unfinished_imports, ImportControl,
+    ImportRunReport,
+};
 use frames_core::thumbnails::ThumbService;
 use frames_core::trash::{delete_trash_items_now, empty_trash, purge_expired_trash, trash_summary};
+
+mod manage;
+pub use manage::*;
 
 uniffi::setup_scaffolding!();
 
@@ -62,6 +68,8 @@ pub trait LibraryObserver: Send + Sync {
     fn thumb_ready(&self, asset_id: String);
     /// Whether the last sync reached S4.
     fn sync_state(&self, online: bool);
+    /// An import started, moved on, or finished: ask for `import_status`.
+    fn import_changed(&self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -241,9 +249,8 @@ pub struct AssetDetail {
     pub albums: Vec<String>,
 }
 
-/// `settings.json` as the Tauri app writes it. Read only until the Mac app
-/// has its own Settings window (Phase 6).
-#[derive(Debug, Clone, serde::Deserialize)]
+/// `settings.json`, in the format the Tauri app reads and writes too.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 struct Settings {
     endpoint: String,
@@ -283,19 +290,25 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// The S4 client these settings describe, or why there is none.
-    fn s4(&self) -> Result<Arc<dyn ObjectStore>, String> {
+    fn save(&self, data_dir: &Path) -> Result<(), FramesError> {
+        let json = serde_json::to_string_pretty(self).map_err(FramesError::other)?;
+        std::fs::write(data_dir.join("settings.json"), json).map_err(FramesError::other)
+    }
+
+    /// The S4 client these settings describe, or why there is none. `secret`
+    /// overrides the Keychain, for testing a connection before saving it.
+    fn s4(&self, secret: Option<&str>) -> Result<Arc<dyn ObjectStore>, String> {
         if !self.use_real_s4 {
-            return Err("Not connected to MEGA S4. Connect in the Frames settings.".into());
+            return Err("Not connected to MEGA S4. Connect in Settings.".into());
         }
         if self.endpoint.trim().is_empty() || self.bucket.trim().is_empty() || self.access_key_id.trim().is_empty() {
-            return Err("The MEGA S4 settings are incomplete.".into());
+            return Err("The MEGA S4 settings are incomplete. Finish them in Settings.".into());
         }
-        let secret = load_secret_from_os_keychain(&self.access_key_id)
-            .ok()
-            .flatten()
+        let secret = secret
+            .map(str::to_string)
+            .or_else(|| load_secret_from_os_keychain(&self.access_key_id).ok().flatten())
             .filter(|s| !s.trim().is_empty())
-            .ok_or("The MEGA S4 secret key is missing from the Keychain.")?;
+            .ok_or("The MEGA S4 secret key is missing. Enter it in Settings.")?;
         Ok(Arc::new(S4Client::new(S4Config {
             endpoint: self.endpoint.clone(),
             region: self.region.clone(),
@@ -308,18 +321,44 @@ impl Settings {
     }
 }
 
+/// The S4 connection, which Settings can change while the library is open.
+/// Background work reads it afresh each time it needs it.
+#[derive(Default)]
+struct Connection {
+    s4: Option<Arc<dyn ObjectStore>>,
+    problem: Option<String>,
+}
+
+type SharedConnection = Arc<RwLock<Connection>>;
+
+fn current_s4(connection: &SharedConnection) -> Option<Arc<dyn ObjectStore>> {
+    connection.read().ok().and_then(|c| c.s4.clone())
+}
+
 /// An open library: the local database, thumbnails and the S4 connection,
 /// held under the library lock for as long as this object lives.
 #[derive(uniffi::Object)]
 pub struct Library {
+    data_dir: PathBuf,
     store: Arc<Mutex<Store>>,
     thumbs: Arc<ThumbService>,
     cache: Arc<Mutex<LocalCache>>,
-    s4: Option<Arc<dyn ObjectStore>>,
-    connection_problem: Option<String>,
+    settings: Mutex<Settings>,
+    connection: SharedConnection,
+    imports: Imports,
+    observer: Arc<dyn LibraryObserver>,
     sync_requests: Mutex<mpsc::Sender<()>>,
     edit_pushes: Mutex<mpsc::Sender<()>>,
+    /// Test libraries upload to memory, never to a real bucket.
+    in_memory: bool,
     _lock: LibraryLock,
+}
+
+/// The import that is running, if any, and what the last one did.
+#[derive(Clone, Default)]
+struct Imports {
+    control: Arc<ImportControl>,
+    last_report: Arc<Mutex<Option<ImportRunReport>>>,
 }
 
 #[uniffi::export]
@@ -332,6 +371,28 @@ impl Library {
         data_dir: String,
         cache_dir: Option<String>,
         observer: Arc<dyn LibraryObserver>,
+    ) -> Result<Arc<Self>, FramesError> {
+        Self::open_with(data_dir, cache_dir, observer, false)
+    }
+
+    /// Open a copy of a library for tests: uploads and S4 reads go to an
+    /// empty bucket in memory, so nothing reaches a real one.
+    #[uniffi::constructor]
+    pub fn open_for_tests(
+        data_dir: String,
+        cache_dir: Option<String>,
+        observer: Arc<dyn LibraryObserver>,
+    ) -> Result<Arc<Self>, FramesError> {
+        Self::open_with(data_dir, cache_dir, observer, true)
+    }
+}
+
+impl Library {
+    fn open_with(
+        data_dir: String,
+        cache_dir: Option<String>,
+        observer: Arc<dyn LibraryObserver>,
+        in_memory: bool,
     ) -> Result<Arc<Self>, FramesError> {
         let dir = PathBuf::from(data_dir);
         let lock = LibraryLock::acquire(&dir)
@@ -349,46 +410,67 @@ impl Library {
             .map_err(FramesError::other)?;
         let cache = Arc::new(Mutex::new(cache));
         let thumbs = ThumbService::new(Arc::clone(&cache), &db_path);
-        let s4 = settings.s4();
-        thumbs.set_s4(s4.as_ref().ok().cloned());
-
+        let connection: SharedConnection = Arc::new(RwLock::new(Connection::default()));
         let store = Arc::new(Mutex::new(store));
         let (sync_requests, wakeups) = mpsc::channel();
         let (edit_pushes, edits) = mpsc::channel();
         let library = Arc::new(Self {
+            data_dir: dir,
             store: Arc::clone(&store),
             thumbs: Arc::clone(&thumbs),
-            cache,
-            s4: s4.as_ref().ok().cloned(),
-            connection_problem: s4.as_ref().err().cloned(),
+            cache: Arc::clone(&cache),
+            settings: Mutex::new(settings),
+            connection: Arc::clone(&connection),
+            imports: Imports::default(),
+            observer: Arc::clone(&observer),
             sync_requests: Mutex::new(sync_requests),
             edit_pushes: Mutex::new(edit_pushes),
+            in_memory,
             _lock: lock,
         });
+        library.connect(None);
 
-        if let Ok(s4) = &s4 {
-            let (store, s4) = (Arc::clone(&store), Arc::clone(s4));
-            spawn("frames-edit-push", WorkClass::Utility, move || push_edits_when_quiet(&store, s4.as_ref(), edits))?;
-        }
-        spawn("frames-background", WorkClass::Background, move || {
-            std::thread::sleep(STARTUP_QUIET);
-            let ready = Arc::clone(&observer);
-            thumbs.start_backfill(Some(Arc::new(move |id: &str| ready.thumb_ready(id.to_string()))));
-            if let Ok(s4) = s4 {
-                let (purge_store, purge_s4) = (Arc::clone(&store), Arc::clone(&s4));
-                let _ = spawn("frames-trash-purge", WorkClass::Background, move || loop {
-                    let _ = purge_expired_trash(&mut &*purge_store, purge_s4.as_ref(), Utc::now());
-                    std::thread::sleep(PURGE_INTERVAL);
-                });
-                sync_loop(&store, s4.as_ref(), &thumbs, observer.as_ref(), wakeups);
-            }
-        })?;
+        let pusher = (Arc::clone(&store), Arc::clone(&connection));
+        spawn("frames-edit-push", WorkClass::Utility, move || push_edits_when_quiet(&pusher.0, &pusher.1, edits))?;
+        let background = Background {
+            store,
+            thumbs,
+            cache,
+            connection,
+            imports: library.imports.clone(),
+            observer,
+        };
+        spawn("frames-background", WorkClass::Background, move || background.run(wakeups))?;
         Ok(library)
     }
 
+    /// Connect to S4 as the settings say, or record why not, then sync.
+    fn connect(&self, secret: Option<&str>) {
+        let result = if self.in_memory {
+            Ok(Arc::new(InMemoryObjectStore::new(S4Config::default())) as Arc<dyn ObjectStore>)
+        } else {
+            self.settings.lock().map_err(|e| e.to_string()).and_then(|s| s.s4(secret))
+        };
+        self.thumbs.set_s4(result.as_ref().ok().cloned());
+        if let Ok(mut connection) = self.connection.write() {
+            *connection = match result {
+                Ok(s4) => Connection { s4: Some(s4), problem: None },
+                Err(problem) => Connection { s4: None, problem: Some(problem) },
+            };
+        }
+        self.sync_now();
+    }
+
+    fn s4(&self) -> Option<Arc<dyn ObjectStore>> {
+        current_s4(&self.connection)
+    }
+}
+
+#[uniffi::export]
+impl Library {
     /// Why the library isn't syncing with S4, if it isn't.
     pub fn connection_problem(&self) -> Option<String> {
-        self.connection_problem.clone()
+        self.connection.read().ok().and_then(|c| c.problem.clone())
     }
 
     /// Sync now instead of waiting for the next round.
@@ -502,14 +584,14 @@ impl Library {
 
     /// Delete items in Recently Deleted from S4 now. Returns how many went.
     pub fn delete_now(&self, asset_ids: Vec<String>) -> Result<u64, FramesError> {
-        let s4 = self.s4.as_ref().ok_or(FramesError::NotConnected)?;
+        let s4 = self.s4().ok_or(FramesError::NotConnected)?;
         let report = delete_trash_items_now(&mut &*self.store, s4.as_ref(), &asset_ids, Utc::now()).map_err(FramesError::other)?;
         self.push_edits_soon();
         Ok(report.purged_asset_ids.len() as u64)
     }
 
     pub fn empty_trash(&self) -> Result<u64, FramesError> {
-        let s4 = self.s4.as_ref().ok_or(FramesError::NotConnected)?;
+        let s4 = self.s4().ok_or(FramesError::NotConnected)?;
         let report = empty_trash(&mut &*self.store, s4.as_ref(), Utc::now()).map_err(FramesError::other)?;
         self.push_edits_soon();
         Ok(report.purged_asset_ids.len() as u64)
@@ -534,7 +616,7 @@ impl Library {
             }
         }
         if !from_s4.is_empty() {
-            match &self.s4 {
+            match &self.s4() {
                 Some(s4) => {
                     let before = from_s4.len() as u32;
                     let files = export_originals(&from_s4, &folder, &mut &*self.store, s4.as_ref(), &self.cache)
@@ -556,7 +638,7 @@ impl Library {
             std::fs::copy(local, &target).map_err(FramesError::other)?;
             return Ok(());
         }
-        let s4 = self.s4.as_ref().ok_or(FramesError::NotConnected)?;
+        let s4 = self.s4().ok_or(FramesError::NotConnected)?;
         let staging = self.thumbs.cache_root().join("export").join(&asset_id);
         let files = export_originals(&[asset_id], &staging, &mut &*self.store, s4.as_ref(), &self.cache)
             .map_err(FramesError::other)?;
@@ -669,12 +751,102 @@ fn spawn(name: &str, class: WorkClass, work: impl FnOnce() + Send + 'static) -> 
 }
 
 /// Upload local edits a moment after they stop, so a burst of them becomes
-/// one log batch. If S4 can't be reached they wait for the next sync.
-fn push_edits_when_quiet(store: &Mutex<Store>, s4: &dyn ObjectStore, edits: mpsc::Receiver<()>) {
+/// one log batch. Without S4, or if it can't be reached, they wait for the
+/// next sync.
+fn push_edits_when_quiet(store: &Mutex<Store>, connection: &SharedConnection, edits: mpsc::Receiver<()>) {
     while edits.recv().is_ok() {
         while edits.recv_timeout(EDIT_PUSH_DEBOUNCE).is_ok() {}
-        let _ = flush_outbox(&mut &*store, s4, Utc::now());
+        if let Some(s4) = current_s4(connection) {
+            let _ = flush_outbox(&mut &*store, s4.as_ref(), Utc::now());
+        }
     }
+}
+
+/// What the background thread works with.
+struct Background {
+    store: Arc<Mutex<Store>>,
+    thumbs: Arc<ThumbService>,
+    cache: Arc<Mutex<LocalCache>>,
+    connection: SharedConnection,
+    imports: Imports,
+    observer: Arc<dyn LibraryObserver>,
+}
+
+impl Background {
+    /// Fill missing thumbnails, then sync on open, every `SYNC_INTERVAL` and
+    /// whenever asked: push and pull changes, purge Recently Deleted once a
+    /// day, and carry on with imports a previous run left unfinished.
+    fn run(self, wakeups: mpsc::Receiver<()>) {
+        std::thread::sleep(STARTUP_QUIET);
+        let ready = Arc::clone(&self.observer);
+        self.thumbs.start_backfill(Some(Arc::new(move |id: &str| ready.thumb_ready(id.to_string()))));
+        let mut last_purge: Option<Instant> = None;
+        loop {
+            if let Some(s4) = current_s4(&self.connection) {
+                match sync_once(&mut &*self.store, s4.as_ref(), Utc::now()) {
+                    Ok(report) => {
+                        self.observer.sync_state(!report.offline);
+                        if report.batches_pulled > 0 {
+                            self.thumbs.start_backfill(None);
+                            self.observer.library_changed();
+                        }
+                        if !report.offline {
+                            if last_purge.is_none_or(|t| t.elapsed() >= PURGE_INTERVAL) {
+                                let _ = purge_expired_trash(&mut &*self.store, s4.as_ref(), Utc::now());
+                                last_purge = Some(Instant::now());
+                            }
+                            resume_imports(&self.store, &s4, &self.cache, &self.thumbs, &self.imports, &self.observer);
+                        }
+                    }
+                    Err(_) => self.observer.sync_state(false),
+                }
+            }
+            match wakeups.recv_timeout(SYNC_INTERVAL) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+}
+
+/// Carry on with files an earlier import queued but didn't finish, on a
+/// thread of their own, unless an import is already running.
+fn resume_imports(
+    store: &Arc<Mutex<Store>>,
+    s4: &Arc<dyn ObjectStore>,
+    cache: &Arc<Mutex<LocalCache>>,
+    thumbs: &Arc<ThumbService>,
+    imports: &Imports,
+    observer: &Arc<dyn LibraryObserver>,
+) {
+    let waiting = store.lock().ok().and_then(|s| unfinished_imports(&s).ok()).is_some_and(|g| !g.is_empty());
+    if !waiting || imports.control.is_running() {
+        return;
+    }
+    let (store, s4, cache, thumbs) = (Arc::clone(store), Arc::clone(s4), Arc::clone(cache), Arc::clone(thumbs));
+    let (imports, observer) = (imports.clone(), Arc::clone(observer));
+    let _ = spawn("frames-import", WorkClass::Utility, move || {
+        let progress = Arc::clone(&observer);
+        let report = resume_unfinished_imports(store, s4, cache, Arc::clone(&imports.control), Utc::now(), move |_| {
+            progress.import_changed()
+        });
+        finish_import(report, &imports, &thumbs, observer.as_ref());
+    });
+}
+
+/// Record how an import ended and refresh what it changed.
+fn finish_import(
+    report: Result<Option<ImportRunReport>, frames_core::sync::SyncError>,
+    imports: &Imports,
+    thumbs: &Arc<ThumbService>,
+    observer: &dyn LibraryObserver,
+) {
+    if let (Ok(Some(report)), Ok(mut last)) = (report, imports.last_report.lock()) {
+        *last = Some(report);
+    }
+    thumbs.start_backfill(None);
+    observer.library_changed();
+    observer.import_changed();
 }
 
 fn album_name(name: &str) -> Result<String, FramesError> {
@@ -690,32 +862,6 @@ fn copy_without_clash(file: &Path, folder: &Path, id: &str) -> Result<(), Frames
     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("original").to_string();
     let target = if folder.join(&name).exists() { folder.join(clash_filename(&name, id)) } else { folder.join(&name) };
     std::fs::copy(file, target).map(|_| ()).map_err(FramesError::other)
-}
-
-/// Sync on open, then every `SYNC_INTERVAL` or when asked, until the library closes.
-fn sync_loop(
-    store: &Mutex<Store>,
-    s4: &dyn ObjectStore,
-    thumbs: &Arc<ThumbService>,
-    observer: &dyn LibraryObserver,
-    wakeups: mpsc::Receiver<()>,
-) {
-    loop {
-        match sync_once(&mut &*store, s4, Utc::now()) {
-            Ok(report) => {
-                observer.sync_state(!report.offline);
-                if report.batches_pulled > 0 {
-                    thumbs.start_backfill(None);
-                    observer.library_changed();
-                }
-            }
-            Err(_) => observer.sync_state(false),
-        }
-        match wakeups.recv_timeout(SYNC_INTERVAL) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-    }
 }
 
 fn path_string(path: PathBuf) -> String {

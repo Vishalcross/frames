@@ -93,6 +93,7 @@
 				F7A100000000000000000011 /* Sources */,
 				F7A100000000000000000012 /* Frameworks */,
 				F7A100000000000000000013 /* Resources */,
+				F7A100000000000000000014 /* Bundle ffmpeg */,
 			);
 			buildRules = (
 			);
@@ -178,6 +179,28 @@
 			shellPath = /bin/sh;
 			shellScript = "\"$SRCROOT/../../scripts/build-core-xcframework.sh\"\n";
 		};
+		F7A100000000000000000014 /* Bundle ffmpeg */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../../frames-shell/src-tauri/binaries/ffmpeg-aarch64-apple-darwin",
+				"$(SRCROOT)/../../frames-shell/src-tauri/binaries/ffprobe-aarch64-apple-darwin",
+			);
+			name = "Bundle ffmpeg";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/ffmpeg",
+				"$(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/ffprobe",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# ffmpeg and ffprobe next to the app's executable, where frames-core looks for them\n# (video thumbnails, video details, and converting formats AVFoundation can't play).\n# scripts/prepare-binaries.js downloads them, with checksums checked.\nset -e\nfor tool in ffmpeg ffprobe; do\n  src=\"$SRCROOT/../../frames-shell/src-tauri/binaries/$tool-aarch64-apple-darwin\"\n  dst=\"$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH/$tool\"\n  if [ ! -f \"$src\" ]; then\n    echo \"warning: $src is missing; run scripts/prepare-binaries.js. Video import will look for $tool elsewhere.\"\n    continue\n  fi\n  cp -f \"$src\" \"$dst\"\n  chmod +x \"$dst\"\n  codesign --force --options runtime --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" \"$dst\"\ndone\n";
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -248,6 +271,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Frames;
@@ -272,6 +296,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Frames;

@@ -5,6 +5,7 @@ enum CoreEvent: Sendable {
     case libraryChanged
     case thumbReady(String)
     case syncState(online: Bool)
+    case importChanged
 }
 
 /// The Rust core (frames_swift_spec.md section 5). Its calls block on SQLite,
@@ -20,12 +21,15 @@ final class Core: Sendable {
         self.events = events
     }
 
-    /// Open the library, taking the library lock, and start its background sync.
-    static func open(dataDirectory: URL, cacheDirectory: URL?) async throws -> Core {
+    /// Open the library, taking the library lock, and start its background
+    /// sync. `testStore` keeps uploads in memory, for test copies.
+    static func open(dataDirectory: URL, cacheDirectory: URL?, testStore: Bool = false) async throws -> Core {
         let (events, continuation) = AsyncStream.makeStream(of: CoreEvent.self)
         let observer = EventForwarder(continuation: continuation)
         let library = try await perform {
-            try Library.open(dataDir: dataDirectory.path, cacheDir: cacheDirectory?.path, observer: observer)
+            testStore
+                ? try Library.openForTests(dataDir: dataDirectory.path, cacheDir: cacheDirectory?.path, observer: observer)
+                : try Library.open(dataDir: dataDirectory.path, cacheDir: cacheDirectory?.path, observer: observer)
         }
         return Core(library: library, events: events)
     }
@@ -55,6 +59,7 @@ private final class EventForwarder: LibraryObserver {
     func libraryChanged() { continuation.yield(.libraryChanged) }
     func thumbReady(assetId: String) { continuation.yield(.thumbReady(assetId)) }
     func syncState(online: Bool) { continuation.yield(.syncState(online: online)) }
+    func importChanged() { continuation.yield(.importChanged) }
 }
 
 extension FramesError {

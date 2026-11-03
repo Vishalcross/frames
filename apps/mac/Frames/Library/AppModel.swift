@@ -4,6 +4,7 @@ import SwiftUI
 enum SidebarItem: Hashable {
     case library
     case videos
+    case imports
     case trash
     case album(String)
 }
@@ -113,6 +114,8 @@ final class AppModel {
     var suggestedTokens: [SearchToken] = []
     var sheet: Sheet?
     var confirmation: Confirmation?
+    /// Changed to ask the window to open Settings (SwiftUI opens it, not the model).
+    var settingsRequest = 0
     /// A message for the user, such as an export result or an error.
     var notice: String?
     /// Whether the last sync reached S4; nil until the first one finishes.
@@ -123,6 +126,12 @@ final class AppModel {
     private(set) var pipeline: ImagePipeline?
     private(set) var viewerCache: ViewerCache?
     let transitions = ViewerTransitions()
+    let theme = ThemeEngine()
+    var importStatus: ImportStatus?
+    /// Bytes per second over the last half minute, for "time left".
+    private(set) var importRate: Double?
+    @ObservationIgnored private var importSamples: [(time: Date, bytes: UInt64)] = []
+    @ObservationIgnored private var importRefresh: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
 
     /// The library folder shared with the Tauri app, or `-FramesDataDir` for tests.
@@ -139,12 +148,15 @@ final class AppModel {
     func open() async {
         guard core == nil else { return }
         do {
-            let core = try await Core.open(dataDirectory: Self.dataDirectory, cacheDirectory: Self.cacheDirectory)
+            let testStore = UserDefaults.standard.bool(forKey: "FramesTestStore")
+            let core = try await Core.open(dataDirectory: Self.dataDirectory, cacheDirectory: Self.cacheDirectory,
+                                           testStore: testStore)
             self.core = core
             pipeline = ImagePipeline(core: core)
             viewerCache = ViewerCache()
             connectionProblem = core.library.connectionProblem()
             await reload()
+            await refreshImportStatus()
             state = .ready
             Task { await listen(to: core.events) }
         } catch let error as FramesError {
@@ -185,7 +197,7 @@ final class AppModel {
             return filter
         }
         switch sidebar {
-        case .library: break
+        case .library, .imports: break
         case .videos: filter.kind = .video
         case .trash: filter.trash = true
         case .album(let id): filter.albumId = id
@@ -221,12 +233,87 @@ final class AppModel {
             case .libraryChanged: await reload()
             case .thumbReady(let id): pipeline?.thumbnailArrived(id)
             case .syncState(let online): self.online = online
+            case .importChanged: scheduleImportRefresh()
             }
         }
     }
 
     func syncNow() {
         core?.library.syncNow()
+    }
+
+    /// After Settings saved a new connection.
+    func connectionChanged() {
+        connectionProblem = core?.library.connectionProblem()
+        online = nil
+    }
+
+    // MARK: Imports
+
+    var importRunning: Bool { importStatus?.running == true }
+
+    /// Ask which files and folders to import, into the album being shown if any.
+    func chooseImport() async {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Import"
+        panel.message = currentAlbum.map { "Choose photos and videos to import into “\($0.name)”." }
+            ?? "Choose photos and videos, or folders of them, to import."
+        guard await panel.begin() == .OK else { return }
+        await importFiles(panel.urls, into: currentAlbum)
+    }
+
+    func importFiles(_ urls: [URL], into album: AlbumSummary?) async {
+        guard let core, !urls.isEmpty else { return }
+        let paths = urls.map(\.path)
+        do {
+            try await core.run { try $0.importPaths(paths: paths, albumId: album?.id) }
+            importSamples = []
+            sidebar = .imports
+        } catch let error as FramesError {
+            notice = error.message
+        } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    func pauseImport() { core?.library.pauseImport() }
+    func resumeImport() { core?.library.resumeImport() }
+
+    func cancelImport() async {
+        guard let core else { return }
+        try? await core.run { try $0.cancelImport() }
+    }
+
+    /// Progress arrives once per file; refresh at most twice a second.
+    private func scheduleImportRefresh() {
+        guard importRefresh == nil else { return }
+        importRefresh = Task {
+            try? await Task.sleep(for: .milliseconds(500))
+            await refreshImportStatus()
+            importRefresh = nil
+        }
+    }
+
+    func refreshImportStatus() async {
+        guard let core, let status = try? await core.run({ try $0.importStatus() }) else { return }
+        let wasRunning = importStatus?.running == true
+        importStatus = status
+        if status.running {
+            let now = Date()
+            importSamples.append((now, status.completedBytes))
+            importSamples.removeAll { now.timeIntervalSince($0.time) > 30 }
+            if let first = importSamples.first, let last = importSamples.last, last.time.timeIntervalSince(first.time) > 3 {
+                importRate = Double(last.bytes &- first.bytes) / last.time.timeIntervalSince(first.time)
+            }
+        } else {
+            importSamples = []
+            importRate = nil
+        }
+        // New photos appear while an import runs, and once it ends.
+        if wasRunning || status.running { await reload() }
     }
 
     // MARK: Search
@@ -277,6 +364,7 @@ final class AppModel {
         focus = index
         transitions.prepareOpening(index: index)
         viewerIndex = index
+        theme.viewerShows(timeline.id(at: index), core: core)
     }
 
     func closeViewer() {
@@ -284,6 +372,7 @@ final class AppModel {
         selection = [index]
         focus = index
         transitions.close(index: index) { [weak self] in self?.viewerIndex = nil }
+        theme.viewerShows(nil, core: core)
     }
 
     func step(_ delta: Int) {
@@ -293,6 +382,13 @@ final class AppModel {
         self.viewerIndex = next
         selection = [next]
         focus = next
+        theme.viewerShows(timeline.id(at: next), core: core)
+    }
+
+    /// Browsing rested on a photo: Adaptive may take its colours.
+    func browsing(_ index: Int) {
+        guard index < timeline.count else { return }
+        theme.browsing(timeline.id(at: index), core: core)
     }
 
     // MARK: Navigation
@@ -319,6 +415,7 @@ final class AppModel {
         switch sidebar {
         case .library: return "Library"
         case .videos: return "Videos"
+        case .imports: return "Imports"
         case .trash: return "Recently Deleted"
         case .album: return currentAlbum?.name ?? "Album"
         }

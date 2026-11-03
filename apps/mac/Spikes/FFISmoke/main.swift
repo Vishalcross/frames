@@ -8,6 +8,7 @@ final class Quiet: LibraryObserver {
     func libraryChanged() {}
     func thumbReady(assetId: String) {}
     func syncState(online: Bool) {}
+    func importChanged() {}
 }
 
 func timed<T>(_ label: String, _ work: () throws -> T) rethrows -> T {

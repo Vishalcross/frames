@@ -18,6 +18,12 @@ struct FramesApp: App {
         }
         .defaultSize(width: 1280, height: 820)
         .commands { LibraryCommands(model: model) }
+
+        Settings {
+            SettingsView()
+                .environment(model)
+                .themed(model.theme)
+        }
     }
 }
 
@@ -26,6 +32,10 @@ struct LibraryCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .newItem) {
+            Button("Import…") { Task { await model.chooseImport() } }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
+                .disabled(model.importRunning)
+            Divider()
             Button("New Album") { model.newAlbum(with: []) }
                 .keyboardShortcut("n")
             Button("New Album with Selection") { model.newAlbum(with: model.selectedIDs) }

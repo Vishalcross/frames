@@ -511,3 +511,45 @@ Each phase ends with an app the owner can use on the real library and a performa
 * the viewer transition at full speed.
 
 Delete Now, Delete All and the edit upload are untested against the real bucket, because the test copies have no S4 settings.
+
+## 21. Imports, Settings and Appearance (2026-11-03)
+
+**Imports (Phase 3):**
+* File › Import… (⇧⌘I), the Imports view's button, or dropping files and folders on the window. Dropped on a sidebar album, they go into that album.
+* The Imports view shows progress (files and bytes), time left from the last 30 s, duplicates and failures, Pause, Resume and Stop. It also shows the last run's results: imported, failed with reasons, and skipped files.
+* Imports a previous run left unfinished resume automatically once S4 is reachable, as in the Tauri app. Stop marks the waiting files cancelled, so they aren't resumed later.
+* The app bundles ffmpeg and ffprobe next to its executable, signed with the app's identity.
+
+**The bridge now:**
+* keeps the S4 connection swappable, so saving Settings reconnects without reopening;
+* runs sync, the daily purge and import resumption in one background loop;
+* adds `import_paths`, `import_status` and pause, resume and cancel;
+* adds `settings`, `save_settings` (the shared `settings.json`, with the secret in the Keychain), `test_connection`, `cache_info` and `clear_cache`;
+* adds `check_library`, `add_unknown_files` and `rebuild_database`;
+* adds `palette` (computed on first use), and `video_source` and `motion_source` (the original on this Mac, or a one-hour S4 link);
+* adds `Library.open_for_tests`, which uploads to memory.
+
+The app's `-FramesTestStore YES` launch argument uses it. A test import of 3 photos and a text file into a copy gave 3 imported and 1 skipped.
+
+**Settings (⌘,, or the sidebar's Settings button).** Four panes:
+* **Appearance:** Standard, Adaptive, Glass; colour scheme; accent; Adaptive intensity and colour source.
+* **MEGA S4:** sync on or off, endpoint, region, bucket, keys, Test, Save.
+* **Storage:** space limit; cache location, size and usage; Clear Cache.
+* **Library:** this Mac's id, Check Library (with Add Unknown Files) and Rebuild Database.
+
+**Appearance.** `ThemeEngine` ports `immersiveRoles` and the brightness rule from `palette.ts`:
+* Adaptive tints the canvas, the sidebar, the pinned header and the accent from the open photo, or while browsing from the photo under the pointer (0.4 s) or centred when a scroll settles (at most every 0.8 s).
+* Follow Photo switches between light and dark only for an open photo.
+* Standard uses the system look with an optional accent. Glass gives the window an ultra-thin material.
+* The settings are stored per Mac in UserDefaults.
+
+**Videos and Live Photos (part of Phase 4):**
+* Videos play in `AVPlayerView`, from this Mac or a presigned S4 link. A format AVFoundation can't open shows "Can't Play Here" with Export.
+* A Live Photo's LIVE badge plays its movie while pressed.
+
+**Still missing compared with the Tauri app:**
+* Per-album colour themes: dynamic, album auto, album manual.
+* Converting MKV, AVI, MTS and WMV for playback (the HLS path in section 10).
+* Glass tint and clarity options.
+* The manual offline switch.
+* Native `PHLivePhotoView` playback.

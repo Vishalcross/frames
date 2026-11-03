@@ -13,8 +13,22 @@ struct ViewerView: View {
 
     var body: some View {
         let id = model.timeline.id(at: index)
+        if model.timeline.isVideo(index) {
+            VideoView(id: id)
+                .onKeyPress(.leftArrow) { model.step(-1); return .handled }
+                .onKeyPress(.rightArrow) { model.step(1); return .handled }
+                .onKeyPress(.escape) { model.closeViewer(); return .handled }
+        } else {
+            photo(id)
+                .overlay(alignment: .topLeading) {
+                    if model.timeline.isLive(index) && model.transitions.phase != .opening { LiveBadge(id: id) }
+                }
+        }
+    }
+
+    private func photo(_ id: String) -> some View {
         let opening = model.transitions.phase == .opening
-        ZoomableImage(assetID: id, image: fullResolution ?? image, hidden: opening, transitions: model.transitions) { key in
+        return ZoomableImage(assetID: id, image: fullResolution ?? image, hidden: opening, transitions: model.transitions) { key in
             switch key {
             case .previous: model.step(-1)
             case .next: model.step(1)

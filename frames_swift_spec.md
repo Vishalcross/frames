@@ -1,7 +1,8 @@
 # Frames for Mac (Swift): spec
 
 Date: 2026-11-03
-Status: draft for the owner's review. Decisions marked **[confirm]** need a yes or no before work starts (section 16).
+Status: decisions settled on 2026-11-03 except the signing identity (section 16).
+Target machine: the owner's MacBook Air (M3, 8 GB memory, 60 Hz display), macOS 27.
 Parity baseline: `main` at 7fa42b7, plus the Adaptive theme changes made after it (photo brightness, immersive palettes).
 
 Related documents. `frames_design_spec.md` sections 4 to 7 (bucket layout, data model, sync, import) remain the contract with the bucket and with the Windows app. This spec does not change them. `Frames Polish, Local-First Media and Packaging Spec.md` Phase 4 describes the album colour settings that are ported here.
@@ -33,15 +34,16 @@ So the plan replaces the layer that is slow and keeps the one that is correct. *
 
 | # | Decision |
 |---|---|
-| 1 | macOS only. Minimum **macOS 26** **[confirm]**: native Liquid Glass (`glassEffect`), the current SwiftUI, and Swift 6 concurrency. |
+| 1 | macOS only, Apple silicon only (arm64). Minimum **macOS 26**: native Liquid Glass (`glassEffect`), the current SwiftUI, and Swift 6 concurrency. |
 | 2 | Swift 6 with strict concurrency. SwiftUI for windows, sidebar, toolbar, sheets, settings, inspector and list screens. AppKit and Core Animation for the photo grid and the viewer. |
 | 3 | `frames-core` (Rust) stays the single implementation of the store, change log, merge, sync, S4 client, import pipeline, keys, dates, trash and palettes. Swift reaches it through UniFFI, packaged as an XCFramework. |
 | 4 | Apple frameworks for pixels: ImageIO to decode (HEIC, RAW, JPEG, WebP), AVFoundation and AVKit for video, PhotosUI for Live Photos, Core Animation for drawing. |
 | 5 | Bucket format unchanged. Thumbnails stay WebP, because the Windows app reads them. ImageIO reads WebP but can't write it (checked on this Mac with `CGImageDestinationCopyTypeIdentifiers`), so Rust's libwebp encoder keeps encoding them. |
 | 6 | Same local data folder, database and device id as the Tauri app. Only one of the two apps may have the library open at a time (section 6.3). |
-| 7 | Not sandboxed and not on the App Store. Signed with a stable identity so Keychain access survives rebuilds **[confirm]** which identity, section 12. |
+| 7 | Not sandboxed and not on the App Store. Signed with a stable identity so Keychain access survives rebuilds; which identity is still open (section 12). |
 | 8 | ffmpeg stays bundled, but is used only for formats AVFoundation can't play (MKV, AVI, WMV, MTS/M2TS, old codecs). |
-| 9 | Parity first. No new library features in this version. The Tauri app's placeholder sections (Memories, People & Pets, Trips, Days, Duplicates, Hidden, Favourites, Captured by Me, Edit) are **left out** until they do something **[confirm]**. |
+| 9 | Parity first. No new library features in this version. The Tauri app's placeholder sections (Memories, People & Pets, Trips, Days, Duplicates, Hidden, Favourites, Captured by Me, Edit) are **left out** until they do something. |
+| 10 | Windows stays on the Tauri app for this version. |
 
 ## 4. Architecture
 
@@ -85,7 +87,7 @@ Rule: the main thread never waits on SQLite, the network, a decode or a call int
 
 * New crate `crates/frames-ffi`, using UniFFI proc-macros and depending on `frames-core`. It is the only crate Swift sees.
 * `scripts/build-core-xcframework.sh`:
-  1. `cargo build --release` for `aarch64-apple-darwin`, plus `x86_64-apple-darwin` if Intel Macs are supported **[confirm]**;
+  1. `cargo build --release` for `aarch64-apple-darwin` (no Intel build);
   2. `uniffi-bindgen` generates the Swift bindings;
   3. `xcodebuild -create-xcframework` packages them.
 * An Xcode build phase reruns the script when files under `crates/` change.
@@ -193,20 +195,20 @@ If the Tauri app and the Swift app ran at once with the same device id, both cou
 
 ### 7.1 Budgets
 
-Measure on the owner's Mac, with both the real library and a generated library of 100,000 items. A budget is met when it holds in Release builds, three runs out of three.
+Measure on the owner's MacBook Air (M3, 8 GB, 60 Hz), with both the real library and a generated library of 100,000 items. A budget is met when it holds in Release builds, three runs out of three. On a 60 Hz display a frame lasts 16.7 ms. The code must still be written for 120 Hz (8.3 ms), so it stays smooth on ProMotion and external high-refresh displays.
 
 | Measure | Budget |
 |---|---|
 | Launch to first grid frame, warm cache | under 400 ms |
 | Launch to first grid frame, cold (after reboot) | under 1 s |
 | Timeline snapshot, 100k items | under 50 ms in the core, under 10 ms to lay out |
-| Scrolling, including a 10-second fling through 100k | no frame over the display interval (8.3 ms at 120 Hz); hitch time under 5 ms per second |
+| Scrolling, including a 10-second fling through 100k | no frame over the display interval (16.7 ms on the target Mac; main-thread work per frame under 8 ms); hitch time under 5 ms per second |
 | Pinch or slider zoom between column counts | animated at the display rate, no blank tiles at rest |
 | Visible tile from the memory cache | same frame |
 | Visible tile from a local file | under 50 ms; a ThumbHash placeholder shows meanwhile |
 | Viewer opens, preview cached | under 100 ms to the preview, under 300 ms to full resolution (local original) |
 | Next or previous photo in the viewer | under 50 ms (neighbours prefetched) |
-| Memory while browsing 100k | under 600 MB |
+| Memory while browsing 100k | under 600 MB (the target Mac has 8 GB) |
 | CPU when idle (5 s after the last input, no import) | 0 % on the main thread, no repeating timers |
 | During an import | scrolling budgets still hold |
 
@@ -317,11 +319,11 @@ The pipeline in `frames_design_spec.md` section 7 is unchanged and runs in the c
   * `crates/frames-ffi` and `scripts/build-core-xcframework.sh` (5.1).
 * **Bundle:** id `app.frames.mac`. Hardened runtime on; network-client entitlement; no sandbox.
 * **ffmpeg and ffprobe** go in `Contents/Helpers/`, signed. The existing `scripts/prepare-binaries.js` provides them, with checksums verified.
-* **Signing [confirm]:**
+* **Signing (still open):**
   * **Apple Development (free Apple ID team).** A stable identity, so Keychain access survives rebuilds, and enough for this Mac.
   * **Developer ID plus notarization (paid Apple Developer Program).** Needed only if the app should open on other Macs without a Gatekeeper warning.
   * **Not ad-hoc**, as the Tauri build is today. Each ad-hoc rebuild changes the code identity and the Keychain asks again.
-* **Architecture:** arm64 only, unless an Intel Mac will run it **[confirm]**.
+* **Architecture:** arm64 only.
 * **Release checklist:** version and build number, signature check (`codesign --verify --deep --strict`), a launch on a clean user account, and the performance report from 7.6.
 
 ## 13. Testing
@@ -365,14 +367,16 @@ Each phase ends with an app the owner can use on the real library and a performa
 * **Import from the Apple Photos library** (PhotoKit).
 * **The placeholder sections** listed in decision 9.
 
-## 16. Decisions for the owner
+## 16. Decisions
 
-1. **Minimum macOS 26?** Recommended. It gives native Liquid Glass and the current SwiftUI. Your Mac runs macOS 27.
-2. **Signing identity.** Free Apple Development (this Mac only) or the paid Developer Program (other Macs, notarized).
-3. **Placeholder sections.** Leave them out until they're real? Recommended.
-4. **Intel Macs.** Support them, or arm64 only?
-5. **Install Xcode** on this Mac. Required.
-6. **Windows stays on Tauri?** Recommended for this version.
+| Question | Answer (2026-11-03) |
+|---|---|
+| Minimum macOS 26? | Yes |
+| Placeholder sections left out until real? | Yes |
+| Intel Macs? | No, arm64 only |
+| Windows stays on Tauri? | Yes |
+| Xcode installed on this Mac? | To do (required before Phase 0) |
+| Signing identity | Open. Recommended: free Apple Development, since the app runs only on this Mac |
 
 ## 17. Risks
 

@@ -21,3 +21,4 @@ binaries/
 # Native Mac app: generated Rust bindings and Swift build output
 apps/mac/Generated/
 apps/mac/.build/
+apps/mac/**/xcuserdata/

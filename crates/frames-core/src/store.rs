@@ -31,6 +31,9 @@ const META_DEVICE_ID: &str = "device_id";
 const META_NEXT_SEQ: &str = "next_seq";
 const META_BATCHES_SINCE_SNAPSHOT: &str = "batches_since_snapshot";
 const META_LAST_SNAPSHOT_AT: &str = "last_snapshot_at";
+/// Set once `remove_legacy_folder_assets` has run, so later opens skip its
+/// scan of every asset id.
+const META_LEGACY_ASSETS_REMOVED: &str = "legacy_assets_removed";
 
 pub const SNAPSHOT_BATCH_THRESHOLD: u64 = 500;
 pub const SNAPSHOT_MAX_AGE_DAYS: i64 = 7;
@@ -57,6 +60,35 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// e.g. `2026-11-02T03:14:15.926Z`.
 pub fn format_utc(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// `format_utc`'s fixed form (`YYYY-MM-DDTHH:MM:SS.sssZ`) as milliseconds
+/// since 1970, without a general parser: the timeline reads one per asset.
+/// Any other form goes through `parse_utc`.
+pub fn utc_millis(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let fixed = b.len() == 24
+        && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':'
+        && b[16] == b':' && b[19] == b'.' && b[23] == b'Z';
+    if !fixed {
+        return parse_utc(s).ok().map(|t| t.timestamp_millis());
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        b[range].iter().try_fold(0i64, |n, &c| c.is_ascii_digit().then(|| n * 10 + i64::from(c - b'0')))
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second, ms) = (number(11..13)?, number(14..16)?, number(17..19)?, number(20..23)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days since 1970-01-01, after Howard Hinnant's days_from_civil.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + ms)
 }
 
 /// Parse an RFC 3339 UTC timestamp from SQLite.
@@ -120,6 +152,22 @@ pub struct AssetSummary {
     /// thumbnail arrives. Local-only; filled in by the thumbnail service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbhash: Option<String>,
+}
+
+/// What one grid tile needs, for the native Mac timeline
+/// (frames_swift_spec.md 5.3), borrowed from the query row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineTile<'a> {
+    pub id: &'a str,
+    pub kind: AssetKind,
+    /// Date taken as local wall-clock time: milliseconds since 1970, read as
+    /// if UTC, so its calendar fields are the ones the camera showed.
+    pub local_ms: i64,
+    pub date_guessed: bool,
+    pub duration_ms: Option<u64>,
+    pub thumb_failed: bool,
+    /// Base64 ThumbHash, if the thumbnail service has made one.
+    pub thumbhash: Option<&'a str>,
 }
 
 /// Full asset detail for the viewer info panel.
@@ -522,8 +570,12 @@ impl Store {
             [],
         )?;
 
+        // The timeline index; it replaces `assets_taken_desc`, which has the
+        // same leading columns, so SQLite reads tiles from it alone.
+        conn.execute("DROP INDEX IF EXISTS assets_taken_desc", [])?;
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS assets_taken_desc ON assets (taken_at DESC, id ASC)
+            "CREATE INDEX IF NOT EXISTS assets_timeline_tiles ON assets
+               (taken_at DESC, id ASC, kind, tz_offset, date_guessed, duration_ms, thumb_failed, thumbhash)
              WHERE trashed_at IS NULL AND purged_at IS NULL",
             [],
         )?;
@@ -545,10 +597,24 @@ impl Store {
     /// Returns the number of assets removed; 0 means nothing was touched.
     pub fn remove_legacy_folder_assets(&mut self, backup_path: &Path) -> Result<usize> {
         const LEGACY: &str = "SELECT id FROM assets WHERE length(id) != 64 OR id GLOB '*[^0-9a-f]*'";
+        let done: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM local_meta WHERE key = ?1", [META_LEGACY_ASSETS_REMOVED], |r| r.get(0))
+            .optional()?;
+        if done.is_some() {
+            return Ok(0);
+        }
+        let mark_done = |conn: &Connection| {
+            conn.execute(
+                "INSERT OR REPLACE INTO local_meta (key, value) VALUES (?1, '1')",
+                [META_LEGACY_ASSETS_REMOVED],
+            )
+        };
         let count: i64 =
             self.conn
                 .query_row(&format!("SELECT count(*) FROM ({LEGACY})"), [], |r| r.get(0))?;
         if count == 0 {
+            mark_done(&self.conn)?;
             return Ok(0);
         }
         if !backup_path.exists() {
@@ -562,6 +628,7 @@ impl Store {
             tx.execute(&format!("DELETE FROM {table} WHERE asset_id IN ({LEGACY})"), [])?;
         }
         let removed = tx.execute(&format!("DELETE FROM assets WHERE id IN ({LEGACY})"), [])?;
+        mark_done(&tx)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -1580,6 +1647,42 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Visit every visible asset matching `filter`, newest first, as a grid
+    /// tile: one query for a whole timeline, read from `assets_timeline_tiles`
+    /// alone and copied nowhere, so 100k assets take tens of milliseconds.
+    pub fn for_each_timeline_tile(
+        &self,
+        filter: &SearchFilter,
+        mut visit: impl FnMut(TimelineTile<'_>),
+    ) -> Result<()> {
+        let (where_sql, args) = filter_sql(filter);
+        let Some(where_sql) = where_sql else {
+            return Ok(());
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT s.id, s.kind, s.taken_at, s.tz_offset, s.date_guessed, s.duration_ms,
+                    s.thumb_failed, s.thumbhash
+             FROM assets s
+             WHERE {where_sql}
+             ORDER BY s.taken_at DESC, s.id ASC"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
+        while let Some(r) = rows.next()? {
+            let utc_ms = row_text(r, 2)?.and_then(utc_millis).unwrap_or_default();
+            let tz_offset: Option<i32> = r.get(3)?;
+            visit(TimelineTile {
+                id: row_text(r, 0)?.unwrap_or_default(),
+                kind: str_to_kind(row_text(r, 1)?.unwrap_or("photo")),
+                local_ms: utc_ms + i64::from(tz_offset.unwrap_or(0)) * 60_000,
+                date_guessed: r.get::<_, i64>(4)? != 0,
+                duration_ms: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                thumb_failed: r.get::<_, i64>(6)? != 0,
+                thumbhash: row_text(r, 7)?,
+            });
+        }
+        Ok(())
+    }
+
     /// How many visible assets match `filter`; the grid sizes its scrollbar from this.
     pub fn count_assets(&self, filter: &SearchFilter) -> Result<usize> {
         let (where_sql, args) = filter_sql(filter);
@@ -1853,6 +1956,13 @@ impl Store {
 // =============================================================================
 // Internal Merge & FTS Helpers
 // =============================================================================
+
+/// Column `i` as text borrowed from the row, without copying it.
+fn row_text<'r>(r: &'r rusqlite::Row<'_>, i: usize) -> rusqlite::Result<Option<&'r str>> {
+    r.get_ref(i)?.as_str_or_null().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
 
 fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<AssetSummary> {
     let taken_str: String = r.get(5)?;
@@ -2896,5 +3006,37 @@ mod tests {
         assert_eq!(ids(&videos, 0, 10), vec!["b-may"]);
         let no_words = SearchFilter { text: Some("--".into()), ..Default::default() };
         assert_eq!(store.count_assets(&no_words).unwrap(), 0);
+
+        // The timeline tiles match the paged query, with local wall-clock time.
+        let tiles = |f: &SearchFilter| {
+            let mut out = Vec::new();
+            store
+                .for_each_timeline_tile(f, |t| out.push((t.id.to_string(), t.kind, t.local_ms)))
+                .unwrap();
+            out
+        };
+        let all_tiles = tiles(&all);
+        let tile_ids: Vec<String> = all_tiles.iter().map(|t| t.0.clone()).collect();
+        assert_eq!(tile_ids, ids(&all, 0, 10));
+        let june_local = Utc.with_ymd_and_hms(2024, 6, 1, 1, 30, 0).unwrap();
+        assert_eq!(all_tiles[0].2, june_local.timestamp_millis());
+        assert_eq!(all_tiles[1].1, AssetKind::Video);
+        assert_eq!(tiles(&videos).len(), 1);
+    }
+
+    #[test]
+    fn utc_millis_matches_the_general_parser() {
+        for text in [
+            "2024-05-31T20:00:00.000Z",
+            "2024-02-29T23:59:59.999Z",
+            "2000-03-01T00:00:00.001Z",
+            "1969-12-31T23:59:59.000Z",
+            "2026-11-03T18:22:01.500Z",
+        ] {
+            assert_eq!(utc_millis(text), Some(parse_utc(text).unwrap().timestamp_millis()), "{text}");
+        }
+        // Other RFC 3339 forms still parse, through the general parser.
+        assert_eq!(utc_millis("2024-05-31T20:00:00Z"), Some(1_717_185_600_000));
+        assert_eq!(utc_millis("not a date"), None);
     }
 }

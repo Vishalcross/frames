@@ -422,3 +422,48 @@ Each phase ends with an app the owner can use on the real library and a performa
 **Follow-ups for Phase 1:**
 * Memory ended at about 640 MB in both versions, over the 600 MB budget. It comes from the shared image pipeline, not the grid. Account for the decoded image cost properly and measure with the cache capped at 150 MB.
 * Bring the cold first layout under the 1 s budget, and investigate the cold-start stalls with Instruments.
+
+## 19. Phase 1 status (2026-11-03)
+
+**Built.** `apps/mac/Frames.xcodeproj`. Its "Rust Core" target runs `scripts/build-core-xcframework.sh` before each build, and the script only replaces generated files that changed. The app has:
+* A window with a sidebar (Library, Videos, Albums with counts) and the Years / Months / All Photos selector.
+* The custom layer grid:
+  * ThumbHash placeholders and month headers that stay pinned at the top;
+  * video and LIVE badges;
+  * click and double-click, arrow keys, Return and Space;
+  * pinch and ⌘+ / ⌘− zoom from 3 to 15 columns, keeping the photo under the pointer in place.
+* Years and Months cards built from the in-memory timeline. Clicking a month opens All Photos at that month.
+* A viewer:
+  * the grid's thumbnail at once, then the preview, then the original on this Mac, each decoded at screen size;
+  * neighbours prepared ahead;
+  * pinch or double-click to zoom; arrows, Esc and Space; ⌘I for info.
+* An info panel showing filename, date with its UTC offset, camera, pixel size, file size and albums.
+* Sync in the background (on open, every 5 minutes, and ⇧⌘R), a status icon, and an offline or not-connected banner.
+* Debug-only launch arguments for tests: a data or cache folder, timings, and a window snapshot (`App/DebugHooks.swift`).
+
+**Core changes made for it:**
+* `Store::for_each_timeline_tile`;
+* the `assets_timeline_tiles` index, which replaces `assets_taken_desc`;
+* the `utc_millis` fast date parser;
+* `remove_legacy_folder_assets` now runs once per library, not on every open;
+* background work (thumbnail backfill, sync) starts 3 s after opening;
+* timeline numbers cross the bridge as little-endian bytes.
+
+**Measured** on the MacBook Air (M3), Debug build of the app, Rust in release:
+
+| Measure | Your library (216) | Generated (100,000) | Budget |
+|---|---|---|---|
+| Launch to first grid frame, warm | 278 to 293 ms | 368 to 375 ms | under 400 ms |
+| Timeline in the core | under 1 ms | 27 ms (alone), 70 to 100 ms through the bridge in the app | under 50 ms in the core |
+| Timeline into Swift | under 1 ms | 20 ms | under 10 ms to lay out |
+| Memory, scrolled halfway | — | 244 MB | under 600 MB |
+
+**Not yet, or simplified:**
+* The year scrubber.
+* Animated transitions: the tile-to-viewer zoom, and animated grid zoom (the column count changes in one step).
+* Full-resolution tiles past 1:1 zoom in the viewer.
+* Multi-select (Phase 2).
+* The batched thumbnail requests in 5.2: the pipeline makes one blocking call per tile, off the main thread, six at a time.
+* The S4 secret is still read through `/usr/bin/security`, as the Tauri app does, so nothing prompts until a stable signing identity exists (5.5).
+* The Settings window (Phase 6). Until then the app reads `settings.json` written by the Tauri app.
+* Sync is untested from this app against the real bucket. It is the same `sync_once` the Tauri app runs every 5 minutes.

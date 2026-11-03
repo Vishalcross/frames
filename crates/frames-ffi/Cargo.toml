@@ -15,6 +15,11 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
+base64 = "0.23"
+chrono = "0.4"
+dirs = "7"
 frames-core = { path = "../frames-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 uniffi = { version = "0.32", features = ["cli"] }

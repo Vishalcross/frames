@@ -50,8 +50,11 @@ CREATE INDEX assets_timeline ON assets (taken_at)
 -- Trash view and the daily purge.
 CREATE INDEX assets_trash ON assets (trashed_at)
   WHERE trashed_at IS NOT NULL AND purged_at IS NULL;
--- Fast timeline sorted query index.
-CREATE INDEX IF NOT EXISTS assets_taken_desc ON assets (taken_at DESC, id ASC)
+-- The timeline, newest first. It also holds every column a grid tile needs,
+-- so the Mac app reads a whole library from this index alone
+-- (frames_swift_spec.md 5.3).
+CREATE INDEX IF NOT EXISTS assets_timeline_tiles ON assets
+  (taken_at DESC, id ASC, kind, tz_offset, date_guessed, duration_ms, thumb_failed, thumbhash)
   WHERE trashed_at IS NULL AND purged_at IS NULL;
 
 CREATE TABLE albums (

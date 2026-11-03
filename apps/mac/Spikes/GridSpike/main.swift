@@ -18,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var collection: CollectionGrid?
     var benchmark: Benchmark?
 
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         let files = SyntheticLibrary.cachedThumbnails()
         guard !files.isEmpty else {

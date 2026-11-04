@@ -10,6 +10,8 @@ import ImageIO
 /// `-FramesDebugInfo YES`, `-FramesDebugScrollTo <index>`, `-FramesDebugTimings YES`,
 /// `-FramesDebugKeys right,left,esc` (posts those keys once the viewer is open, printing where
 /// it is after each; `-FramesDebugKeysFromGrid YES` gives the grid the keyboard first),
+/// `-FramesDebugSwipe next,prev,short,hold` (two-finger swipes on the open photo: a full one each
+/// way, a short slow one that should settle back, and one held mid-way for a snapshot),
 /// `-FramesDebugImport <folder>`, `-FramesDebugAccessibility YES` (prints what VoiceOver hears in the grid), `-FramesDebugSettings YES` (opens Settings; pick
 /// the pane with `-FramesSettingsTab appearance|connection|storage|library`),
 /// (prints how long loading took), and `-FramesDebugSnapshot <png path>`, which writes
@@ -49,6 +51,7 @@ enum DebugHooks {
         if defaults.object(forKey: "FramesDebugOpen") != nil { model.openViewer(at: defaults.integer(forKey: "FramesDebugOpen")) }
         if defaults.bool(forKey: "FramesDebugInfo") { model.showInfo = true }
         if let keys = defaults.string(forKey: "FramesDebugKeys") { await post(keys, model) }
+        if let swipes = defaults.string(forKey: "FramesDebugSwipe") { await swipe(swipes, model) }
         if let folder = defaults.string(forKey: "FramesDebugImport") {
             await model.importFiles([URL(fileURLWithPath: folder)], into: nil)
         }
@@ -81,6 +84,40 @@ enum DebugHooks {
     }
 
     private static var marked: Set<String> = []
+
+    private static func swipe(_ swipes: String, _ model: AppModel) async {
+        try? await Task.sleep(for: .milliseconds(1200))
+        guard let view = model.transitions.zoomView else { return print("swipe: no photo open") }
+        /// A trackpad scroll event; `fingers` is how far they moved, positive to the right.
+        func event(fingers: Double, phase: Int64) -> NSEvent? {
+            guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: 0, wheel3: 0) else { return nil }
+            cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+            cg.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+            let inverted = NSEvent(cgEvent: cg)?.isDirectionInvertedFromDevice ?? false
+            let delta = inverted ? fingers : -fingers
+            cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: delta)
+            cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: delta)
+            return NSEvent(cgEvent: cg)
+        }
+        print("swipe: start at \(model.viewerIndex.map(String.init) ?? "-") of \(model.timeline.count)")
+        for kind in swipes.split(separator: ",") {
+            let (step, count, pause): (Double, Int, Int) = switch kind {
+            case "next": (-30, 12, 16)
+            case "prev": (30, 12, 16)
+            case "short": (-10, 3, 60)
+            default: (-25, 10, 16)  // hold
+            }
+            event(fingers: 0, phase: 1).map(view.scrollWheel)
+            for _ in 0..<count {
+                try? await Task.sleep(for: .milliseconds(pause))
+                event(fingers: step, phase: 2).map(view.scrollWheel)
+            }
+            if kind == "hold" { return print("swipe: holding") }
+            event(fingers: 0, phase: 4).map(view.scrollWheel)
+            try? await Task.sleep(for: .milliseconds(600))
+            print("swipe: \(kind) -> \(model.viewerIndex.map(String.init) ?? "-")")
+        }
+    }
 
     private static func post(_ keys: String, _ model: AppModel) async {
         try? await Task.sleep(for: .milliseconds(800))

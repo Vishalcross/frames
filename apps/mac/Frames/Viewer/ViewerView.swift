@@ -8,8 +8,10 @@ import SwiftUI
 struct ViewerView: View {
     @Environment(AppModel.self) private var model
     let index: Int
-    @State private var image: CGImage?
-    @State private var fullResolution: CGImage?
+    /// Each image with the photo it shows: just after a step, the last
+    /// photo's are still here until the new one's arrive.
+    @State private var image: (id: String, image: CGImage)?
+    @State private var fullResolution: (id: String, image: CGImage)?
     @State private var keys = ViewerKeys()
 
     var body: some View {
@@ -35,9 +37,11 @@ struct ViewerView: View {
 
     private func photo(_ id: String) -> some View {
         let opening = model.transitions.phase == .opening
-        return ZoomableImage(assetID: id, index: index, image: fullResolution ?? image, hidden: opening,
-                             transitions: model.transitions) { key in
+        let shown = [fullResolution, image].lazy.compactMap { $0 }.first { $0.id == id }?.image
+        return ZoomableImage(assetID: id, index: index, count: model.timeline.count, image: shown, hidden: opening,
+                             transitions: model.transitions, neighbour: neighbourImage) { key in
             switch key {
+            case .step(let delta): model.step(delta)
             case .close: model.closeViewer()
             case .info: model.showInfo.toggle()
             case .fullResolution: Task { await loadFullResolution(id) }
@@ -52,28 +56,41 @@ struct ViewerView: View {
     private func load(_ id: String) async {
         guard let core = model.core, let pipeline = model.pipeline, let cache = model.viewerCache else { return }
         let pixels = ViewerCache.screenPixels
-        image = cache.image(for: id)
-            ?? [512, 384, 256, 128].lazy.compactMap { pipeline.cached(id, pixels: $0) }.first
-            ?? pipeline.placeholder(id, hash: model.timeline.thumbhash(index))
+        if let first = cache.image(for: id)
+            ?? [512, 384, 256, 128].lazy.compactMap({ pipeline.cached(id, pixels: $0) }).first
+            ?? pipeline.placeholder(id, hash: model.timeline.thumbhash(index)) {
+            image = (id, first)
+        }
         if cache.isFull(id) { return prepareNeighbours() }
 
         if let preview = await ViewerCache.decode(core: core, id: id, pixels: pixels, original: false), !Task.isCancelled {
-            image = preview
+            image = (id, preview)
             cache.store(preview, for: id, full: false)
         }
         prepareNeighbours()
         if let original = await ViewerCache.decode(core: core, id: id, pixels: pixels, original: true), !Task.isCancelled {
-            image = original
+            image = (id, original)
             cache.store(original, for: id, full: true)
         }
+    }
+
+    /// The best image ready for the photo `delta` away, for a swipe to show
+    /// beside this one.
+    private func neighbourImage(_ delta: Int) -> CGImage? {
+        let other = index + delta
+        guard other >= 0, other < model.timeline.count, let pipeline = model.pipeline else { return nil }
+        let id = model.timeline.id(at: other)
+        return model.viewerCache?.image(for: id)
+            ?? [512, 384, 256, 128].lazy.compactMap { pipeline.cached(id, pixels: $0) }.first
+            ?? pipeline.placeholder(id, hash: model.timeline.thumbhash(other))
     }
 
     /// The original at its own size, for detail past 100%. Not cached: one
     /// at a time, dropped when you move on.
     private func loadFullResolution(_ id: String) async {
-        guard let core = model.core, fullResolution == nil else { return }
-        let full = await ViewerCache.decode(core: core, id: id, pixels: 16_384, original: true)
-        if model.viewerIndex.map({ model.timeline.id(at: $0) }) == id { fullResolution = full }
+        guard let core = model.core, fullResolution?.id != id,
+              let full = await ViewerCache.decode(core: core, id: id, pixels: 16_384, original: true) else { return }
+        if model.viewerIndex.map({ model.timeline.id(at: $0) }) == id { fullResolution = (id, full) }
     }
 
     private func prepareNeighbours() {
@@ -164,7 +181,7 @@ final class ViewerCache {
 }
 
 enum ViewerKey {
-    case close, info, fullResolution
+    case step(Int), close, info, fullResolution
 }
 
 /// Left and right step through the album or library, and Esc goes back to
@@ -212,9 +229,11 @@ final class ViewerKeys {
 struct ZoomableImage: NSViewRepresentable {
     let assetID: String
     let index: Int
+    let count: Int
     let image: CGImage?
     let hidden: Bool
     let transitions: ViewerTransitions
+    let neighbour: (Int) -> CGImage?
     let onKey: (ViewerKey) -> Void
 
     func makeNSView(context: Context) -> ZoomView {
@@ -224,6 +243,8 @@ struct ZoomableImage: NSViewRepresentable {
     func updateNSView(_ view: ZoomView, context: Context) {
         view.onKey = onKey
         view.transitions = transitions
+        view.neighbour = neighbour
+        view.count = count
         view.show(image, assetID: assetID, index: index, hidden: hidden)
     }
 }
@@ -237,6 +258,13 @@ final class ZoomView: NSScrollView {
     private var shownIndex: Int?
     /// Stepping to a neighbour: which side its photo slides in from, and when.
     private var slide: (from: CATransitionSubtype, at: Date)?
+    /// For swipes: the image of the photo `delta` away, and how many there are.
+    var neighbour: (Int) -> CGImage? = { _ in nil }
+    var count = 0
+    private var swipe: Swipe?
+    private var track: SwipeTrack?
+    /// A swipe has just shown the new photo; it needs no slide.
+    private var swiped = false
     private var askedForFullResolution = false
     private var appeared = false
 
@@ -262,7 +290,12 @@ final class ZoomView: NSScrollView {
 
     func show(_ image: CGImage?, assetID: String, index: Int, hidden: Bool) {
         if assetID != self.assetID {
-            if let shownIndex, !hidden, self.image != nil {
+            // A step by keys ends a swipe in progress.
+            swipe = nil
+            endSwipe()
+            if swiped {
+                swiped = false
+            } else if let shownIndex, !hidden, self.image != nil {
                 slide = (index > shownIndex ? .fromRight : .fromLeft, Date())
             }
             self.assetID = assetID
@@ -270,8 +303,9 @@ final class ZoomView: NSScrollView {
             if magnification != 1 { magnification = 1 }
         }
         shownIndex = index
-        canvas.isHidden = hidden
-        guard self.image !== image else { return }
+        canvas.isHidden = hidden || track != nil
+        // Until the new photo's first image arrives, the last one stays.
+        guard let image, self.image !== image else { return }
         self.image = image
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -332,6 +366,103 @@ final class ZoomView: NSScrollView {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.checkMagnification() }
     }
 
+    // MARK: Swiping
+
+    private struct Swipe {
+        /// How far the fingers have moved the photo; positive is to the right.
+        var offset: CGFloat = 0
+        /// Sideways (true) or not, from the first movement.
+        var sideways: Bool?
+        /// Points per second, smoothed.
+        var velocity: CGFloat = 0
+        var time: TimeInterval
+    }
+
+    /// Two fingers sideways move the photo with them, the neighbour coming in
+    /// beside it. Let go past a quarter of the width, or with a flick, and it
+    /// steps; otherwise it settles back. Zoomed in, they pan as usual.
+    override func scrollWheel(with event: NSEvent) {
+        // The momentum after a swipe is swallowed.
+        if !event.momentumPhase.isEmpty {
+            if swipe == nil && track == nil { super.scrollWheel(with: event) }
+            return
+        }
+        guard magnification <= 1.01, event.hasPreciseScrollingDeltas, !event.phase.isEmpty else {
+            return super.scrollWheel(with: event)
+        }
+        if event.phase.contains(.mayBegin) || event.phase.contains(.began) {
+            swipe = Swipe(time: event.timestamp)
+            return
+        }
+        guard var current = swipe else { return super.scrollWheel(with: event) }
+        let ended = event.phase.contains(.ended) || event.phase.contains(.cancelled)
+        // The fingers' own direction, whichever way scrolling is set to go.
+        let dx = event.isDirectionInvertedFromDevice ? event.scrollingDeltaX : -event.scrollingDeltaX
+        if current.sideways == nil, abs(dx) + abs(event.scrollingDeltaY) > 2 {
+            current.sideways = abs(dx) > abs(event.scrollingDeltaY)
+        }
+        guard current.sideways == true else {
+            swipe = ended ? nil : current
+            return super.scrollWheel(with: event)
+        }
+        if ended {
+            swipe = nil
+            return finishSwipe(current, cancelled: event.phase.contains(.cancelled))
+        }
+        current.offset += dx
+        let elapsed = event.timestamp - current.time
+        if elapsed > 0 { current.velocity = 0.6 * current.velocity + 0.4 * dx / elapsed }
+        current.time = event.timestamp
+        swipe = current
+        let delta = current.offset > 0 ? -1 : 1
+        let possible = canStep(delta)
+        if track == nil {
+            let made = SwipeTrack(frame: convert(canvas.bounds, from: canvas), image: image)
+            addSubview(made)
+            track = made
+            canvas.isHidden = true
+        }
+        // At the first or last photo it only gives a little.
+        track?.place(offset: possible ? current.offset : current.offset * 0.25, delta: delta) {
+            possible ? neighbour(delta) : nil
+        }
+    }
+
+    private func canStep(_ delta: Int) -> Bool {
+        guard let shownIndex else { return false }
+        return shownIndex + delta >= 0 && shownIndex + delta < count
+    }
+
+    private func finishSwipe(_ swipe: Swipe, cancelled: Bool) {
+        guard let track else { return }
+        let delta = swipe.offset > 0 ? -1 : 1
+        let flick = abs(swipe.velocity) > 600 && (swipe.velocity > 0) == (swipe.offset > 0)
+        let steps = !cancelled && canStep(delta) && (abs(swipe.offset) > track.bounds.width * 0.25 || flick)
+        let end = steps ? -CGFloat(delta) * (track.bounds.width + SwipeTrack.gap) : 0
+        track.animate(to: end) { [weak self] in
+            guard let self, self.track === track else { return }
+            if steps {
+                // Show the new photo in place now, so the last one doesn't flash
+                // back before the new photo's own image arrives.
+                self.swiped = true
+                self.image = track.otherImage
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                self.canvas.layer?.contents = track.otherImage
+                CATransaction.commit()
+            }
+            self.endSwipe()
+            if steps { self.onKey(.step(delta)) }
+        }
+    }
+
+    private func endSwipe() {
+        guard let track else { return }
+        track.removeFromSuperview()
+        self.track = nil
+        canvas.isHidden = false
+    }
+
     /// Left, right and Esc are `ViewerKeys`'.
     override func keyDown(with event: NSEvent) {
         if event.characters == " " {
@@ -341,5 +472,56 @@ final class ZoomView: NSScrollView {
         } else {
             super.keyDown(with: event)
         }
+    }
+}
+
+/// The photo and its neighbour side by side while two fingers move them.
+private final class SwipeTrack: NSView {
+    static let gap: CGFloat = 24
+    private let current = CALayer()
+    private let other = CALayer()
+    private var otherDelta = 0
+    private(set) var otherImage: CGImage?
+
+    init(frame: CGRect, image: CGImage?) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        for photo in [current, other] {
+            photo.contentsGravity = .resizeAspect
+            layer?.addSublayer(photo)
+        }
+        current.contents = image
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// The photo `offset` from its place, and the one `delta` away beside it.
+    func place(offset: CGFloat, delta: Int, image: () -> CGImage?) {
+        if delta != otherDelta {
+            otherDelta = delta
+            otherImage = image()
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        other.contents = otherImage
+        frames(offset)
+        CATransaction.commit()
+    }
+
+    func animate(to offset: CGFloat, completion: @escaping () -> Void) {
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.25)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1))
+        CATransaction.setCompletionBlock(completion)
+        frames(offset)
+        CATransaction.commit()
+    }
+
+    private func frames(_ offset: CGFloat) {
+        current.frame = bounds.offsetBy(dx: offset, dy: 0)
+        other.frame = bounds.offsetBy(dx: offset + CGFloat(otherDelta) * (bounds.width + Self.gap), dy: 0)
     }
 }

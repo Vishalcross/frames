@@ -1,21 +1,7 @@
 {
-  "fill" : {
-    "linear-gradient" : [
-      "display-p3:0.42000,0.27000,0.92000,1.00000",
-      "display-p3:0.13000,0.09000,0.40000,1.00000"
-    ]
-  },
-  "groups" : [
-    {
-      "layers" : [ { "image-name" : "front.svg", "name" : "front" } ],
-      "shadow" : { "kind" : "neutral", "opacity" : 0.5 },
-      "translucency" : { "enabled" : false, "value" : 0 }
-    },
-    {
-      "layers" : [ { "image-name" : "back.svg", "name" : "back", "opacity" : 0.6 } ],
-      "shadow" : { "kind" : "neutral", "opacity" : 0.3 },
-      "translucency" : { "enabled" : true, "value" : 0.5 }
-    }
-  ],
+  "fill" : { "linear-gradient" : [ "display-p3:0.12000,0.13000,0.26000,1.00000", "display-p3:0.05000,0.05000,0.12000,1.00000" ] },
+  "groups" : [ { "layers" : [ { "image-name" : "inner.svg", "name" : "inner" } ], "shadow" : { "kind" : "neutral", "opacity" : 0.5 }, "translucency" : { "enabled" : false, "value" : 0 } },
+  { "layers" : [ { "image-name" : "middle.svg", "name" : "middle" } ], "shadow" : { "kind" : "neutral", "opacity" : 0.5 }, "translucency" : { "enabled" : false, "value" : 0 } },
+  { "layers" : [ { "image-name" : "outer.svg", "name" : "outer" } ], "shadow" : { "kind" : "neutral", "opacity" : 0.5 }, "translucency" : { "enabled" : false, "value" : 0 } } ],
   "supported-platforms" : { "squares" : "shared" }
 }

@@ -601,7 +601,7 @@ The app's `-FramesTestStore YES` launch argument uses it. A test import of 3 pho
 * **Empty states.**
   * An empty library shows a welcome with Connect to MEGA S4… (when not connected) and Import Photos…. While the first sync looks for photos, it says so.
   * Videos and albums have their own empty messages.
-* **App icon.** An Icon Composer icon (`Frames/AppIcon.icon`), so macOS 26 renders it in Liquid Glass: two photo prints, the front one a sunset, on violet.
+* **App icon.** An Icon Composer icon (`Frames/AppIcon.icon`), so macOS 26 renders it in Liquid Glass: three nested frames, orange, pink and violet from the outside in, on midnight blue. Each frame is its own layer, so the glass gives them depth. It replaced a first version of two photo prints, which looked like any image app.
 * **About Frames** names what the app is built on. The empty Help item is gone until there is help to show.
 * **Remembered between launches:** the grid's zoom (column count) and Years, Months or All Photos.
   * Debug runs on a library copy (`-FramesDataDir`) save none of these, nor the last palette, so testing leaves the app's real preferences alone.
@@ -673,3 +673,16 @@ What stands between this build and an app others can rely on, most important fir
   * photos, with the keyboard in the photo, the window or the grid;
   * videos;
   * a five-photo album, stopping at both ends.
+
+**Two-finger swipes** (`ZoomView.scrollWheel`):
+* The photo follows the fingers sideways, and its neighbour comes in beside it, 24 pt apart.
+* Let go past a quarter of the width, or with a flick (over 600 pt/s the same way), and it steps; otherwise it settles back in 0.25 s.
+* At the first or last photo it gives only a quarter as much, and settles back.
+* It follows the fingers whichever way scrolling is set (`isDirectionInvertedFromDevice`). The momentum after a swipe is swallowed.
+* Zoomed in past 100%, two fingers pan as before.
+* The new photo is shown in place at the end of the swipe, so the last photo doesn't flash back before the new one's own image arrives. To make that hold, the viewer now passes on only images of the photo being shown.
+* Checked with `-FramesDebugSwipe`, which sends trackpad-phased scroll events:
+  * full swipes each way;
+  * a short slow one that settles back;
+  * swipes past both ends of a five-photo album;
+  * a snapshot after a swipe that matches opening that photo directly.

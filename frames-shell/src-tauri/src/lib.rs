@@ -170,11 +170,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn init() -> Self {
-        let data_dir = dirs::data_local_dir()
+    /// The library folder, shared with the native Mac app.
+    pub fn default_data_dir() -> PathBuf {
+        dirs::data_local_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("app.frames.desktop");
-        Self::init_with_dir(data_dir)
+            .join("app.frames.desktop")
+    }
+
+    pub fn init() -> Self {
+        Self::init_with_dir(Self::default_data_dir())
     }
 
     pub fn init_with_dir(data_dir: PathBuf) -> Self {
@@ -1543,7 +1547,43 @@ async fn run_rebuild_database(app: AppHandle, state: State<'_, AppState>) -> Res
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Tell the user another app has the library open. Shown before any window
+/// exists, so it uses the system's own alert.
+fn alert_library_in_use() {
+    let title = "Frames is already open in another app.";
+    let message = "Quit it, then try again.";
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &format!("display alert \"{title}\" message \"{message}\" as critical")])
+        .status();
+    #[cfg(target_os = "windows")]
+    let _ = spawn_hidden_command("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{message}', '{title}') | Out-Null"
+            ),
+        ])
+        .status();
+    eprintln!("{title} {message}");
+}
+
 pub fn run() {
+    // One app at a time per library (frames_core::lock). Held until exit.
+    let _library_lock = match frames_core::lock::LibraryLock::acquire(&AppState::default_data_dir()) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            alert_library_in_use();
+            return;
+        }
+        Err(err) => {
+            eprintln!("Could not lock the library folder, opening without the lock: {err}");
+            None
+        }
+    };
+
     tauri::Builder::default()
         .manage(AppState::init())
         .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {

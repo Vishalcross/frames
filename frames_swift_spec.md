@@ -179,7 +179,8 @@ Swift stores and reads the S4 secret with the Security framework (Keychain) and 
 
 ### 6.2 Local data (shared with the Tauri app)
 
-* Folder: `~/Library/Application Support/app.frames.desktop/`. It holds `frames.sqlite3`, `settings.json` and the thumbnail and preview cache.
+* Library folder: `~/Library/Application Support/app.frames.desktop/` holds `frames.sqlite3` and `settings.json`.
+* Cache: `~/Library/Caches/app.frames.desktop/cache/` (unless Settings moves it). Small thumbnails are in `thumbs_s/<first 2 hex>/<id>.webp`, previews in `lru/previews/<id>.webp`.
 * Schema and migrations stay owned by `frames-core`, so both apps always agree on them.
 * The device id and next sequence number come from the database. The Mac keeps its existing identity (`mac-7df742fc`) and its log continues without a gap.
 
@@ -229,7 +230,7 @@ The plan is a custom `GridView`: a layer-backed `NSView` inside `NSScrollView`.
 * Selection behaves as today: click, Shift, Command, marquee and whole month. Selection is drawn as a layer border plus a check mark, not by re-rendering the tile.
 * **Zoom works like Photos.** Pinch or slider changes animate the visible layers around the pointer to the new size, then snap to the new column count.
 * **Accessibility.** Every visible tile is an accessibility element ("Photo, 12 May 2024, 14:30"). The arrow keys move a focus ring.
-* **Decision gate (Phase 0).** Build the same 100k grid both ways, once as `GridView` and once as `NSCollectionView` with a custom layout and prefetching. Measure both against 7.1. Keep `NSCollectionView` if it meets the budgets, because it is less code. Otherwise use `GridView`.
+* **Decided in Phase 0: `GridView`.** Both versions held 60 fps through 100k items, but `NSCollectionView` needed 5 to 6 ms of main-thread work per frame (9 ms worst), against about 1.1 ms (2.5 ms worst) for `GridView`. That breaks the 8 ms limit and leaves no room for 120 Hz, badges or selection. Numbers in section 18.
 
 ### 7.4 The image pipeline
 
@@ -295,12 +296,16 @@ Three appearances, as today.
 ## 10. Video and Live Photos
 
 * **Native formats** (MOV, MP4, M4V, 3GP with H.264, HEVC, ProRes or AAC) play in `AVPlayerView`. The source is the local cached original if present, otherwise a presigned S4 URL. AVFoundation handles range requests and hardware decoding.
-* **Other formats** go through the core's existing player: an ffmpeg repackage (`-c copy`) or a conversion to H.264 (`h264_videotoolbox`) served on 127.0.0.1 with a per-session token.
-  * **Spike (Phase 0):** confirm `AVPlayer` plays and seeks in today's fragmented-MP4 progressive stream.
-  * If it doesn't, change the loopback output to HLS (fMP4 segments with a growing playlist), which AVPlayer supports natively, and seek by playlist position.
+* **Other formats** go through the core's player: an ffmpeg repackage (`-c copy`) or a conversion to H.264 (`h264_videotoolbox`), served on 127.0.0.1 with a per-session token. **Decided in Phase 0: as HLS.**
+  * `AVPlayer` rejects today's progressive fragmented-MP4 stream (`AVFoundationErrorDomain` −11850, "server incorrectly configured"), because it requires byte-range support, which a live conversion can't offer.
+  * HLS works for both repackage and convert: fMP4 segments of about 2 s and an `EVENT` playlist that grows while ffmpeg writes (`-f hls -hls_segment_type fmp4 -hls_playlist_type event`). The player was ready in 0.2 to 0.3 s, including while the playlist was still growing.
+  * Run ffmpeg as fast as it can, not in real time (no `-re`). With stream copy, segments can only end on the source's keyframes, so in real time the first segment can take a whole keyframe interval (8 s for the test file).
+  * Segments go to a temporary folder in the cache and are deleted when playback ends or the app quits. This replaces the Tauri design's "nothing written to disk" for this path only.
+  * Seeking within written segments uses the playlist. Seeking past them starts a new session at that time (`-ss`), as today.
+  * The Windows app keeps its progressive stream, since its web view plays it.
 * **Live Photos.** When a Live Photo opens, the photo and its MOV are fetched to the cache and handed to `PHLivePhoto.request(withResourceFileURLs:…)` for `PHLivePhotoView`, which gives Apple's own playback.
   * Fallback if pairing is rejected (for example a missing content identifier): an `AVPlayerLayer` playing the MOV once over the photo.
-  * Confirm both paths in the Phase 0 spike.
+  * **Deferred to Phase 4** (owner's call, 2026-11-03): there are no Live Photos in the library yet, and a fake pair wouldn't prove Apple's pairing. Confirm both paths when a real one exists.
 * The scrubber shows the stored duration while a converted stream is still filling.
 
 ## 11. Import
@@ -315,8 +320,9 @@ The pipeline in `frames_design_spec.md` section 7 is unchanged and runs in the c
 
 * **Prerequisite:** install Xcode. This Mac has only the Command Line Tools (Swift 6.2.3), which can't run Instruments, sign with a team identity or compile asset catalogs.
 * **Layout:**
-  * `apps/mac/Frames.xcodeproj`, with sources in `apps/mac/Frames/`;
-  * `crates/frames-ffi` and `scripts/build-core-xcframework.sh` (5.1).
+  * `apps/mac/Frames.xcodeproj`, with sources in `apps/mac/Frames/` (from Phase 1);
+  * `apps/mac/Package.swift`: the Phase 0 trial programs (`ffi-smoke`, `grid-spike`, `video-spike`);
+  * `crates/frames-ffi` and `scripts/build-core-xcframework.sh` (5.1). The script sets `MACOSX_DEPLOYMENT_TARGET=26.0`; without it the C code inside the core (SQLite, libwebp, ring) targets the build Mac's own macOS version.
 * **Bundle:** id `app.frames.mac`. Hardened runtime on; network-client entitlement; no sandbox.
 * **ffmpeg and ffprobe** go in `Contents/Helpers/`, signed. The existing `scripts/prepare-binaries.js` provides them, with checksums verified.
 * **Signing (still open):**
@@ -389,3 +395,294 @@ Each phase ends with an app the owner can use on the real library and a performa
 | AVPlayer and the converted stream | Phase 0 spike, with HLS as the fallback |
 | Two copies of the theme maths drift | Golden fixtures generated from the TypeScript, checked in tests |
 | Keychain prompts after every build | A stable signing identity (section 12) |
+
+## 18. Phase 0 results (2026-11-03)
+
+| Item | Result |
+|---|---|
+| Data-folder lock | Done. `frames_core::lock`, with a test. The Tauri app takes it at launch and shows "Frames is already open in another app" if it can't. Shipped in the Tauri build of 20:04. |
+| `frames-ffi` and XCFramework | Done. `scripts/build-core-xcframework.sh` builds in about 3 minutes; the static library is 106 MB before linking. `ffi-smoke` opened a copy of the real library from Swift: 216 items, the "Portfolio" album, and a second open refused by the lock. |
+| Grid | `GridView` chosen (7.3). Measured below. |
+| Video | HLS chosen for non-native formats (section 10). |
+| Live Photos | Deferred to Phase 4: no Live Photos in the library yet (section 10). |
+
+**Grid trial.** 100,000 items in 494 months, cycling the 217 real cached thumbnails; window 1280 × 800 points, 7 columns; MacBook Air M3, 60 Hz. Each speed ran for 5 s, scrolled by the display link. "Main" is the main-thread time of one scroll step.
+
+| Speed (screens/s) | `GridView` main p95 / worst | `NSCollectionView` main p95 / worst | Frames over budget |
+|---|---|---|---|
+| 1 | 1.06 / 2.50 ms | 5.27 / 7.66 ms | none in either |
+| 2 | 1.12 / 1.37 ms | 5.96 / 8.05 ms | none in either |
+| 6 | 0.75 / 1.11 ms | 6.09 / 9.08 ms | none in either |
+| 20 | 1.41 / 2.33 ms | 6.01 / 7.04 ms | none in either |
+
+* Decode latency: 9 to 13 ms median and 13 to 81 ms p95 while scrolling slowly. Above 3 screens a second no decodes start, by design.
+* First layout: 211 ms for `GridView` warm (809 ms on a cold first launch); 285 ms for `NSCollectionView`.
+* The first, cold `GridView` run had two stalls (163 ms and 50 ms) outside the scroll step; the repeat run had none.
+
+**Follow-ups for Phase 1:**
+* Memory ended at about 640 MB in both versions, over the 600 MB budget. It comes from the shared image pipeline, not the grid. Account for the decoded image cost properly and measure with the cache capped at 150 MB.
+* Bring the cold first layout under the 1 s budget, and investigate the cold-start stalls with Instruments.
+
+## 19. Phase 1 status (2026-11-03)
+
+**Built.** `apps/mac/Frames.xcodeproj`. Its "Rust Core" target runs `scripts/build-core-xcframework.sh` before each build, and the script only replaces generated files that changed. The app has:
+* A window with a sidebar (Library, Videos, Albums with counts) and the Years / Months / All Photos selector.
+* The custom layer grid:
+  * ThumbHash placeholders and month headers that stay pinned at the top;
+  * video and LIVE badges;
+  * click and double-click, arrow keys, Return and Space;
+  * pinch and ⌘+ / ⌘− zoom from 3 to 15 columns, keeping the photo under the pointer in place.
+* Years and Months cards built from the in-memory timeline. Clicking a month opens All Photos at that month.
+* A viewer:
+  * the grid's thumbnail at once, then the preview, then the original on this Mac, each decoded at screen size;
+  * neighbours prepared ahead;
+  * pinch or double-click to zoom; arrows, Esc and Space; ⌘I for info.
+* An info panel showing filename, date with its UTC offset, camera, pixel size, file size and albums.
+* Sync in the background (on open, every 5 minutes, and ⇧⌘R), a status icon, and an offline or not-connected banner.
+* Debug-only launch arguments for tests: a data or cache folder, timings, and a window snapshot (`App/DebugHooks.swift`).
+
+**Core changes made for it:**
+* `Store::for_each_timeline_tile`;
+* the `assets_timeline_tiles` index, which replaces `assets_taken_desc`;
+* the `utc_millis` fast date parser;
+* `remove_legacy_folder_assets` now runs once per library, not on every open;
+* background work (thumbnail backfill, sync) starts 3 s after opening;
+* timeline numbers cross the bridge as little-endian bytes.
+
+**Measured** on the MacBook Air (M3), Debug build of the app, Rust in release:
+
+| Measure | Your library (216) | Generated (100,000) | Budget |
+|---|---|---|---|
+| Launch to first grid frame, warm | 278 to 293 ms | 368 to 375 ms | under 400 ms |
+| Timeline in the core | under 1 ms | 27 ms (alone), 70 to 100 ms through the bridge in the app | under 50 ms in the core |
+| Timeline into Swift | under 1 ms | 20 ms | under 10 ms to lay out |
+| Memory, scrolled halfway | — | 244 MB | under 600 MB |
+
+**Not yet, or simplified:**
+* The year scrubber.
+* Animated transitions: the tile-to-viewer zoom, and animated grid zoom (the column count changes in one step).
+* Full-resolution tiles past 1:1 zoom in the viewer.
+* Multi-select (Phase 2).
+* The batched thumbnail requests in 5.2: the pipeline makes one blocking call per tile, off the main thread, six at a time.
+* The S4 secret is still read through `/usr/bin/security`, as the Tauri app does, so nothing prompts until a stable signing identity exists (5.5).
+* The Settings window (Phase 6). Until then the app reads `settings.json` written by the Tauri app.
+* Sync is untested from this app against the real bucket. It is the same `sync_once` the Tauri app runs every 5 minutes.
+
+## 20. Phase 2 status (2026-11-03)
+
+**Built:**
+* **Selection.** Click, Shift-click (range), ⌘-click (toggle), a marquee dragged from a gap or header, clicking a month header (selects the month), ⌘A, Esc, and Shift-arrow. Selected tiles get a ring and a check mark. The selection is kept by asset id across reloads.
+* **Albums:**
+  * create from the sidebar's +, from File › New Album (⌘N), or from a selection (⌥⌘N) or its menus;
+  * rename and delete from the sidebar's context menu, with a confirmation before deleting;
+  * add, move and remove from the grid's context menu or the toolbar;
+  * drop photos on a sidebar album to add them.
+* **Recently Deleted:**
+  * sidebar entry; one grid ordered by deletion, each tile showing its days left;
+  * Recover, Delete Now (confirmed), and Delete All (confirmed with the count and size; needs S4);
+  * ⌘⌫ moves photos there.
+* **Adjust Date and Time.** A sheet from the Image menu or the context menu. It edits the wall-clock time where the photo was taken; only the index changes.
+* **Export:**
+  * Export Originals… (⇧⌘E) copies from this Mac when the original is still at its import path, otherwise from S4. It reports anything missing.
+  * Dragging tiles to Finder or another app writes each original on drop (file promises; the first 500 of a larger drag).
+* **Search.** The toolbar field with suggested tokens: albums, months, cameras, types and file names. The results replace the grid.
+* **Edits upload about 2 s after the last one,** in one log batch. Items past 30 days are purged daily. Both need S4.
+* **The items from Phase 1's "not yet" list:**
+  * the year scrubber (it appears while scrolling or on hover; click or drag to jump, with a month bubble);
+  * the zoom from a tile into the viewer and back;
+  * the grid follows a pinch live and settles on the nearest column count with animation (⌘+/− animate too);
+  * the full-resolution original replaces the screen-size image once the viewer is zoomed past 100%.
+
+**Bridge additions:**
+* album edits; trash, restore, delete-now and empty-trash calls;
+* `set_date`, `export_originals`, `export_original` and `filenames`;
+* `search_suggestions`; a trash summary;
+* the Recently Deleted timeline with days left;
+* timeline filters for text, month, camera, type and file extension;
+* the edit-upload and daily-purge threads.
+
+`apps/mac/Spikes/EditCheck` runs every edit on a copy of a library and checks the result. All 18 checks pass, and every edit queues its change-log op.
+
+**Not verified by me.** These need a person at the trackpad:
+* the live pinch;
+* drag to Finder and drops on sidebar albums;
+* context menus and sheets;
+* keyboard shortcuts;
+* the viewer transition at full speed.
+
+Delete Now, Delete All and the edit upload are untested against the real bucket, because the test copies have no S4 settings.
+
+## 21. Imports, Settings and Appearance (2026-11-03)
+
+**Imports (Phase 3):**
+* File › Import… (⇧⌘I), the Imports view's button, or dropping files and folders on the window. Dropped on a sidebar album, they go into that album.
+* The Imports view shows progress (files and bytes), time left from the last 30 s, duplicates and failures, Pause, Resume and Stop. It also shows the last run's results: imported, failed with reasons, and skipped files.
+* Imports a previous run left unfinished resume automatically once S4 is reachable, as in the Tauri app. Stop marks the waiting files cancelled, so they aren't resumed later.
+* The app bundles ffmpeg and ffprobe next to its executable, signed with the app's identity.
+
+**The bridge now:**
+* keeps the S4 connection swappable, so saving Settings reconnects without reopening;
+* runs sync, the daily purge and import resumption in one background loop;
+* adds `import_paths`, `import_status` and pause, resume and cancel;
+* adds `settings`, `save_settings` (the shared `settings.json`, with the secret in the Keychain), `test_connection`, `cache_info` and `clear_cache`;
+* adds `check_library`, `add_unknown_files` and `rebuild_database`;
+* adds `palette` (computed on first use), and `video_source` and `motion_source` (the original on this Mac, or a one-hour S4 link);
+* adds `Library.open_for_tests`, which uploads to memory.
+
+The app's `-FramesTestStore YES` launch argument uses it. A test import of 3 photos and a text file into a copy gave 3 imported and 1 skipped.
+
+**Settings (⌘,, or the sidebar's Settings button).** Four panes:
+* **Appearance:** Standard, Adaptive, Glass; colour scheme; accent; Adaptive intensity and colour source.
+* **MEGA S4:** sync on or off, endpoint, region, bucket, keys, Test, Save.
+* **Storage:** space limit; cache location, size and usage; Clear Cache.
+* **Library:** this Mac's id, Check Library (with Add Unknown Files) and Rebuild Database.
+
+**Appearance.** `ThemeEngine` ports `immersiveRoles` and the brightness rule from `palette.ts`:
+* Adaptive tints the canvas, the sidebar, the pinned header and the accent from the open photo, or while browsing from the photo under the pointer (0.4 s) or centred when a scroll settles (at most every 0.8 s).
+* Follow Photo switches between light and dark only for an open photo.
+* Standard uses the system look with an optional accent. Glass gives the window an ultra-thin material.
+* The settings are stored per Mac in UserDefaults.
+
+**Videos and Live Photos (part of Phase 4):**
+* Videos play in `AVPlayerView`, from this Mac or a presigned S4 link. A format AVFoundation can't open shows "Can't Play Here" with Export.
+* A Live Photo's LIVE badge plays its movie while pressed.
+
+**Still missing compared with the Tauri app:**
+* Per-album colour themes: dynamic, album auto, album manual.
+* Converting MKV, AVI, MTS and WMV for playback (the HLS path in section 10).
+* Glass tint and clarity options.
+* The manual offline switch.
+* Native `PHLivePhotoView` playback.
+
+## 22. The last gaps with the Tauri app, closed (2026-11-03)
+
+* **Album colours.** Right-click an album in the sidebar and choose Colours…. The choices are each photo's own colours, or one palette for the album, either generated from its photos (with Make Again) or chosen by hand with three colour wells.
+  * The album's page uses that palette in Adaptive.
+  * So does a photo opened from the album, or opened from the library when it is in such an album (as the Tauri app does).
+  * Chosen colours are shown exactly and their background decides light or dark. Generated ones are toned like a photo's.
+  * The setting is kept on this Mac, in `album_theme`, as before.
+* **Video formats AVFoundation can't open** (`frames_core::hls`, section 10). The viewer:
+  1. plays the original when the import's codec notes allow it;
+  2. otherwise plays a repackaged HLS stream (fMP4 segments and an EVENT playlist served on 127.0.0.1 with a session token);
+  3. otherwise a converted one (VideoToolbox H.264 at 10 Mb/s, AAC);
+  4. otherwise shows "Can't Play Here".
+
+  Copied HEVC is tagged `hvc1`. Streams stop when the viewer leaves the video or the app quits; leftovers are cleared at the next start. Test: a 20 s H.264/AAC MKV played through the stream after 0.7 s, and an MP4 played the original after 0.4 s. Seeking is limited to what ffmpeg has written; starting a new session at the seek point (`-ss`) is left for later.
+* **Glass:**
+  * Tint: Neutral, or from the photo (its accent hue at L 0.62, over the window's material at 18%).
+  * Clarity: Regular (regular material) or Clear (ultra-thin).
+  * Reduce Transparency keeps the window solid.
+* **Work Offline** (the sync button's menu, or File › Work Offline; remembered on this Mac):
+  * nothing reaches S4 (no sync, uploads, downloads or purges), and a running import pauses and resumes when you go back online;
+  * edits wait in the outbox;
+  * a banner with Go Online.
+
+**Not exactly as before:**
+* The Tauri app's Glass tint was set per appearance in CSS; here it is the window material plus a tint.
+* Live Photos play their movie while the LIVE badge is held, rather than in Apple's `PHLivePhotoView`. That waits for a real Live Photo to test with (section 10).
+
+## 23. Theming and UI refinements (2026-11-04)
+
+* **The viewer's backdrop follows the look** (as in the Tauri app):
+  * Standard and Glass: black in dark, white in light, like Photos.
+  * Adaptive: the canvas hue nearly black or white (L 0.13 / 0.985), with the photo's colours glowing through. The glow is the photo's ThumbHash scaled 1.15, at 35% (30% in light). It is already a soft blur, so it costs one small image. Reduce Transparency turns the glow off.
+  * An album with chosen colours: its background colour.
+  * The zoom into and out of the viewer fades the same colour, not black.
+  * Videos open without the zoom; before, they left the transition waiting for a photo.
+* **Adaptive opens in the colours it was left in.** It remembers the last photo palette and light or dark (`FramesTheme.last`), instead of starting on a grey slate that changes a moment later.
+* **The window's title.**
+  * The viewer shows the photo's date as the title and its time underneath, as Photos does.
+  * Elsewhere the count reads "200 Photos, 19 Videos" instead of "219 items".
+* **Sync status moved from the toolbar to the bottom of the sidebar**, in words: Up to Date, Syncing…, Importing 12 of 635, Import Paused, Offline, Not Connected, Working Offline. Its menu has Sync Now and Work Offline. Settings is the gear beside it.
+* **Years and Months cards.**
+  * A shade under the caption, so it reads on bright photos.
+  * Continuous corners, and a slight lift on hover.
+  * Clicking a year opens Months at that year, instead of at the top.
+* **Empty states.**
+  * An empty library shows a welcome with Connect to MEGA S4… (when not connected) and Import Photos…. While the first sync looks for photos, it says so.
+  * Videos and albums have their own empty messages.
+* **App icon.** An Icon Composer icon (`Frames/AppIcon.icon`), so macOS 26 renders it in Liquid Glass: three nested frames, orange, pink and violet from the outside in, on midnight blue. Each frame is its own layer, so the glass gives them depth. It replaced a first version of two photo prints, which looked like any image app.
+* **About Frames** names what the app is built on. The empty Help item is gone until there is help to show.
+* **Remembered between launches:** the grid's zoom (column count) and Years, Months or All Photos.
+  * Debug runs on a library copy (`-FramesDataDir`) save none of these, nor the last palette, so testing leaves the app's real preferences alone.
+* **VoiceOver in the grid.** The grid is an accessibility list. Each tile on screen is an image named, for example, "Video, 0:20, 3 November 2026" or "Photo, 18 April 2026, 12 days left". It reports selection and opens on press. Checked with `-FramesDebugAccessibility YES`.
+
+## 24. Production readiness
+
+What stands between this build and an app others can rely on, most important first.
+
+**Before anyone else runs it**
+
+1. **Signing identity** (12).
+   * Today the app is ad-hoc signed. It runs only on this Mac, and the Keychain may ask again for the S4 secret after each rebuild.
+   * A free Apple Development identity fixes that for this Mac.
+   * Other Macs need Developer ID plus notarization, which requires the paid Apple Developer Program.
+2. **Our own ffmpeg build.**
+   * The bundled ffmpeg is version 6.0 (2023), configured with `--enable-gpl --enable-nonfree` and x264, x265 and others. A nonfree build may not be redistributed at all. It also parses untrusted files with two years of unfixed bugs.
+   * Frames needs only demuxers, native decoders, the VideoToolbox encoders and the mp4/HLS muxers.
+   * So: a script that builds current FFmpeg as LGPL (no `--enable-gpl` or `--enable-nonfree`) with checksummed sources, and ships its licence and a source offer.
+3. **No crashes from the core.**
+   * The generated Swift calls non-throwing exports (`small_thumb`, `preview`, `local_original`, `connection_problem`, `sync_now` and others) with `try!`, so a Rust panic in one of them closes the app.
+   * Make every export return `Result`, so a panic arrives as an error, like the throwing ones.
+4. **Release packaging.** Version and build numbers from git, a DMG, `notarytool` and `stapler`, signature checks, and a first launch on a clean user account. One script.
+5. **Updates.** Sparkle 2 with an EdDSA-signed appcast on GitHub Releases. Only once there is a signed build to update.
+6. **Acknowledgements.** The Rust crates' licences (generated with `cargo-about`) and FFmpeg's LGPL notice, in the About panel or a window it opens.
+
+**Reliability**
+
+7. **Logs and diagnostics.**
+   * Nothing is logged today. Add a Swift `Logger` (subsystem `app.frames.mac`; categories sync, import, video, theme) and route the core's `log` output to it.
+   * Add Copy Diagnostics in Settings › Library (versions, counts, recent errors).
+   * Keep MetricKit crash diagnostics locally.
+8. **Network changes.** Sync as soon as the network returns or the Mac wakes (`NWPathMonitor`, the wake notification), not at the next timer.
+9. **Seeking in converted videos.** Start a new ffmpeg session at the seek point (`-ss`) (22).
+10. **Database upgrades.** A test that opens a library from each earlier schema version, and a copy of the database kept before a migration runs.
+11. **Real-library pass** (13):
+    * Test and Save on a real bucket;
+    * the 635-file Portfolio upload;
+    * real videos and a Live Photo;
+    * the Tauri and Swift apps sharing one test bucket.
+
+**Quality**
+
+12. **Accessibility**, beyond the grid (23):
+    * a spoken label for the open photo;
+    * a visible keyboard focus in the grid;
+    * Increase Contrast in the theme engine (less chroma, a stronger accent);
+    * a VoiceOver pass over Settings and Imports.
+13. **Automated tests and CI.**
+    * A Swift Testing target: theme maths against `palette.ts` fixtures, timeline and grid layout maths.
+    * A UI smoke test.
+    * GitHub Actions on a macOS runner: `cargo test`, the XCFramework, `xcodebuild`, and the Tauri Windows build, so core changes can't break either app unnoticed.
+14. **Performance pass** with Instruments on the real library: launch, scrolling, opening the viewer, against the budgets in 7.6.
+15. **Help.** A short getting-started page behind the Help menu.
+16. **Localization**, only if wanted. Strings built in the model (counts, sync status) would need `String(localized:)` first.
+
+**Decided against**
+
+* **The Mac App Store.** It requires the App Sandbox, which conflicts with running ffmpeg on arbitrary files and with sharing the library folder with the Tauri app. Developer ID is the route, and no privacy manifest is needed for it.
+
+## 25. Stepping through photos with the arrow keys (2026-11-04)
+
+* **Left and right always step** to the previous or next photo or video in what is shown: the library, an album, Videos, a search. Esc goes back to the grid, and the grid shows where you ended.
+  * Before, arrows worked only while the photo view had the keyboard. After a click on the toolbar, or in a video, the keyboard sat with the window or the grid behind, and nothing happened.
+  * Now `ViewerKeys`, a local key monitor that lives while the viewer is open, handles them first, whoever has the keyboard.
+  * It leaves alone typing in the search field, sheets, the Settings window, and keys with Command, Option or Control.
+* **The next photo slides in** from the side it lies on: a 0.22 s push of the photo layer. Only its first image slides; the sharper ones that follow replace it in place. Reduce Motion makes it a fade.
+* **Checked with `-FramesDebugKeys`**, which posts real key events through the app's queue:
+  * photos, with the keyboard in the photo, the window or the grid;
+  * videos;
+  * a five-photo album, stopping at both ends.
+
+**Two-finger swipes** (`ZoomView.scrollWheel`):
+* The photo follows the fingers sideways, and its neighbour comes in beside it, 24 pt apart.
+* Let go past a quarter of the width, or with a flick (over 600 pt/s the same way), and it steps; otherwise it settles back in 0.25 s.
+* At the first or last photo it gives only a quarter as much, and settles back.
+* It follows the fingers whichever way scrolling is set (`isDirectionInvertedFromDevice`). The momentum after a swipe is swallowed.
+* Zoomed in past 100%, two fingers pan as before.
+* The new photo is shown in place at the end of the swipe, so the last photo doesn't flash back before the new one's own image arrives. To make that hold, the viewer now passes on only images of the photo being shown.
+* Checked with `-FramesDebugSwipe`, which sends trackpad-phased scroll events:
+  * full swipes each way;
+  * a short slow one that settles back;
+  * swipes past both ends of a five-photo album;
+  * a snapshot after a swipe that matches opening that photo directly.

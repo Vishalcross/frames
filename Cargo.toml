@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/frames-core",
+    "crates/frames-ffi",
     "frames-shell/src-tauri",
 ]
 resolver = "2"
@@ -17,3 +18,9 @@ opt-level = 3
 # corrupt photo must fail that photo, not close the app.
 panic = "unwind"
 strip = true
+
+# The Mac app's Rust library (scripts/build-core-xcframework.sh): release, but
+# unstripped, because uniffi-bindgen reads its metadata from the symbols.
+[profile.ffi]
+inherits = "release"
+strip = false

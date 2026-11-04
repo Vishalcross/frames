@@ -31,6 +31,7 @@ struct LibraryWindow: View {
                 VStack(spacing: 0) {
                     StatusBanner()
                     DetailView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .background(model.theme.colours.canvas.map { Color(nsColor: $0) } ?? .clear)
                 .dropDestination(for: URL.self) { urls, _ in
@@ -46,8 +47,8 @@ struct LibraryWindow: View {
                     .inspectorColumnWidth(min: 240, ideal: 280, max: 360)
             }
         }
-        .navigationTitle(model.viewerIndex == nil ? model.title : "")
-        .navigationSubtitle(subtitle)
+        .navigationTitle(model.viewerTitle?.date ?? model.title)
+        .navigationSubtitle(model.viewerTitle?.time ?? subtitle)
         .toolbar { LibraryToolbar() }
         .themed(model.theme)
         .searchable(text: $model.searchText, tokens: $model.searchTokens, suggestedTokens: $model.suggestedTokens,
@@ -75,10 +76,8 @@ struct LibraryWindow: View {
     }
 
     private var subtitle: String {
-        guard model.viewerIndex == nil, model.sidebar != .imports || model.isSearching else { return "" }
-        if !model.selection.isEmpty { return "\(model.selection.count) selected" }
-        let count = model.timeline.count
-        return count == 0 ? "" : "\(count.formatted()) \(count == 1 ? "item" : "items")"
+        guard model.sidebar != .imports || model.isSearching else { return "" }
+        return model.countText
     }
 }
 
@@ -113,17 +112,44 @@ struct SidebarView: View {
         .listStyle(.sidebar)
         .scrollContentBackground(model.theme.colours.sidebar == nil ? .automatic : .hidden)
         .background(model.theme.colours.sidebar.map { Color(nsColor: $0) } ?? .clear)
-        .safeAreaInset(edge: .bottom) {
-            Button { openSettings() } label: {
-                Label("Settings", systemImage: "gearshape")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.borderless)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .help("Connection, storage, library and appearance (⌘,)")
-        }
+        .safeAreaInset(edge: .bottom) { SidebarFooter() }
         .onChange(of: model.settingsRequest) { openSettings() }
+    }
+}
+
+/// Under the sidebar: how syncing is going, in words, with its menu; and Settings.
+struct SidebarFooter: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        @Bindable var model = model
+        let status = model.syncStatus
+        HStack(spacing: 8) {
+            Menu {
+                Text(status.detail)
+                Divider()
+                Button("Sync Now") { model.syncNow() }
+                    .disabled(model.connectionProblem != nil || model.workOffline)
+                Toggle("Work Offline", isOn: $model.workOffline)
+            } label: {
+                Label(status.title, systemImage: status.symbol)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .menuStyle(.button)
+            .buttonStyle(.borderless)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help(status.detail)
+            Spacer(minLength: 0)
+            Button("Settings", systemImage: "gearshape") { openSettings() }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                .help("Settings (⌘,)")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
     }
 }
 
@@ -203,6 +229,35 @@ struct AlbumRow: View {
     }
 }
 
+/// An empty library: how to fill it.
+struct WelcomeView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("Welcome to Frames", systemImage: "photo.stack")
+        } description: {
+            Text(description)
+        } actions: {
+            if model.connectionProblem != nil {
+                Button("Connect to MEGA S4…") { model.openSettings(tab: "connection") }
+                    .buttonStyle(.borderedProminent)
+            }
+            Button("Import Photos…") { Task { await model.chooseImport() } }
+        }
+    }
+
+    private var description: String {
+        if model.connectionProblem != nil {
+            return "Connect your MEGA S4 bucket to bring in your library, or import photos and videos from this Mac."
+        }
+        if model.online == nil && !model.workOffline {
+            return "Looking for your library in MEGA S4…"
+        }
+        return "Import photos and videos from this Mac, or drag them here. Frames keeps them in your MEGA S4 bucket."
+    }
+}
+
 /// The grid, or Years and Months cards in the library.
 struct DetailView: View {
     @Environment(AppModel.self) private var model
@@ -210,6 +265,8 @@ struct DetailView: View {
     var body: some View {
         if model.isSearching {
             grid(empty: ContentUnavailableView.search)
+        } else if model.showsWelcome {
+            WelcomeView()
         } else if model.sidebar == .imports {
             ImportsView()
         } else if model.sidebar == .library && model.grouping == .years {
@@ -220,8 +277,10 @@ struct DetailView: View {
             grid(empty: ContentUnavailableView("Recently Deleted Is Empty", systemImage: "trash",
                                                description: Text("Deleted photos stay here for 30 days.")))
         } else {
-            grid(empty: ContentUnavailableView("No Photos", systemImage: "photo.on.rectangle",
-                                               description: Text(model.sidebar == .videos ? "There are no videos yet." : "Nothing here yet.")))
+            grid(empty: model.sidebar == .videos
+                 ? ContentUnavailableView("No Videos", systemImage: "video", description: Text("Videos you import appear here."))
+                 : ContentUnavailableView("No Photos", systemImage: "photo.on.rectangle",
+                                          description: Text("Drag photos here from the library, or drop files to import them.")))
         }
     }
 
@@ -275,7 +334,6 @@ struct LibraryToolbar: ToolbarContent {
             }
             Button("Info", systemImage: "info.circle") { model.showInfo.toggle() }
                 .disabled(model.viewerIndex == nil && model.selection.isEmpty)
-            SyncButton()
         }
     }
 }
@@ -294,50 +352,14 @@ struct AddToAlbumMenu: View {
     }
 }
 
-struct SyncButton: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        @Bindable var model = model
-        Menu {
-            Button("Sync Now") { model.syncNow() }
-                .disabled(model.connectionProblem != nil || model.workOffline)
-            Toggle("Work Offline", isOn: $model.workOffline)
-        } label: {
-            Label("Sync", systemImage: symbol)
-        } primaryAction: {
-            if model.workOffline { model.workOffline = false } else { model.syncNow() }
-        }
-        .help(help)
-    }
-
-    private var symbol: String {
-        if model.workOffline { return "wifi.slash" }
-        if model.connectionProblem != nil { return "icloud.slash" }
-        switch model.online {
-        case true?: return "checkmark.icloud"
-        case false?: return "exclamationmark.icloud"
-        case nil: return "arrow.triangle.2.circlepath.icloud"
-        }
-    }
-
-    private var help: String {
-        if model.workOffline { return "Working offline. Click to go back online." }
-        if let problem = model.connectionProblem { return problem }
-        switch model.online {
-        case true?: return "Up to date with MEGA S4. Click to sync now."
-        case false?: return "Offline. Browsing still works; Frames syncs when it can reach MEGA S4."
-        case nil: return "Syncing with MEGA S4…"
-        }
-    }
-}
-
 /// Shown only when the library isn't syncing.
 struct StatusBanner: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        if model.workOffline {
+        if model.showsWelcome {
+            // The welcome says it already.
+        } else if model.workOffline {
             HStack {
                 Label("Working offline. Changes stay on this Mac and upload when you go back online.", systemImage: "wifi.slash")
                 Spacer()

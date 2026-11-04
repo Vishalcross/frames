@@ -1,8 +1,8 @@
 import AppKit
 
 /// The zoom between a grid tile and the viewer (frames_swift_spec.md 7.5).
-/// The photo travels on a layer above the window while the viewer's black
-/// background fades in or out under it.
+/// The photo travels on a layer above the window while the viewer's
+/// backdrop fades in or out under it.
 @MainActor
 @Observable
 final class ViewerTransitions {
@@ -15,14 +15,17 @@ final class ViewerTransitions {
     private(set) var phase = Phase.idle
     @ObservationIgnored weak var grid: GridView?
     @ObservationIgnored weak var zoomView: ZoomView?
+    /// For the viewer's backdrop colour.
+    @ObservationIgnored weak var theme: ThemeEngine?
     @ObservationIgnored private var start: (image: CGImage, frame: CGRect)?
     private static let duration = 0.32
 
     private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
-    /// Note where the tile is before the viewer covers it.
-    func prepareOpening(index: Int) {
-        if !reduceMotion, let snapshot = grid?.tileSnapshot(index), let image = snapshot.image {
+    /// Note where the tile is before the viewer covers it. Videos open
+    /// without the zoom: their player isn't a photo to land on.
+    func prepareOpening(index: Int, animated: Bool) {
+        if animated, !reduceMotion, let snapshot = grid?.tileSnapshot(index), let image = snapshot.image {
             start = (image, snapshot.frame)
             phase = .opening
         } else {
@@ -41,7 +44,8 @@ final class ViewerTransitions {
         self.start = nil
         let area = view.convert(view.bounds, to: nil)
         let target = Self.fit(start.image, in: area)
-        Overlay.run(in: window, image: start.image, area: area, from: start.frame, to: target, backdropFrom: 0, backdropTo: 1) {
+        Overlay.run(in: window, image: start.image, area: area, from: start.frame, to: target,
+                    backdrop: backdrop(window), backdropFrom: 0, backdropTo: 1) {
             self.phase = .open
         }
     }
@@ -62,7 +66,13 @@ final class ViewerTransitions {
             return closed()
         }
         phase = .idle
-        Overlay.run(in: window, image: image, area: area, from: from, to: tile, backdropFrom: 1, backdropTo: 0, endsInTile: true, closed)
+        Overlay.run(in: window, image: image, area: area, from: from, to: tile,
+                    backdrop: backdrop(window), backdropFrom: 1, backdropTo: 0, endsInTile: true, closed)
+    }
+
+    private func backdrop(_ window: NSWindow) -> CGColor {
+        let dark = window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return (theme?.viewerBackdrop(dark: dark) ?? (dark ? .black : .white)).cgColor
     }
 
     static func fit(_ image: CGImage, in area: CGRect) -> CGRect {
@@ -74,7 +84,7 @@ final class ViewerTransitions {
     /// A short-lived view above the window's content that animates the photo.
     private final class Overlay: NSView {
         static func run(in window: NSWindow, image: CGImage, area: CGRect, from: CGRect, to: CGRect,
-                        backdropFrom: Float, backdropTo: Float, endsInTile: Bool = false,
+                        backdrop colour: CGColor, backdropFrom: Float, backdropTo: Float, endsInTile: Bool = false,
                         _ completion: @escaping () -> Void) {
             guard let content = window.contentView else { return completion() }
             let overlay = Overlay(frame: content.bounds)
@@ -82,7 +92,7 @@ final class ViewerTransitions {
             content.addSubview(overlay, positioned: .above, relativeTo: nil)
 
             let backdrop = CALayer()
-            backdrop.backgroundColor = NSColor.black.cgColor
+            backdrop.backgroundColor = colour
             backdrop.frame = overlay.convert(area, from: nil)
             backdrop.opacity = backdropFrom
             // The clip is the tile's square at one end and the whole photo at the other.

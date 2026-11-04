@@ -13,7 +13,6 @@ struct VideoView: View {
 
     var body: some View {
         ZStack {
-            Color.black
             if let player { PlayerView(player: player, controls: true) }
             if failed {
                 ContentUnavailableView {
@@ -23,9 +22,9 @@ struct VideoView: View {
                 } actions: {
                     Button("Export Original…") { Task { await model.exportSelection() } }
                 }
-                .foregroundStyle(.white)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: id) { await load() }
         .onDisappear {
             player?.pause()

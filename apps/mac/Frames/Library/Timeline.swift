@@ -20,6 +20,8 @@ struct Timeline: Sendable {
     /// Changes whenever the contents may have, so views can tell cheaply.
     let version: UUID
     let count: Int
+    /// How many of `count` are videos.
+    let videoCount: Int
     let sections: [TimelineSection]
     private let ids: Data
     private let idEnds: [UInt32]
@@ -33,6 +35,7 @@ struct Timeline: Sendable {
     private init() {
         version = UUID()
         count = 0
+        videoCount = 0
         sections = []
         ids = Data()
         idEnds = []
@@ -51,6 +54,7 @@ struct Timeline: Sendable {
         idEnds = Self.integers(snapshot.idEnds)
         localMs = Self.integers(snapshot.localMs)
         flags = snapshot.flags
+        videoCount = snapshot.flags.reduce(0) { $0 + Int($1 & 1) }
         durations = Self.integers(snapshot.durationS)
         thumbhashes = snapshot.thumbhashes
         thumbhashEnds = Self.integers(snapshot.thumbhashEnds)

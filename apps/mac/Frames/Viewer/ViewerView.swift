@@ -13,16 +13,23 @@ struct ViewerView: View {
 
     var body: some View {
         let id = model.timeline.id(at: index)
-        if model.timeline.isVideo(index) {
-            VideoView(id: id)
-                .onKeyPress(.leftArrow) { model.step(-1); return .handled }
-                .onKeyPress(.rightArrow) { model.step(1); return .handled }
-                .onKeyPress(.escape) { model.closeViewer(); return .handled }
-        } else {
-            photo(id)
-                .overlay(alignment: .topLeading) {
-                    if model.timeline.isLive(index) && model.transitions.phase != .opening { LiveBadge(id: id) }
-                }
+        let opening = model.transitions.phase == .opening
+        Group {
+            if model.timeline.isVideo(index) {
+                VideoView(id: id)
+                    .onKeyPress(.leftArrow) { model.step(-1); return .handled }
+                    .onKeyPress(.rightArrow) { model.step(1); return .handled }
+                    .onKeyPress(.escape) { model.closeViewer(); return .handled }
+            } else {
+                photo(id)
+                    .overlay(alignment: .topLeading) {
+                        if model.timeline.isLive(index) && !opening { LiveBadge(id: id) }
+                    }
+            }
+        }
+        // While the photo zooms in, the transition draws the backdrop.
+        .background {
+            if !opening { ViewerBackdrop(id: id, hash: model.timeline.thumbhash(index)) }
         }
     }
 
@@ -37,7 +44,6 @@ struct ViewerView: View {
             case .fullResolution: Task { await loadFullResolution(id) }
             }
         }
-        .background(opening ? Color.clear : Color.black)
         .task(id: id) {
             fullResolution = nil
             await load(id)
@@ -76,6 +82,39 @@ struct ViewerView: View {
         for neighbour in [index + 1, index - 1] where neighbour >= 0 && neighbour < model.timeline.count {
             cache.prepare(model.timeline.id(at: neighbour), core: core)
         }
+    }
+}
+
+/// Behind the open photo: black or white, or in Adaptive the photo's hue
+/// nearly black or white with the photo's own colours glowing through, as
+/// in the Tauri app. The glow is the ThumbHash, already a soft blur.
+struct ViewerBackdrop: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    let id: String
+    let hash: Data
+
+    var body: some View {
+        let theme = model.theme
+        ZStack {
+            Color(nsColor: theme.viewerBackdrop(dark: scheme == .dark))
+            if theme.settings.appearance == .adaptive, !reduceTransparency,
+               let glow = model.pipeline?.placeholder(id, hash: hash) {
+                Image(decorative: glow, scale: 1)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFill()
+                    .scaleEffect(1.15)
+                    .blur(radius: 24)
+                    .opacity(scheme == .dark ? 0.35 : 0.3)
+                    .id(id)
+                    .transition(.opacity)
+            }
+        }
+        .clipped()
+        .allowsHitTesting(false)
+        .animation(.easeInOut(duration: 0.3), value: id)
     }
 }
 

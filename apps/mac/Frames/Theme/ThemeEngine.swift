@@ -8,6 +8,8 @@ struct ThemeColours: Equatable {
     var scheme: ColorScheme?
     /// Glass tinted from the photo.
     var glassTint: NSColor?
+    /// Behind the open photo; nil for black in dark and white in light.
+    var viewer: NSColor?
 }
 
 /// Works out the window's colours from the Appearance settings and, for
@@ -27,13 +29,23 @@ final class ThemeEngine {
     /// The album page's palette, kept while a photo from another album is open.
     @ObservationIgnored private var pagePalette: (palette: PhotoPalette, exact: Bool)?
     /// Kept between photos, so mid-brightness photos don't flip it.
-    private var photoScheme: ColorScheme = .dark
+    private var photoScheme: ColorScheme
     @ObservationIgnored private var request: String?
     @ObservationIgnored private var lastBrowseFocus = Date.distantPast
     @ObservationIgnored private var albumColours: [String: AlbumColours] = [:]
 
     init() {
+        // Open in the colours the app was left in, not a grey slate that
+        // changes a moment later.
+        let last = Self.loadLast()
+        photoScheme = last.scheme
+        if settings.takesPhotoColours, settings.colourSource == .viewerAndBrowsing { photoPalette = last.palette }
         recompute()
+    }
+
+    /// Behind the open photo, for a window in dark or light.
+    func viewerBackdrop(dark: Bool) -> NSColor {
+        colours.viewer ?? (dark ? .black : .white)
     }
 
     /// The album page shown changed (nil: not an album).
@@ -103,6 +115,24 @@ final class ThemeEngine {
             if lum < 0.45 { photoScheme = .dark } else if lum > 0.55 { photoScheme = .light }
         }
         setPalette(found)
+        Self.saveLast(found, scheme: photoScheme)
+    }
+
+    private static let lastKey = "FramesTheme.last"
+
+    private static func loadLast() -> (palette: PhotoPalette?, scheme: ColorScheme) {
+        let saved = UserDefaults.standard.dictionary(forKey: lastKey) ?? [:]
+        let scheme: ColorScheme = saved["scheme"] as? String == "light" ? .light : .dark
+        guard let bg = saved["bg"] as? String, let sidebar = saved["sidebar"] as? String,
+              let accent = saved["accent"] as? String else { return (nil, scheme) }
+        return (PhotoPalette(bg: bg, sidebar: sidebar, accent: accent, lum: (saved["lum"] as? Double).map(Float.init)), scheme)
+    }
+
+    private static func saveLast(_ palette: PhotoPalette, scheme: ColorScheme) {
+        var saved: [String: Any] = ["bg": palette.bg, "sidebar": palette.sidebar, "accent": palette.accent,
+                                    "scheme": scheme == .light ? "light" : "dark"]
+        if let lum = palette.lum { saved["lum"] = Double(lum) }
+        AppModel.remember(saved, lastKey)
     }
 
     private func setPalette(_ new: PhotoPalette?) {
@@ -141,6 +171,7 @@ final class ThemeEngine {
                 next.canvas = bg
                 next.sidebar = NSColor(hex: palette.sidebar)
                 next.accent = NSColor(hex: palette.accent)
+                next.viewer = bg
                 next.scheme = bg.oklch.luminance < 0.18 ? .dark : .light
             } else {
                 let dark = (next.scheme ?? Self.systemScheme) == .dark
@@ -148,10 +179,12 @@ final class ThemeEngine {
                     next.canvas = roles.canvas
                     next.sidebar = roles.sidebar
                     next.accent = roles.accent
+                    next.viewer = roles.viewer
                 } else {
                     // Before any photo: a quiet slate in the same tones.
                     next.canvas = Oklch(l: dark ? 0.22 : 0.965, c: 0.02, h: 255).nsColor
                     next.sidebar = Oklch(l: dark ? 0.185 : 0.925, c: 0.025, h: 255).nsColor
+                    next.viewer = Oklch(l: dark ? 0.13 : 0.985, c: dark ? 0.012 : 0.004, h: 255).nsColor
                 }
             }
         }
@@ -163,9 +196,10 @@ final class ThemeEngine {
     }
 
     /// The Tauri app's `immersiveRoles`: canvas in the photo's dominant hue,
-    /// sidebar in its second hue a shade deeper, accent in its most vivid colour.
+    /// sidebar in its second hue a shade deeper, accent in its most vivid
+    /// colour, and behind the open photo the canvas's hue, nearly black or white.
     static func immersive(_ p: PhotoPalette, dark: Bool, intensity k: Double)
-        -> (canvas: NSColor, sidebar: NSColor, accent: NSColor)? {
+        -> (canvas: NSColor, sidebar: NSColor, accent: NSColor, viewer: NSColor)? {
         guard let bg = NSColor(hex: p.bg), let side = NSColor(hex: p.sidebar), let acc = NSColor(hex: p.accent) else { return nil }
         let vivid = acc.oklch
         func colourfulness(_ c: NSColor) -> Double { min(1, c.hslSaturation / 0.35) }
@@ -190,6 +224,7 @@ final class ThemeEngine {
             accent.l = min(0.98, max(0.02, accent.l + (dark ? 0.02 : -0.02)))
             steps += 1
         }
-        return (canvas.nsColor, sidebar.nsColor, accent.nsColor)
+        let viewer = Oklch(l: dark ? 0.13 : 0.985, c: k * (dark ? 0.025 : 0.008), h: canvasHue).fitted
+        return (canvas.nsColor, sidebar.nsColor, accent.nsColor, viewer.nsColor)
     }
 }

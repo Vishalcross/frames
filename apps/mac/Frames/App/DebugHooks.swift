@@ -4,10 +4,11 @@ import ImageIO
 
 /// Test hooks for Debug builds, all off unless passed as launch arguments:
 /// `-FramesDebugSidebar videos|trash|<album name>`, `-FramesDebugGrouping years|months|all`,
+/// `-FramesDebugYear <year>` (Months from that year, as clicking it in Years does),
 /// `-FramesDebugSelect <first>-<last>`, `-FramesDebugSearch <text>`,
 /// `-FramesDebugColumns N`, `-FramesDebugOpen <index>` (opens the viewer),
 /// `-FramesDebugInfo YES`, `-FramesDebugScrollTo <index>`, `-FramesDebugTimings YES`,
-/// `-FramesDebugImport <folder>`, `-FramesDebugSettings YES` (opens Settings; pick
+/// `-FramesDebugImport <folder>`, `-FramesDebugAccessibility YES` (prints what VoiceOver hears in the grid), `-FramesDebugSettings YES` (opens Settings; pick
 /// the pane with `-FramesSettingsTab appearance|connection|storage|library`),
 /// (prints how long loading took), and `-FramesDebugSnapshot <png path>`, which writes
 /// the window to a PNG after `-FramesDebugDelay` seconds (default 3) and quits.
@@ -29,6 +30,7 @@ enum DebugHooks {
         case "months"?: model.grouping = .months
         default: break
         }
+        if defaults.integer(forKey: "FramesDebugYear") > 0 { model.showYear(defaults.integer(forKey: "FramesDebugYear")) }
         if defaults.integer(forKey: "FramesDebugColumns") > 0 { model.columns = defaults.integer(forKey: "FramesDebugColumns") }
         try? await Task.sleep(for: .milliseconds(300))
         if let search = defaults.string(forKey: "FramesDebugSearch") {
@@ -49,6 +51,15 @@ enum DebugHooks {
         }
         if defaults.bool(forKey: "FramesDebugSettings") {
             model.settingsRequest += 1
+        }
+        if defaults.bool(forKey: "FramesDebugAccessibility"), let grid = model.transitions.grid {
+            try? await Task.sleep(for: .milliseconds(500))
+            let children = grid.accessibilityChildren() ?? []
+            print("grid: \(grid.accessibilityRole()?.rawValue ?? "-") \"\(grid.accessibilityLabel() ?? "")\", \(children.count) children")
+            for case let child as NSAccessibilityElement in children.prefix(4) {
+                print("  \(child.accessibilityRole()?.rawValue ?? "-") \"\(child.accessibilityLabel() ?? "")\" selected=\(child.isAccessibilitySelected()) frame=\(child.accessibilityFrame())")
+            }
+            print("selected: \(grid.accessibilitySelectedChildren()?.count ?? 0)")
         }
         snapshotIfAsked(defaults)
     }

@@ -9,7 +9,7 @@ struct YearsView: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 16)], spacing: 16) {
                 ForEach(years, id: \.year) { year in
                     Button {
-                        model.grouping = .months
+                        model.showYear(year.year)
                     } label: {
                         SummaryCard(title: String(year.year), count: year.count, keyAssetID: year.keyAssetID, height: 220)
                     }
@@ -35,23 +35,33 @@ struct YearsView: View {
 }
 
 /// One card per month, newest first. Clicking one shows it in All Photos.
+/// Opened from a year, it starts at that year's months.
 struct MonthsView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 14)], spacing: 14) {
-                ForEach(model.timeline.sections, id: \.start) { section in
-                    Button {
-                        model.showMonth(year: section.year, month: section.month)
-                    } label: {
-                        SummaryCard(title: section.title, count: section.count,
-                                    keyAssetID: model.timeline.id(at: section.start), height: 180)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 14)], spacing: 14) {
+                    ForEach(model.timeline.sections, id: \.start) { section in
+                        Button {
+                            model.showMonth(year: section.year, month: section.month)
+                        } label: {
+                            SummaryCard(title: section.title, count: section.count,
+                                        keyAssetID: model.timeline.id(at: section.start), height: 180)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                }
+                .padding(16)
+            }
+            .onAppear {
+                guard let year = model.monthsYear else { return }
+                model.monthsYear = nil
+                if let section = model.timeline.sections.first(where: { $0.year == year }) {
+                    proxy.scrollTo(section.start, anchor: .top)
                 }
             }
-            .padding(16)
         }
     }
 }
@@ -62,21 +72,31 @@ struct SummaryCard: View {
     let keyAssetID: String
     let height: CGFloat
 
+    @State private var hovering = false
+
     var body: some View {
         Thumbnail(id: keyAssetID, pixels: 768)
             .frame(height: height)
             .frame(maxWidth: .infinity)
+            // A shade under the words, so they read on bright photos too.
+            .overlay {
+                LinearGradient(stops: [.init(color: .clear, location: 0.45), .init(color: .black.opacity(0.6), location: 1)],
+                               startPoint: .top, endPoint: .bottom)
+            }
             .overlay(alignment: .bottomLeading) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).font(.title2.bold())
-                    Text("\(count) \(count == 1 ? "item" : "items")").font(.callout)
+                    Text("\(count.formatted()) \(count == 1 ? "item" : "items")").font(.callout).opacity(0.85)
                 }
                 .foregroundStyle(.white)
-                .shadow(radius: 4)
+                .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
                 .padding(14)
             }
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .contentShape(RoundedRectangle(cornerRadius: 12))
+            .clipShape(.rect(cornerRadius: 12, style: .continuous))
+            .contentShape(.rect(cornerRadius: 12, style: .continuous))
+            .scaleEffect(hovering ? 1.015 : 1)
+            .animation(.easeOut(duration: 0.15), value: hovering)
+            .onHover { hovering = $0 }
     }
 }
 

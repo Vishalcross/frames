@@ -139,6 +139,7 @@ final class GridView: NSView, NSDraggingSource {
         setSelection(newSelection, focus: newFocus)
         if reveal, let newFocus { scrollToVisible(frame(of: newFocus).insetBy(dx: 0, dy: -GridLayout.headerHeight)) }
         onSelectionChange(selection, focus)
+        NSAccessibility.post(element: self, notification: .selectedChildrenChanged)
     }
 
     /// Bring `index` to the top of the view, under the sticky header.
@@ -512,6 +513,65 @@ final class GridView: NSView, NSDraggingSource {
         return selection.isEmpty ? nil : menuProvider()
     }
 
+    // MARK: Accessibility
+
+    /// VoiceOver sees the tiles on screen as a list of images, each named by
+    /// what it is and when it was taken. Tiles are layers, so these stand in
+    /// for them, kept while their tiles stay on screen.
+    private var accessibleTiles: [Int: TileElement] = [:]
+
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .list }
+    override func accessibilityLabel() -> String? { "Photos" }
+
+    override func accessibilityChildren() -> [Any]? {
+        guard let visible = enclosingScrollView?.documentVisibleRect else { return [] }
+        var kept: [Int: TileElement] = [:]
+        let elements = layout.elements(in: visible).tiles.map { index, _ in
+            let element = accessibleTiles[index] ?? TileElement(grid: self, index: index)
+            kept[index] = element
+            return element
+        }
+        accessibleTiles = kept
+        return elements
+    }
+
+    override func accessibilitySelectedChildren() -> [Any]? {
+        accessibleTiles.filter { selection.contains($0.key) }.map(\.value)
+    }
+
+    /// "Video, 1:05, 14 December 2025", for VoiceOver.
+    fileprivate func spokenDescription(of index: Int) -> String {
+        guard index < timeline.count else { return "" }
+        var parts: [String] = []
+        if timeline.isVideo(index) {
+            parts.append("Video")
+            parts.append(Duration.seconds(timeline.durationSeconds(index)).formatted(.time(pattern: .minuteSecond)))
+        } else {
+            parts.append(timeline.isLive(index) ? "Live Photo" : "Photo")
+        }
+        var day = Date.FormatStyle(date: .long, time: .omitted)
+        day.timeZone = .gmt
+        parts.append(timeline.date(at: index).formatted(day))
+        if let days = timeline.daysLeft(index) { parts.append("\(days) \(days == 1 ? "day" : "days") left") }
+        return parts.joined(separator: ", ")
+    }
+
+    fileprivate func screenFrame(of index: Int) -> CGRect {
+        guard let window else { return .zero }
+        return window.convertToScreen(convert(frame(of: index), to: nil))
+    }
+
+    fileprivate func pressTile(_ index: Int) {
+        select([index], focus: index, reveal: false)
+        onOpen(index)
+    }
+
+    fileprivate func selectTile(_ index: Int) {
+        anchor = index
+        select([index], focus: index, reveal: true)
+    }
+
     // MARK: Keyboard
 
     override func keyDown(with event: NSEvent) {
@@ -843,5 +903,47 @@ final class ScrollSpeed {
                 self.onSettle()
             }
         }
+    }
+}
+
+/// One tile as VoiceOver sees it: an image you can select and open.
+private final class TileElement: NSAccessibilityElement {
+    private weak var grid: GridView?
+    private let index: Int
+
+    init(grid: GridView, index: Int) {
+        self.grid = grid
+        self.index = index
+        super.init()
+        setAccessibilityParent(grid)
+        setAccessibilityRole(.image)
+    }
+
+    // AppKit asks on the main thread, though these aren't marked so.
+    override func accessibilityLabel() -> String? {
+        let (grid, index) = (grid, index)
+        return MainActor.assumeIsolated { grid?.spokenDescription(of: index) }
+    }
+
+    override func accessibilityFrame() -> NSRect {
+        let (grid, index) = (grid, index)
+        return MainActor.assumeIsolated { grid?.screenFrame(of: index) ?? .zero }
+    }
+
+    override func isAccessibilitySelected() -> Bool {
+        let (grid, index) = (grid, index)
+        return MainActor.assumeIsolated { grid?.selection.contains(index) ?? false }
+    }
+
+    override func setAccessibilitySelected(_ selected: Bool) {
+        guard selected else { return }
+        let (grid, index) = (grid, index)
+        MainActor.assumeIsolated { grid?.selectTile(index) }
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        let (grid, index) = (grid, index)
+        MainActor.assumeIsolated { grid?.pressTile(index) }
+        return true
     }
 }

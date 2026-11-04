@@ -108,10 +108,17 @@ final class AppModel {
             if !workOffline { online = nil }
         }
     }
-    var grouping = LibraryGrouping.all
+    var grouping = LibraryGrouping(rawValue: UserDefaults.standard.string(forKey: "FramesGrouping") ?? "") ?? .all {
+        didSet { Self.remember(grouping.rawValue, "FramesGrouping") }
+    }
+    /// The year Months should start at, after clicking it in Years.
+    @ObservationIgnored var monthsYear: Int?
     var albums: [AlbumSummary] = []
     var timeline = Timeline.empty
-    var columns = 7
+    var columns = (3...15).contains(UserDefaults.standard.integer(forKey: "FramesColumns"))
+        ? UserDefaults.standard.integer(forKey: "FramesColumns") : 7 {
+        didSet { Self.remember(columns, "FramesColumns") }
+    }
     /// Selected tiles, by index into `timeline`.
     var selection = IndexSet()
     /// The tile Shift-click and the arrow keys extend from, and the one
@@ -155,6 +162,20 @@ final class AppModel {
         return URL.applicationSupportDirectory.appending(path: "app.frames.desktop")
     }
 
+    /// Whether to keep view choices on this Mac. Debug runs on a library
+    /// copy (`-FramesDataDir`) leave the real app's preferences alone.
+    static var savesPreferences: Bool {
+        #if DEBUG
+        UserDefaults.standard.string(forKey: "FramesDataDir") == nil
+        #else
+        true
+        #endif
+    }
+
+    static func remember(_ value: Any, _ key: String) {
+        if savesPreferences { UserDefaults.standard.set(value, forKey: key) }
+    }
+
     /// `-FramesCacheDir` for tests; otherwise the core uses the settings.
     static var cacheDirectory: URL? {
         UserDefaults.standard.string(forKey: "FramesCacheDir").map { URL(fileURLWithPath: $0) }
@@ -169,6 +190,7 @@ final class AppModel {
             self.core = core
             pipeline = ImagePipeline(core: core)
             viewerCache = ViewerCache()
+            transitions.theme = theme
             if workOffline { core.library.setOffline(offline: true) }
             // A conversion still running at quit would otherwise outlive the app.
             NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
@@ -260,6 +282,31 @@ final class AppModel {
 
     func syncNow() {
         core?.library.syncNow()
+    }
+
+    /// Open Settings at a pane: appearance, connection, storage or library.
+    func openSettings(tab: String) {
+        UserDefaults.standard.set(tab, forKey: "FramesSettingsTab")
+        settingsRequest += 1
+    }
+
+    /// How syncing is going, for the sidebar's footer.
+    var syncStatus: (title: String, symbol: String, detail: String) {
+        if workOffline {
+            return ("Working Offline", "wifi.slash", "Nothing reaches MEGA S4 until you go back online. Changes wait on this Mac.")
+        }
+        if let problem = connectionProblem { return ("Not Connected", "icloud.slash", problem) }
+        if let status = importStatus, status.running {
+            let progress = "\(status.completedFiles.formatted()) of \(status.totalFiles.formatted())"
+            return status.paused
+                ? ("Import Paused", "pause.circle", "Paused at \(progress). Resume it in Imports.")
+                : ("Importing \(progress)", "arrow.up.circle", "Uploading to MEGA S4. Details are in Imports.")
+        }
+        switch online {
+        case true?: return ("Up to Date", "checkmark.icloud", "Your library matches MEGA S4.")
+        case false?: return ("Offline", "exclamationmark.icloud", "Can't reach MEGA S4. Browsing still works, and Frames syncs when it can.")
+        case nil: return ("Syncing…", "arrow.triangle.2.circlepath.icloud", "Checking MEGA S4 for changes.")
+        }
     }
 
     /// After Settings saved a new connection.
@@ -382,7 +429,7 @@ final class AppModel {
         guard index >= 0, index < timeline.count else { return }
         selection = [index]
         focus = index
-        transitions.prepareOpening(index: index)
+        transitions.prepareOpening(index: index, animated: !timeline.isVideo(index))
         viewerIndex = index
         theme.viewerShows(timeline.id(at: index), albumID: pageAlbumID, core: core)
     }
@@ -413,7 +460,13 @@ final class AppModel {
 
     // MARK: Navigation
 
-    /// Show All Photos scrolled to a month (clicking a Months or Years card).
+    /// Show Months from a year's first month (clicking a Years card).
+    func showYear(_ year: Int) {
+        monthsYear = year
+        grouping = .months
+    }
+
+    /// Show All Photos scrolled to a month (clicking a Months card).
     func showMonth(year: Int, month: Int) {
         grouping = .all
         if let section = timeline.sections.first(where: { $0.year == year && $0.month == month }) {
@@ -445,6 +498,32 @@ final class AppModel {
         case .trash: return "Recently Deleted"
         case .album: return currentAlbum?.name ?? "Album"
         }
+    }
+
+    /// The library is empty: show how to fill it.
+    var showsWelcome: Bool { sidebar == .library && !isSearching && timeline.count == 0 }
+
+    /// What the window's title shows under the name: "200 Photos, 19 Videos",
+    /// or how many are selected.
+    var countText: String {
+        if !selection.isEmpty { return "\(selection.count.formatted()) selected" }
+        let videos = timeline.videoCount, photos = timeline.count - videos
+        let parts = [photos > 0 ? "\(photos.formatted()) \(photos == 1 ? "Photo" : "Photos")" : nil,
+                     videos > 0 ? "\(videos.formatted()) \(videos == 1 ? "Video" : "Videos")" : nil]
+        return parts.compactMap { $0 }.joined(separator: ", ")
+    }
+
+    /// The open photo's date as the window's title, and its time under it,
+    /// as in Photos.
+    var viewerTitle: (date: String, time: String)? {
+        guard let viewerIndex, viewerIndex < timeline.count else { return nil }
+        // Timeline dates are wall-clock times read in UTC.
+        let date = timeline.date(at: viewerIndex)
+        var day = Date.FormatStyle(date: .long, time: .omitted)
+        day.timeZone = .gmt
+        var time = Date.FormatStyle(date: .omitted, time: .shortened)
+        time.timeZone = .gmt
+        return (date.formatted(day), date.formatted(time))
     }
 
     // MARK: Edits

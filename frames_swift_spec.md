@@ -580,3 +580,84 @@ The app's `-FramesTestStore YES` launch argument uses it. A test import of 3 pho
 **Not exactly as before:**
 * The Tauri app's Glass tint was set per appearance in CSS; here it is the window material plus a tint.
 * Live Photos play their movie while the LIVE badge is held, rather than in Apple's `PHLivePhotoView`. That waits for a real Live Photo to test with (section 10).
+
+## 23. Theming and UI refinements (2026-11-04)
+
+* **The viewer's backdrop follows the look** (as in the Tauri app):
+  * Standard and Glass: black in dark, white in light, like Photos.
+  * Adaptive: the canvas hue nearly black or white (L 0.13 / 0.985), with the photo's colours glowing through. The glow is the photo's ThumbHash scaled 1.15, at 35% (30% in light). It is already a soft blur, so it costs one small image. Reduce Transparency turns the glow off.
+  * An album with chosen colours: its background colour.
+  * The zoom into and out of the viewer fades the same colour, not black.
+  * Videos open without the zoom; before, they left the transition waiting for a photo.
+* **Adaptive opens in the colours it was left in.** It remembers the last photo palette and light or dark (`FramesTheme.last`), instead of starting on a grey slate that changes a moment later.
+* **The window's title.**
+  * The viewer shows the photo's date as the title and its time underneath, as Photos does.
+  * Elsewhere the count reads "200 Photos, 19 Videos" instead of "219 items".
+* **Sync status moved from the toolbar to the bottom of the sidebar**, in words: Up to Date, Syncing…, Importing 12 of 635, Import Paused, Offline, Not Connected, Working Offline. Its menu has Sync Now and Work Offline. Settings is the gear beside it.
+* **Years and Months cards.**
+  * A shade under the caption, so it reads on bright photos.
+  * Continuous corners, and a slight lift on hover.
+  * Clicking a year opens Months at that year, instead of at the top.
+* **Empty states.**
+  * An empty library shows a welcome with Connect to MEGA S4… (when not connected) and Import Photos…. While the first sync looks for photos, it says so.
+  * Videos and albums have their own empty messages.
+* **App icon.** An Icon Composer icon (`Frames/AppIcon.icon`), so macOS 26 renders it in Liquid Glass: two photo prints, the front one a sunset, on violet.
+* **About Frames** names what the app is built on. The empty Help item is gone until there is help to show.
+* **Remembered between launches:** the grid's zoom (column count) and Years, Months or All Photos.
+  * Debug runs on a library copy (`-FramesDataDir`) save none of these, nor the last palette, so testing leaves the app's real preferences alone.
+* **VoiceOver in the grid.** The grid is an accessibility list. Each tile on screen is an image named, for example, "Video, 0:20, 3 November 2026" or "Photo, 18 April 2026, 12 days left". It reports selection and opens on press. Checked with `-FramesDebugAccessibility YES`.
+
+## 24. Production readiness
+
+What stands between this build and an app others can rely on, most important first.
+
+**Before anyone else runs it**
+
+1. **Signing identity** (12).
+   * Today the app is ad-hoc signed. It runs only on this Mac, and the Keychain may ask again for the S4 secret after each rebuild.
+   * A free Apple Development identity fixes that for this Mac.
+   * Other Macs need Developer ID plus notarization, which requires the paid Apple Developer Program.
+2. **Our own ffmpeg build.**
+   * The bundled ffmpeg is version 6.0 (2023), configured with `--enable-gpl --enable-nonfree` and x264, x265 and others. A nonfree build may not be redistributed at all. It also parses untrusted files with two years of unfixed bugs.
+   * Frames needs only demuxers, native decoders, the VideoToolbox encoders and the mp4/HLS muxers.
+   * So: a script that builds current FFmpeg as LGPL (no `--enable-gpl` or `--enable-nonfree`) with checksummed sources, and ships its licence and a source offer.
+3. **No crashes from the core.**
+   * The generated Swift calls non-throwing exports (`small_thumb`, `preview`, `local_original`, `connection_problem`, `sync_now` and others) with `try!`, so a Rust panic in one of them closes the app.
+   * Make every export return `Result`, so a panic arrives as an error, like the throwing ones.
+4. **Release packaging.** Version and build numbers from git, a DMG, `notarytool` and `stapler`, signature checks, and a first launch on a clean user account. One script.
+5. **Updates.** Sparkle 2 with an EdDSA-signed appcast on GitHub Releases. Only once there is a signed build to update.
+6. **Acknowledgements.** The Rust crates' licences (generated with `cargo-about`) and FFmpeg's LGPL notice, in the About panel or a window it opens.
+
+**Reliability**
+
+7. **Logs and diagnostics.**
+   * Nothing is logged today. Add a Swift `Logger` (subsystem `app.frames.mac`; categories sync, import, video, theme) and route the core's `log` output to it.
+   * Add Copy Diagnostics in Settings › Library (versions, counts, recent errors).
+   * Keep MetricKit crash diagnostics locally.
+8. **Network changes.** Sync as soon as the network returns or the Mac wakes (`NWPathMonitor`, the wake notification), not at the next timer.
+9. **Seeking in converted videos.** Start a new ffmpeg session at the seek point (`-ss`) (22).
+10. **Database upgrades.** A test that opens a library from each earlier schema version, and a copy of the database kept before a migration runs.
+11. **Real-library pass** (13):
+    * Test and Save on a real bucket;
+    * the 635-file Portfolio upload;
+    * real videos and a Live Photo;
+    * the Tauri and Swift apps sharing one test bucket.
+
+**Quality**
+
+12. **Accessibility**, beyond the grid (23):
+    * a spoken label for the open photo;
+    * a visible keyboard focus in the grid;
+    * Increase Contrast in the theme engine (less chroma, a stronger accent);
+    * a VoiceOver pass over Settings and Imports.
+13. **Automated tests and CI.**
+    * A Swift Testing target: theme maths against `palette.ts` fixtures, timeline and grid layout maths.
+    * A UI smoke test.
+    * GitHub Actions on a macOS runner: `cargo test`, the XCFramework, `xcodebuild`, and the Tauri Windows build, so core changes can't break either app unnoticed.
+14. **Performance pass** with Instruments on the real library: launch, scrolling, opening the viewer, against the budgets in 7.6.
+15. **Help.** A short getting-started page behind the Help menu.
+16. **Localization**, only if wanted. Strings built in the model (counts, sync status) would need `String(localized:)` first.
+
+**Decided against**
+
+* **The Mac App Store.** It requires the App Sandbox, which conflicts with running ffmpeg on arbitrary files and with sharing the library folder with the Tauri app. Developer ID is the route, and no privacy manifest is needed for it.

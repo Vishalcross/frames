@@ -31,6 +31,11 @@ struct LibraryCommands: Commands {
     let model: AppModel
 
     var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("About Frames") { AboutPanel.show() }
+        }
+        // No help book yet: better no Help item than one that says so.
+        CommandGroup(replacing: .help) {}
         CommandGroup(after: .newItem) {
             Button("Import…") { Task { await model.chooseImport() } }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
@@ -84,5 +89,25 @@ struct LibraryCommands: Commands {
             Button("Zoom Out") { model.zoom(by: 1) }
                 .keyboardShortcut("-")
         }
+    }
+}
+
+/// The standard About panel, with what Frames is built on.
+@MainActor
+enum AboutPanel {
+    static func show() {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        let credits = NSAttributedString(
+            string: """
+            Your photos and videos, kept in your own MEGA S4 bucket.
+
+            Video thumbnails, details and playback of formats macOS can't play use FFmpeg (ffmpeg.org). \
+            The library engine is written in Rust and shared with Frames for Windows.
+            """,
+            attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                         .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style])
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
+        NSApp.activate()
     }
 }

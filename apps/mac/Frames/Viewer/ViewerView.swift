@@ -10,6 +10,7 @@ struct ViewerView: View {
     let index: Int
     @State private var image: CGImage?
     @State private var fullResolution: CGImage?
+    @State private var keys = ViewerKeys()
 
     var body: some View {
         let id = model.timeline.id(at: index)
@@ -17,9 +18,6 @@ struct ViewerView: View {
         Group {
             if model.timeline.isVideo(index) {
                 VideoView(id: id)
-                    .onKeyPress(.leftArrow) { model.step(-1); return .handled }
-                    .onKeyPress(.rightArrow) { model.step(1); return .handled }
-                    .onKeyPress(.escape) { model.closeViewer(); return .handled }
             } else {
                 photo(id)
                     .overlay(alignment: .topLeading) {
@@ -31,14 +29,15 @@ struct ViewerView: View {
         .background {
             if !opening { ViewerBackdrop(id: id, hash: model.timeline.thumbhash(index)) }
         }
+        .onAppear { keys.start(model) }
+        .onDisappear { keys.stop() }
     }
 
     private func photo(_ id: String) -> some View {
         let opening = model.transitions.phase == .opening
-        return ZoomableImage(assetID: id, image: fullResolution ?? image, hidden: opening, transitions: model.transitions) { key in
+        return ZoomableImage(assetID: id, index: index, image: fullResolution ?? image, hidden: opening,
+                             transitions: model.transitions) { key in
             switch key {
-            case .previous: model.step(-1)
-            case .next: model.step(1)
             case .close: model.closeViewer()
             case .info: model.showInfo.toggle()
             case .fullResolution: Task { await loadFullResolution(id) }
@@ -165,13 +164,54 @@ final class ViewerCache {
 }
 
 enum ViewerKey {
-    case previous, next, close, info, fullResolution
+    case close, info, fullResolution
+}
+
+/// Left and right step through the album or library, and Esc goes back to
+/// the grid, whatever in the window has the keyboard: the photo, a video's
+/// player, a toolbar button, or the grid behind. Typing in the search
+/// field, and shortcuts with Command, Option or Control, are left alone.
+@MainActor
+final class ViewerKeys {
+    private var monitor: Any?
+
+    func start(_ model: AppModel) {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak model] event in
+            guard let model else { return event }
+            let (key, code, flags, window) = (event.specialKey, event.keyCode, event.modifierFlags, event.window)
+            let handled = MainActor.assumeIsolated { Self.handle(key, code: code, flags: flags, in: window, model) }
+            return handled ? nil : event
+        }
+    }
+
+    func stop() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+    }
+
+    private static func handle(_ key: NSEvent.SpecialKey?, code: UInt16, flags: NSEvent.ModifierFlags,
+                               in window: NSWindow?, _ model: AppModel) -> Bool {
+        guard model.viewerIndex != nil, let window, window.attachedSheet == nil,
+              window.identifier?.rawValue.hasPrefix("library") == true,
+              !(window.firstResponder is NSText),
+              flags.intersection([.command, .option, .control]).isEmpty else { return false }
+        switch key {
+        case .leftArrow?: model.step(-1)
+        case .rightArrow?: model.step(1)
+        default:
+            guard code == 53 else { return false }  // Esc
+            model.closeViewer()
+        }
+        return true
+    }
 }
 
 /// The photo in a magnifying scroll view: pinch or double-click to zoom,
 /// arrows to move, Esc or Space to go back to the grid.
 struct ZoomableImage: NSViewRepresentable {
     let assetID: String
+    let index: Int
     let image: CGImage?
     let hidden: Bool
     let transitions: ViewerTransitions
@@ -184,7 +224,7 @@ struct ZoomableImage: NSViewRepresentable {
     func updateNSView(_ view: ZoomView, context: Context) {
         view.onKey = onKey
         view.transitions = transitions
-        view.show(image, assetID: assetID, hidden: hidden)
+        view.show(image, assetID: assetID, index: index, hidden: hidden)
     }
 }
 
@@ -194,6 +234,9 @@ final class ZoomView: NSScrollView {
     private(set) var image: CGImage?
     private let canvas = NSView()
     private var assetID: String?
+    private var shownIndex: Int?
+    /// Stepping to a neighbour: which side its photo slides in from, and when.
+    private var slide: (from: CATransitionSubtype, at: Date)?
     private var askedForFullResolution = false
     private var appeared = false
 
@@ -217,19 +260,42 @@ final class ZoomView: NSScrollView {
 
     override var acceptsFirstResponder: Bool { true }
 
-    func show(_ image: CGImage?, assetID: String, hidden: Bool) {
+    func show(_ image: CGImage?, assetID: String, index: Int, hidden: Bool) {
         if assetID != self.assetID {
+            if let shownIndex, !hidden, self.image != nil {
+                slide = (index > shownIndex ? .fromRight : .fromLeft, Date())
+            }
             self.assetID = assetID
             askedForFullResolution = false
             if magnification != 1 { magnification = 1 }
         }
+        shownIndex = index
         canvas.isHidden = hidden
         guard self.image !== image else { return }
         self.image = image
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        // The new photo's first image slides in; the sharper ones that
+        // follow replace it in place.
+        if let slide, Date().timeIntervalSince(slide.at) < 0.5 {
+            canvas.layer?.add(Self.slideTransition(from: slide.from), forKey: "step")
+        }
+        slide = nil
         canvas.layer?.contents = image
         CATransaction.commit()
+    }
+
+    private static func slideTransition(from side: CATransitionSubtype) -> CATransition {
+        let transition = CATransition()
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            transition.type = .fade
+        } else {
+            transition.type = .push
+            transition.subtype = side
+        }
+        transition.duration = 0.22
+        transition.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
+        return transition
     }
 
     override var magnification: CGFloat {
@@ -266,18 +332,14 @@ final class ZoomView: NSScrollView {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.checkMagnification() }
     }
 
+    /// Left, right and Esc are `ViewerKeys`'.
     override func keyDown(with event: NSEvent) {
-        switch event.specialKey {
-        case .leftArrow?: onKey(.previous)
-        case .rightArrow?: onKey(.next)
-        default:
-            if event.keyCode == 53 || event.characters == " " {
-                onKey(.close)
-            } else if event.charactersIgnoringModifiers == "i" && event.modifierFlags.contains(.command) {
-                onKey(.info)
-            } else {
-                super.keyDown(with: event)
-            }
+        if event.characters == " " {
+            onKey(.close)
+        } else if event.charactersIgnoringModifiers == "i" && event.modifierFlags.contains(.command) {
+            onKey(.info)
+        } else {
+            super.keyDown(with: event)
         }
     }
 }

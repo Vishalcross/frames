@@ -661,3 +661,15 @@ What stands between this build and an app others can rely on, most important fir
 **Decided against**
 
 * **The Mac App Store.** It requires the App Sandbox, which conflicts with running ffmpeg on arbitrary files and with sharing the library folder with the Tauri app. Developer ID is the route, and no privacy manifest is needed for it.
+
+## 25. Stepping through photos with the arrow keys (2026-11-04)
+
+* **Left and right always step** to the previous or next photo or video in what is shown: the library, an album, Videos, a search. Esc goes back to the grid, and the grid shows where you ended.
+  * Before, arrows worked only while the photo view had the keyboard. After a click on the toolbar, or in a video, the keyboard sat with the window or the grid behind, and nothing happened.
+  * Now `ViewerKeys`, a local key monitor that lives while the viewer is open, handles them first, whoever has the keyboard.
+  * It leaves alone typing in the search field, sheets, the Settings window, and keys with Command, Option or Control.
+* **The next photo slides in** from the side it lies on: a 0.22 s push of the photo layer. Only its first image slides; the sharper ones that follow replace it in place. Reduce Motion makes it a fade.
+* **Checked with `-FramesDebugKeys`**, which posts real key events through the app's queue:
+  * photos, with the keyboard in the photo, the window or the grid;
+  * videos;
+  * a five-photo album, stopping at both ends.

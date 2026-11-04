@@ -8,6 +8,8 @@ import ImageIO
 /// `-FramesDebugSelect <first>-<last>`, `-FramesDebugSearch <text>`,
 /// `-FramesDebugColumns N`, `-FramesDebugOpen <index>` (opens the viewer),
 /// `-FramesDebugInfo YES`, `-FramesDebugScrollTo <index>`, `-FramesDebugTimings YES`,
+/// `-FramesDebugKeys right,left,esc` (posts those keys once the viewer is open, printing where
+/// it is after each; `-FramesDebugKeysFromGrid YES` gives the grid the keyboard first),
 /// `-FramesDebugImport <folder>`, `-FramesDebugAccessibility YES` (prints what VoiceOver hears in the grid), `-FramesDebugSettings YES` (opens Settings; pick
 /// the pane with `-FramesSettingsTab appearance|connection|storage|library`),
 /// (prints how long loading took), and `-FramesDebugSnapshot <png path>`, which writes
@@ -46,6 +48,7 @@ enum DebugHooks {
         }
         if defaults.object(forKey: "FramesDebugOpen") != nil { model.openViewer(at: defaults.integer(forKey: "FramesDebugOpen")) }
         if defaults.bool(forKey: "FramesDebugInfo") { model.showInfo = true }
+        if let keys = defaults.string(forKey: "FramesDebugKeys") { await post(keys, model) }
         if let folder = defaults.string(forKey: "FramesDebugImport") {
             await model.importFiles([URL(fileURLWithPath: folder)], into: nil)
         }
@@ -78,6 +81,35 @@ enum DebugHooks {
     }
 
     private static var marked: Set<String> = []
+
+    private static func post(_ keys: String, _ model: AppModel) async {
+        try? await Task.sleep(for: .milliseconds(800))
+        guard let window = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("library") == true }) else {
+            return print("keys: no library window")
+        }
+        if UserDefaults.standard.bool(forKey: "FramesDebugKeysFromGrid"), let grid = model.transitions.grid {
+            window.makeFirstResponder(grid)
+        }
+        print("keys: \(model.title) (\(model.timeline.count) items), start at \(model.viewerIndex.map(String.init) ?? "grid"), keyboard in \(type(of: window.firstResponder!))")
+        for key in keys.split(separator: ",") {
+            let (code, character): (UInt16, Int) = switch key {
+            case "left": (123, NSLeftArrowFunctionKey)
+            case "right": (124, NSRightArrowFunctionKey)
+            default: (53, 27)
+            }
+            let text = String(Character(UnicodeScalar(character)!))
+            for type in [NSEvent.EventType.keyDown, .keyUp] {
+                if let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: key == "esc" ? [] : [.function, .numericPad],
+                                                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                                context: nil, characters: text, charactersIgnoringModifiers: text,
+                                                isARepeat: false, keyCode: code) {
+                    NSApp.postEvent(event, atStart: false)
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(500))
+            print("keys: \(key) -> \(model.viewerIndex.map(String.init) ?? "grid") (selection \(model.selection.map(String.init).joined(separator: ",")))")
+        }
+    }
 
     private static func snapshotIfAsked(_ defaults: UserDefaults) {
         guard let path = defaults.string(forKey: "FramesDebugSnapshot") else { return }

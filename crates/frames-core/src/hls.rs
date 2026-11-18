@@ -60,8 +60,12 @@ impl HlsServer {
         let id = format!("{:012x}", fastrand::u64(..) & 0xffff_ffff_ffff);
         let dir = self.root.join(&id);
         std::fs::create_dir_all(&dir)?;
+        // ffmpeg runs in the session folder and writes bare names there. Given
+        // full paths, its HLS writer finds the folder by '/' only, so on
+        // Windows it would put init.mp4 in the working directory instead.
         let child = spawn_hidden_command("ffmpeg")
-            .args(hls_args(source, decision, encoder, hevc, &dir))
+            .args(hls_args(source, decision, encoder, hevc))
+            .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -126,7 +130,7 @@ impl Drop for HlsServer {
 }
 
 /// ffmpeg arguments for an HLS session written into `dir`.
-fn hls_args(source: &str, decision: PlaybackDecision, encoder: H264Encoder, hevc: bool, dir: &Path) -> Vec<String> {
+fn hls_args(source: &str, decision: PlaybackDecision, encoder: H264Encoder, hevc: bool) -> Vec<String> {
     let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-i", source].map(String::from).to_vec();
     let codecs = codec_args(decision, encoder);
     let copies_video = codecs.windows(2).any(|w| w[0] == "-c:v" && w[1] == "copy");
@@ -145,12 +149,11 @@ fn hls_args(source: &str, decision: PlaybackDecision, encoder: H264Encoder, hevc
             "-hls_segment_type", "fmp4",
             "-hls_flags", "independent_segments+temp_file",
             "-hls_fmp4_init_filename", "init.mp4",
+            "-hls_segment_filename", "seg%05d.m4s",
+            "index.m3u8",
         ]
         .map(String::from),
     );
-    args.push("-hls_segment_filename".to_string());
-    args.push(dir.join("seg%05d.m4s").to_string_lossy().to_string());
-    args.push(dir.join("index.m3u8").to_string_lossy().to_string());
     args
 }
 

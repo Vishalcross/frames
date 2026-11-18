@@ -80,7 +80,24 @@ jobs:
         run: npm run build
       # frames-ffi is the Mac app's Swift bridge; Windows doesn't use it.
       - name: Rust tests
-        run: cargo test --workspace --exclude frames-ffi
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --exclude frames-ffi --no-fail-fast 2>&1 | tee test-output.txt
+      # Each failing test's output as an annotation, readable on the run's
+      # page without opening the log.
+      - name: Report failed tests
+        if: failure()
+        shell: bash
+        run: |
+          awk '
+            /^---- .* stdout ----$/ { if (name) emit(); name = $2; body = ""; n = 0; next }
+            /^failures:$/ && name { emit(); name = "" }
+            name && n < 12 && NF { line = $0; gsub(/%/, "%25", line); body = body (n ? "%0A" : "") line; n++ }
+            function emit() { gsub(/:/, "%3A", name); print "::error title=" name "::" body }
+            END { if (name) emit() }
+          ' test-output.txt
+          grep -E "^test .* FAILED$|^error(\[|:)" test-output.txt | head -20 || true
       - name: UI type checks
         working-directory: frames-shell
         run: npm run check

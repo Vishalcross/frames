@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
@@ -82,6 +82,13 @@ impl HlsServer {
 
     fn answer(&self, stream: TcpStream) -> std::io::Result<()> {
         let mut reader = BufReader::new(stream.try_clone()?);
+        let mut out = stream;
+        let answered = self.respond(&mut reader, &mut out);
+        close_gracefully(&out, &mut reader);
+        answered
+    }
+
+    fn respond(&self, reader: &mut BufReader<TcpStream>, out: &mut TcpStream) -> std::io::Result<()> {
         let mut request = String::new();
         reader.read_line(&mut request)?;
         // Read the headers to the blank line; nothing in them matters here.
@@ -91,7 +98,6 @@ impl HlsServer {
         }
         let path = request.split_whitespace().nth(1).unwrap_or("");
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-        let mut out = stream;
         let file = match parts.as_slice() {
             [token, id, name] if *token == self.token && safe_name(id) && safe_name(name) => {
                 let known = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(*id);
@@ -146,6 +152,15 @@ fn hls_args(source: &str, decision: PlaybackDecision, encoder: H264Encoder, hevc
     args.push(dir.join("seg%05d.m4s").to_string_lossy().to_string());
     args.push(dir.join("index.m3u8").to_string_lossy().to_string());
     args
+}
+
+/// Say the response is complete, then read whatever the client still sends
+/// until it closes (or for 2 s). Windows resets a connection closed with
+/// input unread, and the client can then lose the end of the response.
+fn close_gracefully(out: &TcpStream, reader: &mut BufReader<TcpStream>) {
+    let _ = out.shutdown(Shutdown::Write);
+    let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = std::io::copy(reader, &mut std::io::sink());
 }
 
 /// The file's bytes once ffmpeg has written it, or None after `FILE_WAIT`.

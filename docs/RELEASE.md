@@ -99,6 +99,18 @@ Ad-hoc signing is not notarisation. On another Mac, macOS warns that the app is 
 
 ## 3. Building for Windows
 
+### Without a Windows PC: GitHub Actions
+`.github/workflows/windows.yml` builds the installer on a Windows machine at
+every push (except changes only to the Mac app or Markdown), and runs the Rust
+tests and UI checks there in a separate job. To get the installer:
+1. Open the repository's **Actions** tab, then the latest **Windows** run.
+2. Under **Artifacts**, download **Frames-Windows-installer** (a zip holding `Frames_0.1.0_x64-setup.exe`).
+3. On the PC, run it. It is unsigned, so SmartScreen says "Windows protected
+   your PC" the first time: choose **More info**, then **Run anyway**.
+
+It can also be started by hand from the Actions tab (**Run workflow**).
+
+
 ### Prerequisites on Windows
 1. Visual Studio 2022 Build Tools (with "Desktop development with C++" workload).
 2. Rust (`rustup-init.exe`, default target `x86_64-pc-windows-msvc`).

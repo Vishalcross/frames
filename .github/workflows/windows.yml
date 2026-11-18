@@ -1,0 +1,86 @@
+# Builds the Windows app (frames-shell, Tauri) on a Windows machine, since
+# the Mac can't, and runs the tests there. The installer is attached to each
+# run: open the run on GitHub, then Artifacts › Frames-Windows-installer.
+name: Windows
+
+on:
+  push:
+    paths-ignore:
+      - "apps/mac/**"
+      - "**.md"
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch replaces a build still running.
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer:
+    name: Installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frames-shell/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: installer
+      # ffmpeg and ffprobe, downloaded and checked by scripts/prepare-binaries.js.
+      - uses: actions/cache@v4
+        with:
+          path: frames-shell/src-tauri/binaries
+          key: sidecars-${{ hashFiles('scripts/prepare-binaries.js') }}
+      - name: Install the UI's packages
+        working-directory: frames-shell
+        run: npm ci
+      - name: Build the installer
+        working-directory: frames-shell
+        run: npm run bundle:win
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Frames-Windows-installer
+          path: target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
+  tests:
+    name: Tests
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frames-shell/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tests
+      - uses: actions/cache@v4
+        with:
+          path: frames-shell/src-tauri/binaries
+          key: sidecars-${{ hashFiles('scripts/prepare-binaries.js') }}
+      # The shell crate bundles the sidecars, so they must exist to compile it.
+      - name: Get ffmpeg and ffprobe
+        run: node scripts/prepare-binaries.js
+      - name: Install the UI's packages
+        working-directory: frames-shell
+        run: npm ci
+      # The shell crate embeds the built UI.
+      - name: Build the UI
+        working-directory: frames-shell
+        run: npm run build
+      # frames-ffi is the Mac app's Swift bridge; Windows doesn't use it.
+      - name: Rust tests
+        run: cargo test --workspace --exclude frames-ffi
+      - name: UI type checks
+        working-directory: frames-shell
+        run: npm run check

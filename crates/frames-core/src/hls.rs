@@ -6,14 +6,14 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::media::spawn_hidden_command;
-use crate::player::{codec_args, H264Encoder, PlaybackDecision};
+use crate::player::{close_gracefully, codec_args, H264Encoder, PlaybackDecision};
 
 /// How long a request for a file waits for ffmpeg to write it.
 const FILE_WAIT: Duration = Duration::from_secs(20);
@@ -155,15 +155,6 @@ fn hls_args(source: &str, decision: PlaybackDecision, encoder: H264Encoder, hevc
         .map(String::from),
     );
     args
-}
-
-/// Say the response is complete, then read whatever the client still sends
-/// until it closes (or for 2 s). Windows resets a connection closed with
-/// input unread, and the client can then lose the end of the response.
-fn close_gracefully(out: &TcpStream, reader: &mut BufReader<TcpStream>) {
-    let _ = out.shutdown(Shutdown::Write);
-    let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = std::io::copy(reader, &mut std::io::sink());
 }
 
 /// The file's bytes once ffmpeg has written it, or None after `FILE_WAIT`.

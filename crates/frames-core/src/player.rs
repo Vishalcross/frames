@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -650,8 +650,19 @@ fn parse_stream_request_parts(
     Ok((session_id.to_string(), provided_token, seek_secs))
 }
 
-fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>>) -> std::io::Result<()> {
+fn handle_client(stream: TcpStream, state: &Arc<Mutex<ServerState>>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
+    let mut out = stream;
+    let answered = respond(&mut out, &mut reader, state);
+    close_gracefully(&out, &mut reader);
+    answered
+}
+
+fn respond(
+    stream: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    state: &Arc<Mutex<ServerState>>,
+) -> std::io::Result<()> {
     let mut first_line = String::new();
     reader.read_line(&mut first_line)?;
 
@@ -668,24 +679,24 @@ fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     if method != "GET" && method != "HEAD" {
-        return write_http_error(&mut stream, 405, "Method Not Allowed");
+        return write_http_error(stream, 405, "Method Not Allowed");
     }
 
     let (session_id, provided_tok, seek_secs) = match parse_stream_request_parts(target) {
         Ok(t) => t,
-        Err(code) => return write_http_error(&mut stream, code, "Not Found"),
+        Err(code) => return write_http_error(stream, code, "Not Found"),
     };
 
     let (sess, my_generation, refresher) = {
         let mut st = state.lock().unwrap();
         let default_tok = st.default_token.clone();
         let Some(sess_mut) = st.sessions.get_mut(&session_id) else {
-            return write_http_error(&mut stream, 404, "Session not found");
+            return write_http_error(stream, 404, "Session not found");
         };
         let valid_tok = provided_tok.as_deref() == Some(sess_mut.session_token.as_str())
             || provided_tok.as_deref() == Some(default_tok.as_str());
         if !valid_tok {
-            return write_http_error(&mut stream, 403, "Forbidden: invalid session token");
+            return write_http_error(stream, 403, "Forbidden: invalid session token");
         }
         // Increment active_generation so any older stream for this session terminates immediately
         sess_mut.active_generation += 1;
@@ -709,13 +720,13 @@ fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return write_http_error(&mut stream, 500, "Can't play here"),
+        Err(_) => return write_http_error(stream, 500, "Can't play here"),
     };
 
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return write_http_error(&mut stream, 500, "Can't play here");
+        return write_http_error(stream, 500, "Can't play here");
     };
 
     // Read the first chunk before sending 200 OK so if conversion fails immediately,
@@ -725,7 +736,7 @@ fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>
     if first_n == 0 {
         let _ = child.kill();
         let _ = child.wait();
-        return write_http_error(&mut stream, 500, "Can't play here");
+        return write_http_error(stream, 500, "Can't play here");
     }
 
     write!(
@@ -769,6 +780,15 @@ fn handle_client(mut stream: std::net::TcpStream, state: &Arc<Mutex<ServerState>
     }
     let _ = child.wait();
     Ok(())
+}
+
+/// Say the response is complete, then read whatever the client still sends
+/// until it closes (or for 2 s). Windows resets a connection closed with
+/// input unread, and the client can then lose the end of the response.
+pub(crate) fn close_gracefully(out: &TcpStream, reader: &mut BufReader<TcpStream>) {
+    let _ = out.shutdown(Shutdown::Write);
+    let _ = reader.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = std::io::copy(reader, &mut std::io::sink());
 }
 
 fn write_http_error(stream: &mut std::net::TcpStream, status: u16, msg: &str) -> std::io::Result<()> {

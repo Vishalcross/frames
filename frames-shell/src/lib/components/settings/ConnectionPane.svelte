@@ -25,6 +25,20 @@
   let useRealS4 = $state(initial?.use_real_s4 ?? true);
   let saving = $state(false);
   let error = $state('');
+  let rebuild = $state<'idle' | 'confirm' | 'running' | 'done'>('idle');
+  let rebuildError = $state('');
+
+  async function runRebuild() {
+    rebuild = 'running';
+    rebuildError = '';
+    try {
+      await tauriRepo.rebuildLibrary();
+      rebuild = 'done';
+    } catch (e: any) {
+      rebuildError = e?.toString?.() ?? 'The rebuild failed';
+      rebuild = 'idle';
+    }
+  }
 
   async function save() {
     error = '';
@@ -99,6 +113,30 @@
         <input type="checkbox" bind:checked={useRealS4} />
         <span>Use real MEGA S4 (turn off for an in-memory local sandbox)</span>
       </label>
+
+      <div class="conn-section-title">
+        <span>Library on This Computer</span>
+      </div>
+      <p class="conn-note">
+        Rebuild reloads the library from MEGA S4: its newest full copy, then every change after
+        it. Use it when photos or albums made on another computer are missing here. Nothing in
+        MEGA S4 is deleted.
+      </p>
+      {#if rebuild === 'confirm'}
+        <div class="conn-row">
+          <span class="conn-note">Changes made here are uploaded first. Rebuild now?</span>
+          <Button variant="ghost" onclick={() => (rebuild = 'idle')}>Cancel</Button>
+          <Button variant="accent" onclick={runRebuild}>Rebuild</Button>
+        </div>
+      {:else}
+        <div class="conn-row">
+          <Button disabled={rebuild === 'running'} onclick={() => (rebuild = 'confirm')}>
+            {rebuild === 'running' ? 'Rebuilding…' : 'Rebuild Library…'}
+          </Button>
+          {#if rebuild === 'done'}<span class="conn-note">The library has been rebuilt.</span>{/if}
+        </div>
+      {/if}
+      {#if rebuildError}<div class="conn-error">{rebuildError}</div>{/if}
 
       {#if error}<div class="conn-error">{error}</div>{/if}
     </div>
@@ -200,6 +238,20 @@
     align-items: center;
     font-size: var(--text-size-caption);
     color: var(--text-2);
+  }
+  .conn-note {
+    margin: 0;
+    font-size: var(--text-size-caption);
+    color: var(--text-2);
+    line-height: 1.4;
+  }
+  .conn-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .conn-row .conn-note {
+    flex: 1;
   }
   .conn-hint {
     padding: 10px 12px;

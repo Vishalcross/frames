@@ -697,9 +697,28 @@
     cursor: col-resize;
     z-index: 30;
   }
-  .sidebar-resizer:hover,
-  .sidebar-resizer.resizing {
+  /* The grab area stays 6 px wide; only a thin line in its middle shows,
+     after a moment's hover (so passing over it doesn't flash), and fully
+     while dragging. */
+  .sidebar-resizer::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 2px;
+    transform: translateX(-50%);
     background: var(--accent);
+    opacity: 0;
+    transition: opacity var(--dur-fast) var(--ease-standard);
+  }
+  .sidebar-resizer:hover::after {
+    opacity: 0.6;
+    transition-delay: 150ms;
+  }
+  .sidebar-resizer.resizing::after {
+    opacity: 1;
+    transition-delay: 0s;
   }
 
   .sidebar-import-pulse {

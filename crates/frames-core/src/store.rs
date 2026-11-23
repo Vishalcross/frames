@@ -957,6 +957,19 @@ impl Store {
 
     /// True if >= 500 batches have been applied since the last snapshot, or if
     /// at least 1 batch was applied and the last snapshot was >= 7 days ago.
+    /// Nothing here yet: no photos, no albums, nothing applied from another
+    /// device. A new library starts from the newest snapshot.
+    pub fn is_new_library(&self) -> Result<bool> {
+        let device = self.device_id()?;
+        Ok(self.conn.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM assets)
+                AND NOT EXISTS (SELECT 1 FROM albums)
+                AND NOT EXISTS (SELECT 1 FROM sync_state WHERE device != ?1)",
+            [device],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn needs_snapshot(&self, now: DateTime<Utc>) -> Result<bool> {
         let count = self.batches_since_snapshot()?;
         if count >= SNAPSHOT_BATCH_THRESHOLD {
@@ -978,7 +991,9 @@ impl Store {
                 let dt = parse_utc(&ts)?;
                 Ok(now.signed_duration_since(dt) >= Duration::days(SNAPSHOT_MAX_AGE_DAYS))
             }
-            None => Ok(false),
+            // This device has never written one: write it now, so a new
+            // computer never depends on every batch of the log surviving.
+            None => Ok(true),
         }
     }
 

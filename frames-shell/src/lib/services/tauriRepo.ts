@@ -521,6 +521,19 @@ export class TauriAssetRepo implements AssetRepo {
     }
   }
 
+  /** Reload the library from MEGA S4: the newest snapshot, then every change
+   *  after it. Changes made here are uploaded first. Throws on failure. */
+  async rebuildLibrary(): Promise<void> {
+    if (!isTauriAvailable()) return;
+    this.isSyncing = true;
+    try {
+      await invoke('run_rebuild_database');
+      await this.loadBootstrap();
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+
   // Album management
   /** Create an album, optionally holding `assetIds` from the start. Throws on failure. */
   async createAlbum(name: string, assetIds: string[] = []): Promise<AlbumItem[]> {

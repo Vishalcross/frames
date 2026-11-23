@@ -182,6 +182,12 @@ pub fn flush_outbox(
 pub fn pull_remote_logs(store: &mut impl StoreAccess, s4: &dyn ObjectStore) -> Result<usize> {
     let _one_puller = PULL_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let base_delay = s4.config().retry_base_delay_ms;
+    // A new library starts from the newest snapshot and takes only the
+    // batches after it. Replaying the whole log instead would silently miss
+    // anything in a batch that has gone from S4, and all that built on it.
+    if store.with(|st| st.is_new_library())? {
+        restore_newest_snapshot(store, s4)?;
+    }
     let objects = retry_with_backoff_cfg(5, base_delay, || s4.list_objects(LOG_PREFIX))?;
 
     let mut to_fetch = store.with(|st| -> Result<Vec<(String, u64, String)>> {
@@ -277,8 +283,23 @@ pub fn sync_once(
 /// logs (spec section 6 & section 11: "Rebuild deletes it and reloads from the
 /// snapshot plus logs").
 pub fn rebuild_from_s4(store: &mut impl StoreAccess, s4: &dyn ObjectStore) -> Result<SyncReport> {
+    // Changes not yet in S4 go there first: this device never pulls its own
+    // batches back, so the rebuild would otherwise lose them here.
+    let batches_pushed = flush_outbox(store, s4, Utc::now())?;
     store.with(|st| st.reset_for_rebuild())?;
+    restore_newest_snapshot(store, s4)?;
+    let batches_pulled = pull_remote_logs(store, s4)?;
+    Ok(SyncReport {
+        offline: false,
+        batches_pushed,
+        batches_pulled,
+        snapshot_written: None,
+    })
+}
 
+/// Load the newest snapshot in S4 into the library, replacing what it holds,
+/// if there is one.
+fn restore_newest_snapshot(store: &mut impl StoreAccess, s4: &dyn ObjectStore) -> Result<()> {
     let base_delay = s4.config().retry_base_delay_ms;
     let snap_objs = retry_with_backoff_cfg(5, base_delay, || s4.list_objects(SNAPSHOT_PREFIX))?;
     let snap_keys: Vec<&str> = snap_objs.iter().map(|o| o.key.as_str()).collect();
@@ -287,14 +308,7 @@ pub fn rebuild_from_s4(store: &mut impl StoreAccess, s4: &dyn ObjectStore) -> Re
             store.with(|st| st.import_snapshot_gz(&gz_bytes))?;
         }
     }
-
-    let batches_pulled = pull_remote_logs(store, s4)?;
-    Ok(SyncReport {
-        offline: false,
-        batches_pushed: 0,
-        batches_pulled,
-        snapshot_written: None,
-    })
+    Ok(())
 }
 
 // =============================================================================
@@ -1774,6 +1788,27 @@ mod tests {
         let check = check_library(&mut win_store, &s4).unwrap();
         assert!(check.missing_originals.is_empty());
         assert!(check.unknown_s4_keys.is_empty());
+    }
+
+    #[test]
+    fn a_new_computer_starts_from_the_snapshot_when_log_batches_are_gone() {
+        let s4 = InMemoryObjectStore::new(S4Config::default());
+        let mut mac = Store::open_in_memory("mac-1").unwrap();
+        mac.create_album("alb-a".into(), "Portfolio".into(), t(1)).unwrap();
+        // The first sync also writes the first snapshot.
+        let first = sync_once(&mut mac, &s4, t(2)).unwrap();
+        assert!(first.snapshot_written.is_some());
+        mac.create_album("alb-b".into(), "Nikon".into(), t(3)).unwrap();
+        assert!(sync_once(&mut mac, &s4, t(4)).unwrap().snapshot_written.is_none());
+
+        // The batch that created Portfolio goes missing from S4.
+        s4.delete_object(&crate::keys::log_key("mac-1", 1)).unwrap();
+
+        let mut win = Store::open_in_memory("win-1").unwrap();
+        sync_once(&mut win, &s4, t(5)).unwrap();
+        let mut names: Vec<String> = win.list_albums().unwrap().into_iter().map(|a| a.name).collect();
+        names.sort();
+        assert_eq!(names, ["Nikon", "Portfolio"]);
     }
 
     #[test]
